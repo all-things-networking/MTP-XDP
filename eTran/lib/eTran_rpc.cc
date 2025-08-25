@@ -194,7 +194,11 @@ int RpcSocket::message_tx_retransmission(struct InternalResendMeta rm)
     for (int i = 0; i < rm.nr_pkt; i++) {
         struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk_info->tx, idx_tx + i);
         tx_desc->addr = addr;
+        /*#ifdef MTP_ON
+        tx_desc->len = sizeof(struct ethhdr) + sizeof(struct iphdr) + (i == rm.nr_pkt - 1 ? rm.len : HOMA_MSS) + sizeof(struct app_event) + sizeof(struct HOMABP);
+        #else*/
         tx_desc->len = sizeof(struct ethhdr) + sizeof(struct iphdr) + (i == rm.nr_pkt - 1 ? rm.len : HOMA_MSS);
+        //#endif
         tx_desc->options = XDP_EGRESS_NO_COMP;
         addr = homa_txmeta_get_buffer_next(xsk_info->umem_area, addr);
     }
