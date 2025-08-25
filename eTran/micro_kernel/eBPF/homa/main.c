@@ -456,11 +456,11 @@ int xdp_sock_prog(struct xdp_md *ctx)
                 ret = next_req_pkt_ep(&ev, state, data_meta, &int_out);
             }
         }
+
+        CHECK_AND_DROP_LOG(ret == XDP_DROP, "XDP_DROP for error rpc state");
     }
 
-    CHECK_AND_DROP_LOG(ret == XDP_DROP, "XDP_DROP for error rpc state");
-
-    target_xsk = bpf_map_lookup_elem(&port_tbl, &local_port);
+    target_xsk = bpf_map_lookup_elem(&port_tbl, &(ev.flow_id.local_port));
     CHECK_AND_DROP_LOG(!target_xsk, "Can't find corresponding XSK fd for this packet");
     
     socket_id = target_xsk->xsk_map_idx[current_cpu];

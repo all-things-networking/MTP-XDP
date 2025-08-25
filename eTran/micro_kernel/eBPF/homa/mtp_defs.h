@@ -842,9 +842,6 @@ static __always_inline
 int next_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     struct homa_meta_info *data_meta, struct interm_out *int_out) {
 
-    bool new_state = false;
-    int complete = 0;
-
     __u16 seq = ev->seq;
     __u32 message_length = ev->message_length;
     __u32 incoming = ev->incoming;
@@ -857,10 +854,10 @@ int next_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
         return XDP_DROP;
     }
 
-    new_state = ctx->state == BPF_RPC_OUTGOING;
+    int_out->new_state = ctx->state == BPF_RPC_OUTGOING;
 
-    complete = set_bitmap(ctx, seq);
-    if (complete == -1)
+    int_out->complete = set_bitmap(ctx, seq);
+    if (int_out->complete == -1)
     {
         RPC_UNLOCK(ctx);
         bpf_printk("set_bitmap failed, rpcid = %llu, seq = %u", ev->flow_id.rpcid, seq);
@@ -870,7 +867,7 @@ int next_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
         ctx->cc.incoming = incoming;
     ctx->cc.bytes_remaining -= seg_length;
 
-    if (complete == 1)
+    if (int_out->complete == 1)
     {   /* all response packets have been received */
         ctx->state = BPF_RPC_DEAD;
         RPC_UNLOCK(ctx);
@@ -900,12 +897,12 @@ int next_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     
     __sync_fetch_and_sub(&total_incoming, (__u64)seg_length);
 
-    bool need_schedule = message_length > ctx->cc.incoming;
+    int_out->need_schedule = message_length > ctx->cc.incoming;
 
     //if (need_schedule)
     //    cache_this_rpc(hkey);
     
-    if (!new_state || !need_schedule)
+    if (!int_out->new_state || !int_out->need_schedule)
         return XDP_REDIRECT;
 
     struct rpc_key_t hkey = {0};
