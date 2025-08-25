@@ -422,29 +422,39 @@ int xdp_sock_prog(struct xdp_md *ctx)
 
     /*************** MTP START ****************/
 
-    struct net_event ev;
+    struct net_event ev = {0};
     proto_type = parse_packet_mtp(&nh, iph, data_end, &ev);
     CHECK_AND_DROP_LOG(proto_type < 0, "parse_packet_mtp failed");
 
 
     struct rpc_state *state = NULL;
-    bool first_req = false;
-    if(!get_context_mtp(&ev, state, &first_req) || !state)
+    bool first_pkt_rpc = false;
+    if(!get_context_mtp(ev.flow_id, &state, &first_pkt_rpc) || !state)
         return XDP_DROP;
 
-    /*if(proto_type == DATA) {
+    if(proto_type == DATA) {
         // Question: should we have an EP for this? Or how can we abstract it?
         struct ack_net_info ack_info = {0};
-        if(!parse_ack_info(&nh, data_end, &ack_info, ev.remote_ip))
+        if(!parse_ack_info(&nh, data_end, &ack_info, ev.flow_id.remote_ip))
             return XDP_DROP;
         reclaim_rpc_mtp(ack_info, data_meta);
 
-        if (rpc_is_client(local_id(bpf_be64_to_cpu(ev.sender_id)))) {
+        struct interm_out int_out = {0};
+
+        if (rpc_is_client(local_id(bpf_be64_to_cpu(ev.flow_id.rpcid)))) {
             //ret = client_response(homa_data_hdr, remote_ip, data_meta, single_packet);
-            ret = recv_resp_ep_client(&ev, state, data_meta);
+            if(first_pkt_rpc) {
+                ret = first_resp_pkt_ep(&ev, state, data_meta, &int_out);
+            } else {
+                ret = next_resp_pkt_ep(&ev, state, data_meta, &int_out);
+            }
         } else {
-            ret = recv_req_ep_server(&ev, state, data_meta);
             //ret = server_request(homa_data_hdr, remote_ip, single_packet);
+            if(first_pkt_rpc) {
+                ret = first_req_pkt_ep(&ev, state, data_meta, &int_out);
+            } else {
+                ret = next_req_pkt_ep(&ev, state, data_meta, &int_out);
+            }
         }
     }
 
@@ -456,12 +466,12 @@ int xdp_sock_prog(struct xdp_md *ctx)
     socket_id = target_xsk->xsk_map_idx[current_cpu];
     CHECK_AND_DROP_LOG(socket_id < 0, "socket_id < 0");
     
-    return bpf_redirect_map(&xsks_map, socket_id, XDP_DROP);*/
+    return bpf_redirect_map(&xsks_map, socket_id, XDP_DROP);
 
     /*************** MTP END ****************/
 
 
-    //#ifndef MTP_ON
+    #ifndef MTP_ON
     proto_type = homa_parse_common_hdr(&nh, data_end, &homa_common_hdr);
     CHECK_AND_DROP_LOG(proto_type < 0, "homa_parse_common_hdr failed");
     
@@ -473,7 +483,6 @@ int xdp_sock_prog(struct xdp_md *ctx)
     
     single_packet = homa_parse_data_hdr(&nh, data_end, &homa_data_hdr);
     CHECK_AND_DROP_LOG(single_packet < 0, "homa_parse_data_hdr failed");
-    //#endif
 
 // load balancing
 #ifdef LB
@@ -522,13 +531,13 @@ bypass_lb:
     if (rpc_is_client(local_id(bpf_be64_to_cpu(homa_data_hdr->common.sender_id))))
         ret = client_response(homa_data_hdr, remote_ip, data_meta, single_packet);
     else {
-        ret = server_request(homa_data_hdr, remote_ip, single_packet);
-        struct interm_out int_out = {0};
-        if(first_req) {
+        //ret = server_request(homa_data_hdr, remote_ip, single_packet);
+        /*struct interm_out int_out = {0};
+        if(first_pkt_rpc) {
             first_req_pkt_ep(&ev, state, data_meta, &int_out);
         } else {
             next_req_pkt_ep(&ev, state, data_meta, &int_out);
-        }
+        }*/
     }
 
     CHECK_AND_DROP_LOG(ret == XDP_DROP, "XDP_DROP for error rpc state");
@@ -582,6 +591,7 @@ drop:
     CHECK_AND_DROP_LOG(socket_id < 0, "socket_id < 0");
     
     return bpf_redirect_map(&xsks_map, socket_id, XDP_DROP);
+    #endif
 }
 
 SEC("xdp/cpumap")
