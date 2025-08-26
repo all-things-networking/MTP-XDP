@@ -437,7 +437,6 @@ int get_context_mtp(struct hkey key, struct rpc_state **state, bool *first_req) 
     hkey.remote_ip = key.remote_ip;
 
     *state = bpf_map_lookup_elem(&rpc_tbl, &hkey);
-    *first_req = false;
     if(!(*state)) {
         *first_req = true;
         struct rpc_state new_state = {0};
@@ -498,122 +497,6 @@ void reclaim_rpc_mtp(struct ack_net_info ack_info, struct homa_meta_info *data_m
 
     bpf_map_delete_elem(&rpc_tbl, &delete_hkey);
 }
-
-#if 0
-static __always_inline
-int recv_resp_ep_client(struct net_event *ev, struct rpc_state *ctx,
-    struct homa_meta_info *data_meta) {
-        
-    bool new_state = false;
-    int complete = 0;
-
-    __u16 seq = ev->seq;
-    __u32 message_length = ev->message_length;
-    __u32 incoming = ev->incoming;
-    __u64 seg_length = ev->segment_length;
-    
-    RPC_LOCK(ctx);
-
-    if (unlikely(ctx->state == BPF_RPC_DEAD)) {
-        RPC_UNLOCK(ctx);
-        return XDP_DROP;
-    }
-
-    new_state = ctx->state == BPF_RPC_OUTGOING;
-    
-    if (new_state) { /* first response packet */
-        if (likely(single_packet)) 
-        {
-            /* ensure that only we can delete it */
-            ctx->state = BPF_RPC_DEAD;
-            RPC_UNLOCK(ctx);
-            
-            /* userspace will use this metadata to free buffers */
-            data_meta->rx.reap_client_buffer_addr = ctx->buffer_head;
-
-            /* if we allocate qid for this rpc, we need to free it */
-            if (ctx->qid != MAX_BUCKET_SIZE)
-                free_qid(ctx->qid);
-
-            bpf_map_delete_elem(&rpc_tbl, &hkey);
-            
-            enqueue_dead_crpc(hkey.remote_ip, hkey.remote_port, hkey.local_port, hkey.rpcid);
-
-            return XDP_REDIRECT;
-        }
-        
-        ctx->state = BPF_RPC_INCOMING;
-        ctx->bit_width = DIV_ROUND_UP(message_length, HOMA_MSS);
-        
-        clear_all_bitmaps(ctx);
-
-        set_bitmap(ctx, seq);
-
-        ctx->message_length = message_length;
-        ctx->cc.incoming = incoming;
-        
-        ctx->cc.bytes_remaining = message_length - seg_length;
-
-        RPC_UNLOCK(ctx);
-
-        __sync_fetch_and_add(&total_incoming, (__u64)(incoming - seg_length));
-
-        /* free rpc_state_cc object if it exists (used for pacing before) */
-        struct rpc_state_cc *cc_node = NULL;
-        GET_POINTER(cc_node, ctx);
-        if (cc_node)
-            bpf_obj_drop(cc_node);
-    }
-    else {   /* not the first response packet */
-
-        complete = set_bitmap(ctx, seq);
-        if (complete == -1)
-        {
-            RPC_UNLOCK(ctx);
-            bpf_printk("set_bitmap failed, rpcid = %llu, seq = %u", hkey.rpcid, seq);
-            return XDP_DROP;
-        }
-        if (incoming > ctx->cc.incoming)
-            ctx->cc.incoming = incoming;
-        ctx->cc.bytes_remaining -= seg_length;
-
-        if (complete == 1)
-        {   /* all response packets have been received */
-            ctx->state = BPF_RPC_DEAD;
-            RPC_UNLOCK(ctx);
-            /* userspace will use this metadata to free buffers */
-            data_meta->rx.reap_client_buffer_addr = ctx->buffer_head;
-
-            /* if we allocate qid for this rpc, we need to free it */
-            if (ctx->qid != MAX_BUCKET_SIZE)
-                free_qid(ctx->qid);
-
-            enqueue_dead_crpc(hkey.remote_ip, hkey.remote_port, hkey.local_port, hkey.rpcid);
-
-            /* note: after we delete the rpc state, our CC object may still be in the grant_list, 
-                * but it would be finally removed, don't worry about it 
-                */
-            bpf_map_delete_elem(&rpc_tbl, &hkey);
-
-            return XDP_REDIRECT;
-        }
-        
-        RPC_UNLOCK(ctx);
-        
-        __sync_fetch_and_sub(&total_incoming, (__u64)seg_length);
-    }
-
-    bool need_schedule = message_length > ctx->cc.incoming;
-
-    if (need_schedule)
-        cache_this_rpc(hkey);
-    
-    if (!new_state || !need_schedule)
-        return XDP_REDIRECT;
-
-    return insert_grant_list(ctx, &hkey, message_length);
-}
-#endif
 
 /* In MTP program:
 first_req_pkt_ep -> everything in recv_req_ep_server() except the else case.
@@ -755,7 +638,7 @@ int next_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 }
 
 static __always_inline
-int first_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
+int recv_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     struct homa_meta_info *data_meta, struct interm_out *int_out) {
 
     __u16 seq = ev->seq;
@@ -774,52 +657,96 @@ int first_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
     bool single_packet = ev->message_length <= HOMA_MSS;
     
-    if (likely(single_packet)) 
-    {
-        /* ensure that only we can delete it */
-        ctx->state = BPF_RPC_DEAD;
+    if(likely(int_out->new_state)) {
+        if (likely(single_packet)) 
+        {
+            /* ensure that only we can delete it */
+            ctx->state = BPF_RPC_DEAD;
+            RPC_UNLOCK(ctx);
+            
+            /* userspace will use this metadata to free buffers */
+            data_meta->rx.reap_client_buffer_addr = ctx->buffer_head;
+
+            /* if we allocate qid for this rpc, we need to free it */
+            if (ctx->qid != MAX_BUCKET_SIZE)
+                free_qid(ctx->qid);
+
+            struct rpc_key_t hkey = {0};
+            hkey.rpcid = local_id(ev->flow_id.rpcid);
+            hkey.local_port = ev->flow_id.local_port;
+            hkey.remote_port = ev->flow_id.remote_port;
+            hkey.remote_ip = ev->flow_id.remote_ip;
+            bpf_map_delete_elem(&rpc_tbl, &hkey);
+            
+            enqueue_dead_crpc(hkey.remote_ip, hkey.remote_port, hkey.local_port, hkey.rpcid);
+
+            return XDP_REDIRECT;
+        }
+        
+        ctx->state = BPF_RPC_INCOMING;
+        ctx->bit_width = DIV_ROUND_UP(message_length, HOMA_MSS);
+        
+        clear_all_bitmaps(ctx);
+
+        set_bitmap(ctx, seq);
+
+        ctx->message_length = message_length;
+        ctx->cc.incoming = incoming;
+        
+        ctx->cc.bytes_remaining = message_length - seg_length;
+
+        RPC_UNLOCK(ctx);
+
+        __sync_fetch_and_add(&total_incoming, (__u64)(incoming - seg_length));
+
+        /* free rpc_state_cc object if it exists (used for pacing before) */
+        struct rpc_state_cc *cc_node = NULL;
+        GET_POINTER(cc_node, ctx);
+        if (cc_node)
+            bpf_obj_drop(cc_node);
+    } else {
+        int complete = set_bitmap(ctx, seq);
+        int_out->complete = complete;
+        if (complete == -1)
+        {
+            RPC_UNLOCK(ctx);
+            bpf_printk("set_bitmap failed, rpcid = %llu, seq = %u", ev->flow_id.rpcid, seq);
+            return XDP_DROP;
+        }
+        if (incoming > ctx->cc.incoming)
+            ctx->cc.incoming = incoming;
+        ctx->cc.bytes_remaining -= seg_length;
+
+        if (int_out->complete == 1)
+        {   /* all response packets have been received */
+            ctx->state = BPF_RPC_DEAD;
+            RPC_UNLOCK(ctx);
+            /* userspace will use this metadata to free buffers */
+            data_meta->rx.reap_client_buffer_addr = ctx->buffer_head;
+
+            /* if we allocate qid for this rpc, we need to free it */
+            if (ctx->qid != MAX_BUCKET_SIZE)
+                free_qid(ctx->qid);
+
+            struct rpc_key_t hkey = {0};
+            hkey.rpcid = local_id(ev->flow_id.rpcid);
+            hkey.local_port = ev->flow_id.local_port;
+            hkey.remote_port = ev->flow_id.remote_port;
+            hkey.remote_ip = ev->flow_id.remote_ip;
+            enqueue_dead_crpc(hkey.remote_ip, hkey.remote_port, hkey.local_port, hkey.rpcid);
+
+            /* note: after we delete the rpc state, our CC object may still be in the grant_list, 
+                * but it would be finally removed, don't worry about it 
+                */
+            bpf_map_delete_elem(&rpc_tbl, &hkey);
+
+            return XDP_REDIRECT;
+        }
+        
         RPC_UNLOCK(ctx);
         
-        /* userspace will use this metadata to free buffers */
-        data_meta->rx.reap_client_buffer_addr = ctx->buffer_head;
-
-        /* if we allocate qid for this rpc, we need to free it */
-        if (ctx->qid != MAX_BUCKET_SIZE)
-            free_qid(ctx->qid);
-
-        struct rpc_key_t hkey = {0};
-        hkey.rpcid = local_id(ev->flow_id.rpcid);
-        hkey.local_port = ev->flow_id.local_port;
-        hkey.remote_port = ev->flow_id.remote_port;
-        hkey.remote_ip = ev->flow_id.remote_ip;
-        bpf_map_delete_elem(&rpc_tbl, &hkey);
-        
-        enqueue_dead_crpc(hkey.remote_ip, hkey.remote_port, hkey.local_port, hkey.rpcid);
-
-        return XDP_REDIRECT;
+        __sync_fetch_and_sub(&total_incoming, (__u64)seg_length);
     }
-    
-    ctx->state = BPF_RPC_INCOMING;
-    ctx->bit_width = DIV_ROUND_UP(message_length, HOMA_MSS);
-    
-    clear_all_bitmaps(ctx);
-
-    set_bitmap(ctx, seq);
-
-    ctx->message_length = message_length;
-    ctx->cc.incoming = incoming;
-    
-    ctx->cc.bytes_remaining = message_length - seg_length;
-
-    RPC_UNLOCK(ctx);
-
-    __sync_fetch_and_add(&total_incoming, (__u64)(incoming - seg_length));
-
-    /* free rpc_state_cc object if it exists (used for pacing before) */
-    struct rpc_state_cc *cc_node = NULL;
-    GET_POINTER(cc_node, ctx);
-    if (cc_node)
-        bpf_obj_drop(cc_node);
 
     bool need_schedule = message_length > ctx->cc.incoming;
 
@@ -827,82 +754,6 @@ int first_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     //    cache_this_rpc(hkey);
     
     if (!int_out->new_state || !need_schedule)
-        return XDP_REDIRECT;
-
-    struct rpc_key_t hkey = {0};
-    hkey.rpcid = local_id(ev->flow_id.rpcid);
-    hkey.local_port = ev->flow_id.local_port;
-    hkey.remote_port = ev->flow_id.remote_port;
-    hkey.remote_ip = ev->flow_id.remote_ip;
-    return insert_grant_list(ctx, &hkey, message_length);
-}
-
-
-static __always_inline
-int next_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
-    struct homa_meta_info *data_meta, struct interm_out *int_out) {
-
-    __u16 seq = ev->seq;
-    __u32 message_length = ev->message_length;
-    __u32 incoming = ev->incoming;
-    __u64 seg_length = ev->segment_length;
-    
-    RPC_LOCK(ctx);
-
-    if (unlikely(ctx->state == BPF_RPC_DEAD)) {
-        RPC_UNLOCK(ctx);
-        return XDP_DROP;
-    }
-
-    int_out->new_state = ctx->state == BPF_RPC_OUTGOING;
-
-    int_out->complete = set_bitmap(ctx, seq);
-    if (int_out->complete == -1)
-    {
-        RPC_UNLOCK(ctx);
-        bpf_printk("set_bitmap failed, rpcid = %llu, seq = %u", ev->flow_id.rpcid, seq);
-        return XDP_DROP;
-    }
-    if (incoming > ctx->cc.incoming)
-        ctx->cc.incoming = incoming;
-    ctx->cc.bytes_remaining -= seg_length;
-
-    if (int_out->complete == 1)
-    {   /* all response packets have been received */
-        ctx->state = BPF_RPC_DEAD;
-        RPC_UNLOCK(ctx);
-        /* userspace will use this metadata to free buffers */
-        data_meta->rx.reap_client_buffer_addr = ctx->buffer_head;
-
-        /* if we allocate qid for this rpc, we need to free it */
-        if (ctx->qid != MAX_BUCKET_SIZE)
-            free_qid(ctx->qid);
-
-        struct rpc_key_t hkey = {0};
-        hkey.rpcid = local_id(ev->flow_id.rpcid);
-        hkey.local_port = ev->flow_id.local_port;
-        hkey.remote_port = ev->flow_id.remote_port;
-        hkey.remote_ip = ev->flow_id.remote_ip;
-        enqueue_dead_crpc(hkey.remote_ip, hkey.remote_port, hkey.local_port, hkey.rpcid);
-
-        /* note: after we delete the rpc state, our CC object may still be in the grant_list, 
-            * but it would be finally removed, don't worry about it 
-            */
-        bpf_map_delete_elem(&rpc_tbl, &hkey);
-
-        return XDP_REDIRECT;
-    }
-    
-    RPC_UNLOCK(ctx);
-    
-    __sync_fetch_and_sub(&total_incoming, (__u64)seg_length);
-
-    int_out->need_schedule = message_length > ctx->cc.incoming;
-
-    //if (need_schedule)
-    //    cache_this_rpc(hkey);
-    
-    if (!int_out->new_state || !int_out->need_schedule)
         return XDP_REDIRECT;
 
     struct rpc_key_t hkey = {0};

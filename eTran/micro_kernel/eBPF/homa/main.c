@@ -239,7 +239,9 @@ int xdp_egress_prog(struct xdp_md *ctx)
     c = (struct common_header *)(iph + 1);
     d = (struct data_header *)c;
     
-    CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
+    //CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
+    if(d + 1 > data_end)
+        return XDP_DROP;
 
     CHECK_AND_DROP_LOG(iph->protocol != IPPROTO_HOMA, "not HOMA protocol");
 
@@ -373,22 +375,22 @@ int xdp_sock_prog(struct xdp_md *ctx)
     struct hdr_cursor nh = {0};
     
     struct iphdr *iph;
-    //#ifndef MTP_ON
+    #ifndef MTP_ON
     struct common_header *homa_common_hdr;
     struct data_header *homa_data_hdr;
     struct grant_header *homa_grant_hdr;
     struct busy_header *homa_busy_hdr;
     struct resend_header *homa_resend_hdr;
     struct unknown_header *homa_unknown_hdr;
-    //#endif
     struct slow_path_info *sp;
-    
-    int proto_type;
+
     int single_packet = 0;
-    int ret = 0;
     __u32 remote_ip = 0;
     __u32 qid = ctx->rx_queue_index;
     __u16 local_port = 0;
+    #endif
+    int ret = 0;
+    int proto_type;
     struct target_xsk *target_xsk;
 
     #ifdef TEST_PACKET_LOST
@@ -441,13 +443,9 @@ int xdp_sock_prog(struct xdp_md *ctx)
 
         struct interm_out int_out = {0};
 
-        if (rpc_is_client(local_id(bpf_be64_to_cpu(ev.flow_id.rpcid)))) {
+        if (rpc_is_client(local_id(ev.flow_id.rpcid))) {
             //ret = client_response(homa_data_hdr, remote_ip, data_meta, single_packet);
-            if(first_pkt_rpc) {
-                ret = first_resp_pkt_ep(&ev, state, data_meta, &int_out);
-            } else {
-                ret = next_resp_pkt_ep(&ev, state, data_meta, &int_out);
-            }
+            ret = recv_resp_pkt_ep(&ev, state, data_meta, &int_out);
         } else {
             //ret = server_request(homa_data_hdr, remote_ip, single_packet);
             if(first_pkt_rpc) {
@@ -531,13 +529,7 @@ bypass_lb:
     if (rpc_is_client(local_id(bpf_be64_to_cpu(homa_data_hdr->common.sender_id))))
         ret = client_response(homa_data_hdr, remote_ip, data_meta, single_packet);
     else {
-        //ret = server_request(homa_data_hdr, remote_ip, single_packet);
-        /*struct interm_out int_out = {0};
-        if(first_pkt_rpc) {
-            first_req_pkt_ep(&ev, state, data_meta, &int_out);
-        } else {
-            next_req_pkt_ep(&ev, state, data_meta, &int_out);
-        }*/
+        ret = server_request(homa_data_hdr, remote_ip, single_packet);
     }
 
     CHECK_AND_DROP_LOG(ret == XDP_DROP, "XDP_DROP for error rpc state");
