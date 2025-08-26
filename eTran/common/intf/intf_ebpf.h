@@ -250,15 +250,21 @@ struct target_xsk
 };
 
 typedef struct __attribute__((packed)) {
+    __u32 flag;
     __u32 slowpath;
     __u64 buffer_next;
     __u64 buffer_addr;
+    __u32 unused1;
+    __u32 unused2;
 } homa_tx_t;
 
 typedef struct __attribute__((packed)) {
     __u32 qid;
     __u64 reap_client_buffer_addr;
     __u64 reap_server_buffer_addr;
+    __u32 msg_len;
+    __u32 seg_len;
+    __u32 offset;
 } homa_rx_t;
 
 struct homa_meta_info
@@ -269,9 +275,9 @@ struct homa_meta_info
     } __attribute__((packed));
 } __attribute__((packed));
 #ifdef __cplusplus
-static_assert(sizeof(struct homa_meta_info) == 20, "homa_meta_info size is not 20 bytes");
+static_assert(sizeof(struct homa_meta_info) == 32, "homa_meta_info size is not 32 bytes");
 #else
-_Static_assert (sizeof(struct homa_meta_info) == 20, "homa_meta_info size is not 20 bytes");
+_Static_assert (sizeof(struct homa_meta_info) == 32, "homa_meta_info size is not 32 bytes");
 #endif
 
 // RPC state macros

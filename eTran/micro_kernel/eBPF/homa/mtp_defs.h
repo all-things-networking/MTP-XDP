@@ -2,6 +2,9 @@
 
 #define ceil DIV_ROUND_UP
 
+#define NEW_RX_ORDERED_DATA 1
+#define ADD_RX_DATA_SEG     2
+
 struct ack_net_info {
     __u64 rpcid;
     __u16 sport;
@@ -518,6 +521,17 @@ gen_grants -> the main XDP_GEN function (after the tail call happens)
 // would go to XDP_GEN?
 
 static __always_inline
+void new_rx_ordered_data_wrapper(__u32 msg_len, struct homa_meta_info *data_meta) {
+    data_meta->rx.msg_len = msg_len;
+}
+
+static __always_inline
+void add_rx_data_seg_wrapper(__u32 seg_len, __u32 offset, struct homa_meta_info *data_meta) {
+    data_meta->rx.seg_len = seg_len;
+    data_meta->rx.offset = offset;
+}
+
+static __always_inline
 int first_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     struct homa_meta_info *data_meta, struct interm_out *int_out) {
 
@@ -549,17 +563,17 @@ int first_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     int_out->complete = single_packet;
     int_out->new_state = true;
     int_out->need_schedule = message_length > ctx->cc.incoming;
-    /* we create the ctx successfully */
+    int_out->last_bytes_remaining = message_length - seg_length;
 
-
-    // Question: I think that this might be missing in MTP's first_req_pkt_ep and
-    // next_req_pkt_ep, no?
     __sync_fetch_and_add(&total_incoming, (__u64)(incoming - seg_length));
+
+    new_rx_ordered_data_wrapper(ev->message_length, data_meta);
+
+    add_rx_data_seg_wrapper(ev->segment_length, ev->offset, data_meta);
 
     if (int_out->complete)
         return XDP_REDIRECT;
 
-    // Question: so no caching for now?
     //if (need_schedule)
     //    cache_this_rpc(hkey);
 

@@ -116,9 +116,12 @@ static inline bool xsk_rxring_empty(struct xsk_ring_cons *rx)
 
 //////////////////////////// Homa ////////////////////////////
 // Rx meta data
-#define HOMA_RX_QID_OFFSET 20
-#define HOMA_RX_REAP_CLIENT_BUFFER_OFFSET 16
-#define HOMA_RX_REAP_SERVER_BUFFER_OFFSET 8
+#define HOMA_RX_QID_OFFSET 32
+#define HOMA_RX_REAP_CLIENT_BUFFER_OFFSET 28
+#define HOMA_RX_REAP_SERVER_BUFFER_OFFSET 20
+#define HOMA_RX_MTP_MSG_LEN 12
+#define HOMA_RX_MTP_SEG_LEN 8
+#define HOMA_RX_MTP_OFFSET 4
 
 static inline uint32_t homa_rxmeta_qid(char *pkt)
 {
@@ -138,11 +141,29 @@ static inline uint64_t homa_rxmeta_reap_server_buffer(char *pkt)
     return *(uint64_t *)x;
 }
 
+static inline uint32_t homa_rxmeta_mtp_msg_len(char *pkt)
+{
+    char *x = pkt - HOMA_RX_MTP_MSG_LEN;
+    return *(uint32_t *)x;
+}
+
+static inline uint32_t homa_rxmeta_mtp_seg_len(char *pkt)
+{
+    char *x = pkt - HOMA_RX_MTP_SEG_LEN;
+    return *(uint32_t *)x;
+}
+
+static inline uint32_t homa_rxmeta_mtp_offset(char *pkt)
+{
+    char *x = pkt - HOMA_RX_MTP_OFFSET;
+    return *(uint32_t *)x;
+}
+
 // Tx meta data
-#define HOMA_TX_FLAG_OFFSET 24
-#define HOMA_TX_FROM_SLOW_PATH_OFFSET 20
-#define HOMA_TX_BUFFER_NEXT_OFFSET 16
-#define HOMA_TX_BUFFER_ADDR_OFFSET 8
+#define HOMA_TX_FLAG_OFFSET 32
+#define HOMA_TX_FROM_SLOW_PATH_OFFSET 28
+#define HOMA_TX_BUFFER_NEXT_OFFSET 24
+#define HOMA_TX_BUFFER_ADDR_OFFSET 16
 
 /* 
  * Homa tx meta data flags

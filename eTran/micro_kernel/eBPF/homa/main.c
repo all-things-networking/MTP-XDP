@@ -413,6 +413,9 @@ int xdp_sock_prog(struct xdp_md *ctx)
     data_meta->rx.reap_client_buffer_addr = POISON_64;
     data_meta->rx.reap_server_buffer_addr = POISON_64;
     data_meta->rx.qid = ctx->rx_queue_index;
+    data_meta->rx.msg_len = 0;
+    data_meta->rx.seg_len = 0;
+    data_meta->rx.offset = 0;
 
     /* Ethernet and IP header has already been parsed by the entrance program */
     nh.pos = data + sizeof(struct ethhdr) + sizeof(struct iphdr);
