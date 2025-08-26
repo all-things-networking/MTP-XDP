@@ -120,11 +120,14 @@ void RpcSocket::server_request(uint8_t qidx, struct data_header *d, uint32_t rem
     }
 }
 
-void RpcSocket::client_response(uint8_t qidx, struct data_header *d)
+void RpcSocket::client_response(uint8_t qidx, struct data_header *d, char *pkt)
 {
-    auto msg_len = __be32_to_cpu(d->message_length);
-    auto offset = __be32_to_cpu(d->seg.offset);
-    auto seg_len = __be32_to_cpu(d->seg.segment_length);
+    //auto msg_len = __be32_to_cpu(d->message_length);
+    //auto offset = __be32_to_cpu(d->seg.offset);
+    //auto seg_len = __be32_to_cpu(d->seg.segment_length);
+    auto msg_len = homa_rxmeta_mtp_msg_len(pkt);
+    auto offset = homa_rxmeta_mtp_offset(pkt);
+    auto seg_len = homa_rxmeta_mtp_seg_len(pkt);
     char *payload = d->seg.data;
     auto slot_idx = d->unused1;
     InternalReqMeta *req_meta = &_reqmeta_slots[slot_idx];
@@ -376,7 +379,7 @@ void RpcSocket::poll_nic_rx(void)
                 enqueue_reap_backlog(reap_server_buffer_addr);
 
             if (client_rpc(rpcid))
-                client_response(qidx, d);
+                client_response(qidx, d, pkt);
             else if (_req_handler)
                 server_request(qidx, d, remote_ip, rpcid, pkt);
 
@@ -511,7 +514,7 @@ void RpcSocket::poll_nic_rx_block(int timeout)
                 enqueue_reap_backlog(reap_server_buffer_addr);
 
             if (client_rpc(rpcid))
-                client_response(qidx, d);
+                client_response(qidx, d, pkt);
             else if (_req_handler)
                 server_request(qidx, d, remote_ip, rpcid, pkt);
 

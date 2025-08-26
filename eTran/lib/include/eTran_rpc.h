@@ -395,7 +395,7 @@ class RpcSocket
     }
 
     /* handler for client RPC when receiving response */
-    void client_response(uint8_t qidx, struct data_header *d);
+    void client_response(uint8_t qidx, struct data_header *d, char *pkt);
 
     /* handler for server RPC when receiving request */
     void server_request(uint8_t qidx, struct data_header *d, uint32_t remote_ip, uint64_t rpcid, char *pkt);

@@ -154,6 +154,11 @@ void pkt_gen_instr_wrapper(struct data_header *d, struct HOMABP *bp) {
 }
 
 static __always_inline
+void new_tx_ordered_data(__u32 msg_len, struct rpc_state *ctx) {
+    ctx->new_rx_ord_data_msg_len = msg_len;
+}
+
+static __always_inline
 int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_event *ev, 
     struct HOMABP *bp, struct rpc_state *ctx,
     __u64 *rpc_qid, bool *trigger)
@@ -164,6 +169,8 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
     __u32 offset = bpf_ntohl(bp->data.seg.offset);
     __u32 packet_bytes = bpf_ntohl(bp->data.seg.segment_length);
     bool single_packet = message_length <= HOMA_MSS;
+
+    new_tx_ordered_data(message_length, ctx);
     
     new_ctx_instr_wrapper(ctx, ev, bp, first_packet, true);
 
@@ -517,7 +524,6 @@ update_prios -> the other 8 tail call functions in XDP_GEN
 gen_grants -> the main XDP_GEN function (after the tail call happens)
 */
 
-
 // Question: for both of these functions I set some values
 // that I added to RX metadata. Is this okay? Because the
 // RX metadata is different in TCP
@@ -686,6 +692,8 @@ int recv_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
         {
             /* ensure that only we can delete it */
             ctx->state = BPF_RPC_DEAD;
+
+            add_rx_data_seg_wrapper(ev->segment_length, ev->offset, data_meta, ctx);
             RPC_UNLOCK(ctx);
             
             /* userspace will use this metadata to free buffers */
@@ -719,6 +727,7 @@ int recv_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
         
         ctx->cc.bytes_remaining = message_length - seg_length;
 
+        add_rx_data_seg_wrapper(ev->segment_length, ev->offset, data_meta, ctx);
         RPC_UNLOCK(ctx);
 
         __sync_fetch_and_add(&total_incoming, (__u64)(incoming - seg_length));
@@ -741,6 +750,7 @@ int recv_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
             ctx->cc.incoming = incoming;
         ctx->cc.bytes_remaining -= seg_length;
 
+        add_rx_data_seg_wrapper(ev->segment_length, ev->offset, data_meta, ctx);
         if (int_out->complete == 1)
         {   /* all response packets have been received */
             ctx->state = BPF_RPC_DEAD;
@@ -787,3 +797,4 @@ int recv_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     hkey.remote_ip = ev->flow_id.remote_ip;
     return insert_grant_list(ctx, &hkey, message_length);
 }
+
