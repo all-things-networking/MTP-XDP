@@ -68,11 +68,14 @@ void RpcSocket::run_event_loop_block(int timeout)
     flush_rpc_retransmission_queue();
 }
 
-void RpcSocket::server_request(uint8_t qidx, struct data_header *d, uint32_t remote_ip, uint64_t rpcid) {
+void RpcSocket::server_request(uint8_t qidx, struct data_header *d, uint32_t remote_ip, uint64_t rpcid, char *pkt) {
     auto remote_port = __be16_to_cpu(d->common.sport);
-    auto msg_len = __be32_to_cpu(d->message_length);
+    /*auto msg_len = __be32_to_cpu(d->message_length);
     auto offset = __be32_to_cpu(d->seg.offset);
-    auto seg_len = __be32_to_cpu(d->seg.segment_length);
+    auto seg_len = __be32_to_cpu(d->seg.segment_length);*/
+    auto msg_len = homa_rxmeta_mtp_msg_len(pkt);
+    auto offset = homa_rxmeta_mtp_offset(pkt);
+    auto seg_len = homa_rxmeta_mtp_seg_len(pkt);
     auto slot_idx = d->unused1;
     char *payload = d->seg.data;
     struct sockaddr_in dest_addr = {
@@ -375,7 +378,7 @@ void RpcSocket::poll_nic_rx(void)
             if (client_rpc(rpcid))
                 client_response(qidx, d);
             else if (_req_handler)
-                server_request(qidx, d, remote_ip, rpcid);
+                server_request(qidx, d, remote_ip, rpcid, pkt);
 
             /* free the AF_XDP UMEM buffer */
             thread_bcache_prod(bc, addr);
@@ -510,7 +513,7 @@ void RpcSocket::poll_nic_rx_block(int timeout)
             if (client_rpc(rpcid))
                 client_response(qidx, d);
             else if (_req_handler)
-                server_request(qidx, d, remote_ip, rpcid);
+                server_request(qidx, d, remote_ip, rpcid, pkt);
 
             /* free the AF_XDP UMEM buffer */
             thread_bcache_prod(bc, addr);

@@ -329,6 +329,8 @@ struct rpc_state {
     __u16 resend_count;
     void *cc_node;
     struct bpf_spin_lock hash_lock; // 4B
+
+    __u32 new_rx_ord_data_msg_len;
 } __attribute__((aligned(64)));
 static_assert(sizeof(struct rpc_state) == 256, "rpc_state size is not 256 bytes");
 #else
@@ -390,6 +392,8 @@ struct rpc_state
     // used for throttle list to avoid allocation overhead
     struct rpc_state_cc __kptr *cc_node;
     struct bpf_spin_lock hash_lock; // 4B
+
+    __u32 new_rx_ord_data_msg_len;
 } __attribute__((aligned(64)));
 _Static_assert (sizeof(struct rpc_state) == 256, "rpc_state size is not 256 bytes");
 #endif

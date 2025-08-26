@@ -398,7 +398,7 @@ class RpcSocket
     void client_response(uint8_t qidx, struct data_header *d);
 
     /* handler for server RPC when receiving request */
-    void server_request(uint8_t qidx, struct data_header *d, uint32_t remote_ip, uint64_t rpcid);
+    void server_request(uint8_t qidx, struct data_header *d, uint32_t remote_ip, uint64_t rpcid, char *pkt);
 
     /* called by server RPC when multi-packet request is completed */
     inline void multi_pkt_req_complete(std::unordered_map<struct eTran_homa_rpc_tuple, struct InternalReqHandle, 

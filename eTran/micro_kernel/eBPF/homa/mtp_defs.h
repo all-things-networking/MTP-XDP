@@ -517,18 +517,22 @@ update_prios -> the other 8 tail call functions in XDP_GEN
 gen_grants -> the main XDP_GEN function (after the tail call happens)
 */
 
-// Question: how can the compiler know that choose_grants, update_prios, etc
-// would go to XDP_GEN?
 
+// Question: for both of these functions I set some values
+// that I added to RX metadata. Is this okay? Because the
+// RX metadata is different in TCP
 static __always_inline
-void new_rx_ordered_data_wrapper(__u32 msg_len, struct homa_meta_info *data_meta) {
+void new_rx_ordered_data_wrapper(__u32 msg_len, struct homa_meta_info *data_meta, struct rpc_state *ctx) {
     data_meta->rx.msg_len = msg_len;
+    ctx->new_rx_ord_data_msg_len = msg_len;
 }
 
 static __always_inline
-void add_rx_data_seg_wrapper(__u32 seg_len, __u32 offset, struct homa_meta_info *data_meta) {
+void add_rx_data_seg_wrapper(__u32 seg_len, __u32 offset, struct homa_meta_info *data_meta, struct rpc_state *ctx) {
     data_meta->rx.seg_len = seg_len;
     data_meta->rx.offset = offset;
+    if(data_meta->rx.msg_len == 0)
+        data_meta->rx.msg_len = ctx->new_rx_ord_data_msg_len;
 }
 
 static __always_inline
@@ -567,12 +571,17 @@ int first_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
     __sync_fetch_and_add(&total_incoming, (__u64)(incoming - seg_length));
 
-    new_rx_ordered_data_wrapper(ev->message_length, data_meta);
+    new_rx_ordered_data_wrapper(ev->message_length, data_meta, ctx);
 
-    add_rx_data_seg_wrapper(ev->segment_length, ev->offset, data_meta);
+    add_rx_data_seg_wrapper(ev->segment_length, ev->offset, data_meta, ctx);
 
-    if (int_out->complete)
+    if (int_out->complete) {
+        // Question: I also wanted to have some kind of wrapper for
+        // flush_and_notify, but there isn't enough space in RX metadata
+        // for the signal. Any suggestions on how to do that?
+        // flush_and_notify_wrapper();
         return XDP_REDIRECT;
+    }
 
     //if (need_schedule)
     //    cache_this_rpc(hkey);
@@ -632,10 +641,11 @@ int next_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     
     __sync_fetch_and_sub(&total_incoming, (__u64)seg_length);
 
+    add_rx_data_seg_wrapper(ev->segment_length, ev->offset, data_meta, ctx);
+
     if (int_out->complete)
         return XDP_REDIRECT;
 
-    // Question: so no caching for now?
     //if (need_schedule)
     //    cache_this_rpc(hkey);
 
