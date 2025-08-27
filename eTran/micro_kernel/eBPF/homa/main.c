@@ -200,7 +200,6 @@ static __always_inline void fill_ip_hdr(struct iphdr *iph, __u32 len)
     /* fill ip header */
     iph->ihl = 5;
     iph->version = 4;
-    bpf_printk("%u", len);
     iph->tot_len = bpf_htons(len - sizeof(struct ethhdr));
     iph->id = bpf_htons(0);
     iph->frag_off = 0;

@@ -450,6 +450,7 @@ int get_context_mtp(struct hkey key, struct rpc_state **state, bool *first_req) 
     if(!(*state)) {
         *first_req = true;
         struct rpc_state new_state = {0};
+        new_state.local_port = key.local_port;
         bpf_map_update_elem(&rpc_tbl, &hkey, &new_state, BPF_NOEXIST);
         *state = bpf_map_lookup_elem(&rpc_tbl, &hkey);
         if(!(*state)) {
@@ -553,6 +554,7 @@ int first_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
     CHECK_AND_DROP_LOG(ev->retransmit, "server_request: retransmitted packet tries to create state.");
 
+    RPC_LOCK(ctx);
     ctx->remote_ip = ev->flow_id.remote_ip;
     ctx->remote_port = ev->flow_id.remote_port;
     ctx->local_port = ev->flow_id.local_port;
@@ -574,6 +576,8 @@ int first_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     int_out->new_state = true;
     int_out->need_schedule = message_length > ctx->cc.incoming;
     int_out->last_bytes_remaining = message_length - seg_length;
+
+    RPC_UNLOCK(ctx);
 
     __sync_fetch_and_add(&total_incoming, (__u64)(incoming - seg_length));
 
@@ -812,6 +816,8 @@ int sched_ep(struct net_event *ev, struct rpc_state *ctx,
 
     if (!int_out->new_state || !int_out->need_schedule)
         return XDP_REDIRECT;
+
+    bpf_printk("HELLO");
 
     struct rpc_state_cc *elem = NULL;
     struct rpc_state_cc *next_elem = NULL;
