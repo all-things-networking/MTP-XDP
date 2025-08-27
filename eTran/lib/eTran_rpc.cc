@@ -122,15 +122,18 @@ void RpcSocket::server_request(uint8_t qidx, struct data_header *d, uint32_t rem
 
 void RpcSocket::client_response(uint8_t qidx, struct data_header *d, char *pkt)
 {
-    //auto msg_len = __be32_to_cpu(d->message_length);
-    //auto offset = __be32_to_cpu(d->seg.offset);
-    //auto seg_len = __be32_to_cpu(d->seg.segment_length);
-    auto msg_len = homa_rxmeta_mtp_msg_len(pkt);
-    auto offset = homa_rxmeta_mtp_offset(pkt);
-    auto seg_len = homa_rxmeta_mtp_seg_len(pkt);
+    auto msg_len = __be32_to_cpu(d->message_length);
+    auto offset = __be32_to_cpu(d->seg.offset);
+    auto seg_len = __be32_to_cpu(d->seg.segment_length);
+    //auto msg_len1 = homa_rxmeta_mtp_msg_len(pkt);
+    //auto offset1 = homa_rxmeta_mtp_offset(pkt);
+    //auto seg_len1 = homa_rxmeta_mtp_seg_len(pkt);
     char *payload = d->seg.data;
     auto slot_idx = d->unused1;
     InternalReqMeta *req_meta = &_reqmeta_slots[slot_idx];
+
+    //printf("\nPacket: %u %u %u\n", msg_len, offset, seg_len);
+    //printf("Meta: %u %u %u\n", msg_len1, offset1, seg_len1);
 
     /* single-packet message */
     if (likely(msg_len <= HOMA_MSS)) {
@@ -702,6 +705,9 @@ int RpcSocket::message_tx_segmentation(InternalReqMeta *req_meta, unsigned int s
     /* continue from the last segment */
     unsigned int copy_offset = req_meta->seq * HOMA_MSS;
     size -= copy_offset;
+
+    req_meta->curr_offset = copy_offset;
+    req_meta->rest_msg_len = (unsigned int) size;
     
     /* figure out how many buffers are needed */
     unsigned int nr_buffers = homa_get_nr_buffers_from_len(size);
@@ -773,6 +779,7 @@ int RpcSocket::message_tx_segmentation(InternalReqMeta *req_meta, unsigned int s
             req_meta->rpcid);
 
         send_req_ep_user(bp, ev, req_meta);
+        //printf("%u %u %u\n", message_length, copy_offset, plen);
         #else
         /* fill IP header */
         struct iphdr *iph = reinterpret_cast<struct iphdr *>(pkt + sizeof(struct ethhdr));

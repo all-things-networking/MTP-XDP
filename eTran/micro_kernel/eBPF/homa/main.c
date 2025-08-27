@@ -329,9 +329,8 @@ int xdp_egress_prog(struct xdp_md *ctx)
         d->seg.ack.sport = 0;
     }
 
-    bpf_printk("%u", data_end - data);
+    //bpf_printk("%u", data_end - data);
 
-    // TODO: understand why this is problematic
     #ifdef MTP_ON
     int err = 0;
     data_end = (void *)(long)ctx->data_end;
@@ -351,7 +350,7 @@ int xdp_egress_prog(struct xdp_md *ctx)
     
     CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
 
-    bpf_printk("%u", data_end - data);
+    //bpf_printk("%u", data_end - data);
     #endif
 
     fill_ip_hdr(iph, (data_end - data));
@@ -359,7 +358,6 @@ int xdp_egress_prog(struct xdp_md *ctx)
     if (action == XDP_TX) {
         return xmit_packet(ctx, eth, iph);
     }
-    bpf_printk("CARALHO");
     
     ret = enqueue_pkt_to_rl(ctx, rpc_qid, eth, iph);
     
