@@ -200,6 +200,7 @@ static __always_inline void fill_ip_hdr(struct iphdr *iph, __u32 len)
     /* fill ip header */
     iph->ihl = 5;
     iph->version = 4;
+    bpf_printk("%u", len);
     iph->tot_len = bpf_htons(len - sizeof(struct ethhdr));
     iph->id = bpf_htons(0);
     iph->frag_off = 0;
@@ -328,7 +329,7 @@ int xdp_egress_prog(struct xdp_md *ctx)
         d->seg.ack.sport = 0;
     }
 
-    fill_ip_hdr(iph, (data_end - data));
+    bpf_printk("%u", data_end - data);
 
     // TODO: understand why this is problematic
     #ifdef MTP_ON
@@ -349,11 +350,16 @@ int xdp_egress_prog(struct xdp_md *ctx)
     d = (struct data_header *)c;
     
     CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
+
+    bpf_printk("%u", data_end - data);
     #endif
+
+    fill_ip_hdr(iph, (data_end - data));
 
     if (action == XDP_TX) {
         return xmit_packet(ctx, eth, iph);
     }
+    bpf_printk("CARALHO");
     
     ret = enqueue_pkt_to_rl(ctx, rpc_qid, eth, iph);
     

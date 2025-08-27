@@ -754,7 +754,7 @@ int RpcSocket::message_tx_segmentation(InternalReqMeta *req_meta, unsigned int s
         }
         req_meta->prev_buffer_addr = addr;
 
-        plen = std::min((size_t)HOMA_MSS, size);
+        plen = std::min((size_t)(HOMA_MSS - sizeof(struct app_event) - sizeof(struct HOMABP)), size);
 
         #ifdef MTP_ON
         struct iphdr *iph = reinterpret_cast<struct iphdr *>(pkt + sizeof(struct ethhdr));

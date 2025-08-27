@@ -78,11 +78,12 @@ static __always_inline int fib_lookup(struct xdp_md *ctx, struct ethhdr *eth, st
     struct bpf_fib_lookup fib_params = {0};
     set_fib_params(&fib_params, iph, ctx->ingress_ifindex);
     int fib_rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), BPF_FIB_LOOKUP_DIRECT | BPF_FIB_LOOKUP_OUTPUT);
-    if (unlikely(fib_rc != BPF_FIB_LKUP_RET_SUCCESS))
+    if (unlikely(fib_rc != BPF_FIB_LKUP_RET_SUCCESS)) {
         return -1;
+    }
     /* Fill ethernet header */
     set_ethhdr(eth, &fib_params);
-    
+
     /* update cache */
     return update_dst_entry_in_cache(iph, eth);
 }
