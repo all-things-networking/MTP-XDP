@@ -221,8 +221,10 @@ int xdp_egress_prog(struct xdp_md *ctx)
     struct common_header *c;
     struct data_header *d;
     int action, ret;
+    #ifndef MTP_ON
     __u64 rpc_qid = MAX_BUCKET_SIZE;
     bool trigger = false;
+    #endif
 
     /* adjust data_meta to access metadata in headroom */
     CHECK_AND_DROP_LOG(bpf_xdp_adjust_meta(ctx, -(int)sizeof(*data_meta)) != 0, "xdp_adjust_meta failed");
@@ -297,10 +299,11 @@ int xdp_egress_prog(struct xdp_md *ctx)
         state = bpf_map_lookup_elem(&rpc_tbl, &hkey);
         CHECK_AND_DROP_LOG(!state, "client_request, bpf_map_lookup_elem failed.");
     }
+    struct interm_out int_out = {0};
     if (rpc_is_client(bpf_be64_to_cpu(bp->common.sender_id)))
-        action = send_req_ep_client(d, iph, ev, bp, state, &rpc_qid, &trigger);
+        action = send_req_ep_client(d, iph, ev, bp, state, &int_out);
     else
-        action = send_resp_ep_server(d, iph, ev, bp, state, &rpc_qid, &trigger);
+        action = send_resp_ep_server(d, iph, ev, bp, state, &int_out);
     #endif
     
     #ifndef MTP_ON
@@ -358,9 +361,9 @@ int xdp_egress_prog(struct xdp_md *ctx)
         return xmit_packet(ctx, eth, iph);
     }
     
-    ret = enqueue_pkt_to_rl(ctx, rpc_qid, eth, iph);
+    ret = enqueue_pkt_to_rl(ctx, state->qid, eth, iph);
     
-    if (trigger)
+    if (int_out.trigger)
         kick_pacer();
     
     return ret;
@@ -440,14 +443,13 @@ int xdp_sock_prog(struct xdp_md *ctx)
     if(!get_context_mtp(ev.flow_id, &state, &first_pkt_rpc) || !state)
         return XDP_DROP;
 
+    struct interm_out int_out = {0};
     if(proto_type == DATA) {
         // Question: should we have an EP for this? Or how can we abstract it?
         struct ack_net_info ack_info = {0};
         if(!parse_ack_info(&nh, data_end, &ack_info, ev.flow_id.remote_ip))
             return XDP_DROP;
         reclaim_rpc_mtp(ack_info, data_meta);
-
-        struct interm_out int_out = {0};
 
         if (rpc_is_client(local_id(ev.flow_id.rpcid))) {
             ret = recv_resp_pkt_ep(&ev, state, data_meta, &int_out);
@@ -462,6 +464,12 @@ int xdp_sock_prog(struct xdp_md *ctx)
         }
 
         CHECK_AND_DROP_LOG(ret == XDP_DROP, "XDP_DROP for error rpc state");
+
+    } else if(proto_type == RESEND) {
+            ret = resend_pkt_ep(&ev, state, data_meta, &int_out);
+            if (ret == UNKNOWN || ret == BUSY) {
+                return xmit_ctrl_pkt(ctx, ret);
+            }
     }
 
     target_xsk = bpf_map_lookup_elem(&port_tbl, &(ev.flow_id.local_port));

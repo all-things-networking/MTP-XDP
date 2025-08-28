@@ -331,6 +331,7 @@ struct rpc_state {
     struct bpf_spin_lock hash_lock; // 4B
 
     __u32 new_rx_ord_data_msg_len;
+    //__u32 bytes_remaining;
 } __attribute__((aligned(64)));
 static_assert(sizeof(struct rpc_state) == 256, "rpc_state size is not 256 bytes");
 #else
@@ -394,6 +395,7 @@ struct rpc_state
     struct bpf_spin_lock hash_lock; // 4B
 
     __u32 new_rx_ord_data_msg_len;
+    //__u32 bytes_remaining;
 } __attribute__((aligned(64)));
 _Static_assert (sizeof(struct rpc_state) == 256, "rpc_state size is not 256 bytes");
 #endif

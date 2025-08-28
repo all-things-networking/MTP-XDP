@@ -98,6 +98,7 @@ struct interm_out {
     __u32 last_bytes_remaining;
     bool last_grant;
     bool send_fifo_rpc;
+    bool trigger;
 };
 
 // Question: if we don't use BP to fill the initial context
@@ -109,7 +110,8 @@ void new_ctx_instr_wrapper(struct rpc_state *ctx, struct app_event *ev, struct H
             /* create a new RPC state */
             ctx->state = BPF_RPC_OUTGOING;
             ctx->message_length = bpf_ntohl(bp->data.message_length);
-            ctx->next_xmit_offset = bpf_ntohl(bp->data.seg.segment_length);
+            //ctx->next_xmit_offset = bpf_ntohl(bp->data.seg.segment_length);
+            ctx->next_xmit_offset = min(bpf_ntohl(bp->data.message_length), Homa_unsched_bytes);
             ctx->buffer_head = ev->addr;
             ctx->remote_port = bpf_ntohs(bp->common.dest_port);
             ctx->local_port = bpf_ntohs(bp->common.src_port);
@@ -121,7 +123,8 @@ void new_ctx_instr_wrapper(struct rpc_state *ctx, struct app_event *ev, struct H
             /* first received response packet */
             ctx->state = BPF_RPC_OUTGOING;
             ctx->message_length = bpf_ntohl(bp->data.message_length);
-            ctx->next_xmit_offset = bpf_ntohl(bp->data.seg.segment_length);
+            //ctx->next_xmit_offset = bpf_ntohl(bp->data.seg.segment_length);
+            ctx->next_xmit_offset = min(bpf_ntohl(bp->data.message_length), Homa_unsched_bytes);
             ctx->buffer_head = ev->addr;
             ctx->nr_pkts_in_rl = 0;
             ctx->cc.sched_prio = 0;
@@ -154,14 +157,19 @@ void pkt_gen_instr_wrapper(struct data_header *d, struct HOMABP *bp) {
 }
 
 static __always_inline
-void new_tx_ordered_data(__u32 msg_len, struct rpc_state *ctx) {
+void new_tx_ordered_data_wrapper(__u32 msg_len, struct rpc_state *ctx) {
     ctx->new_rx_ord_data_msg_len = msg_len;
 }
 
+
+/*static __always_inline
+void sched_instr_wrapper(__u32 bytes_remaining, struct rpc_state *ctx) {
+    ctx->bytes_remaining = bytes_remaining;
+}*/
+
 static __always_inline
 int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_event *ev, 
-    struct HOMABP *bp, struct rpc_state *ctx,
-    __u64 *rpc_qid, bool *trigger)
+    struct HOMABP *bp, struct rpc_state *ctx, struct interm_out *int_out)
 {
 
     bool first_packet = bpf_ntohs(bp->common.seq) == 0 ? 1 : 0;
@@ -169,53 +177,50 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
     __u32 offset = bpf_ntohl(bp->data.seg.offset);
     __u32 packet_bytes = bpf_ntohl(bp->data.seg.segment_length);
     bool single_packet = message_length <= HOMA_MSS;
+    __u64 cc_granted = atomic_read(&ctx->cc.granted);
 
-    new_tx_ordered_data(message_length, ctx);
-    
-    new_ctx_instr_wrapper(ctx, ev, bp, first_packet, true);
+    if(first_packet) {
 
-    /* optimization for single-packet case */
-    if (likely(single_packet)) {
-        set_prio(iph, HOMA_MAX_PRIORITY - 1);
-        bp->data.incoming = bpf_htonl(message_length);
+        new_tx_ordered_data_wrapper(message_length, ctx);
+        
+        new_ctx_instr_wrapper(ctx, ev, bp, first_packet, true);
+
+        bp->data.incoming = bpf_htonl(cc_granted);
+
+        /* optimization for single-packet case */
+        if (likely(single_packet)) {
+            set_prio(iph, HOMA_MAX_PRIORITY - 1);
+            bp->data.incoming = bpf_htonl(message_length);
+        }
+
+        if (offset + packet_bytes < Homa_unsched_bytes)
+            set_prio(iph, get_prio(message_length));
+        else
+            set_prio(iph, atomic_read(&ctx->cc.sched_prio));
+
         pkt_gen_instr_wrapper(d, bp);
+
+        //__u32 bytes_remaining = ev->msg_len - cc_granted;
+        //sched_instr_wrapper(bytes_remaining, ctx);
+
         return XDP_TX;
+
     }
 
+    bp->data.incoming = bpf_htonl(cc_granted);
     if (offset + packet_bytes < Homa_unsched_bytes)
         set_prio(iph, get_prio(message_length));
     else
         set_prio(iph, atomic_read(&ctx->cc.sched_prio));
 
-    /* check if we have enough credit */
-    __u64 cc_granted = atomic_read(&ctx->cc.granted);
-    bp->data.incoming = bpf_htonl(cc_granted);
-
-    if (offset + packet_bytes <= cc_granted) {
-        /* we have enough credit, further check three conditions to determine if we can send packet directly 
-         * 1) no packets in rate limiter
-         * 2) packet size is small enough or NIC queue is not busy
-         */
-        if (atomic_read(&ctx->nr_pkts_in_rl) == 0 &&
-            (packet_bytes <= Homa_min_throttled_bytes || check_nic_queue(packet_bytes)))
-        {
-            /* this update is safe for no packets in rate limiter */
-            ctx->next_xmit_offset = offset + packet_bytes;
-            pkt_gen_instr_wrapper(d, bp);
-            return XDP_TX;
-        }
-    }
-
     pkt_gen_instr_wrapper(d, bp);
 
-    // Question: how can we know whether a packet should be sent
-    // immediatelly or put in RL? In TCP the EP considers that we'll
-    // send the packet immediatelly, and we abstract the whole rate
-    // and delay thing.
-    // But here the decision on whether the packet should be sent or not
-    // (XDP_TX or XDP_REDIRECT) is a part of the EP.
-
-    // TODO: this part underneath should be abstracted
+    if (offset + packet_bytes <= ctx->next_xmit_offset && (atomic_read(&ctx->nr_pkts_in_rl) == 0 &&
+        (packet_bytes <= Homa_min_throttled_bytes || check_nic_queue(packet_bytes)))) {
+            
+        //ctx->next_xmit_offset = offset + packet_bytes;
+        return XDP_TX;
+    }
 
     struct rpc_state_cc *cc_node = NULL;
     struct rpc_state_cc *ref_cc_node = NULL;
@@ -253,18 +258,15 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
         /* store pointer in map for future update */
         PUT_POINTER(cc_node, ctx);
     }
-    
-    *rpc_qid = ctx->qid;
 
-    *trigger = cc_granted >= (offset + packet_bytes);
+    int_out->trigger = cc_granted >= (offset + packet_bytes);
 
     return XDP_REDIRECT;
 }
 
 static __always_inline
 int send_resp_ep_server(struct data_header *d, struct iphdr *iph, struct app_event *ev, 
-    struct HOMABP *bp, struct rpc_state *ctx,
-    __u64 *rpc_qid, bool *trigger)
+    struct HOMABP *bp, struct rpc_state *ctx, struct interm_out *int_out)
 {
 
     bool first_packet = bpf_ntohs(bp->common.seq) == 0 ? 1 : 0;
@@ -272,38 +274,41 @@ int send_resp_ep_server(struct data_header *d, struct iphdr *iph, struct app_eve
     __u32 offset = bpf_ntohl(bp->data.seg.offset);
     __u32 packet_bytes = bpf_ntohl(bp->data.seg.segment_length);
     bool single_packet = message_length <= HOMA_MSS;
-    
-    new_ctx_instr_wrapper(ctx, ev, bp, first_packet, false);
+    __u64 cc_granted = atomic_read(&ctx->cc.granted);
 
-    /* optimization for single-packet case */
-    if (likely(single_packet)) {
-        set_prio(iph, HOMA_MAX_PRIORITY - 1);
-        bp->data.incoming = bpf_htonl(message_length);
+    if(first_packet) {
+
+        new_ctx_instr_wrapper(ctx, ev, bp, first_packet, false);
+
+        bp->data.incoming = bpf_htonl(cc_granted);
+        /* optimization for single-packet case */
+        if (likely(single_packet)) {
+            set_prio(iph, HOMA_MAX_PRIORITY - 1);
+            bp->data.incoming = bpf_htonl(message_length);
+        }
+
+        if (offset + packet_bytes < Homa_unsched_bytes)
+            set_prio(iph, get_prio(message_length));
+        else
+            set_prio(iph, atomic_read(&ctx->cc.sched_prio));
+
         pkt_gen_instr_wrapper(d, bp);
         return XDP_TX;
     }
 
+    bp->data.incoming = bpf_htonl(cc_granted);
     if (offset + packet_bytes < Homa_unsched_bytes)
         set_prio(iph, get_prio(message_length));
     else
         set_prio(iph, atomic_read(&ctx->cc.sched_prio));
 
-    /* check if we have enough credit */
-    __u64 cc_granted = atomic_read(&ctx->cc.granted);
-    bp->data.incoming = bpf_htonl(cc_granted);
+    pkt_gen_instr_wrapper(d, bp);
 
-    if (offset + packet_bytes <= cc_granted) {
-        /* we have enough credit, further check three conditions to determine if we can send packet directly 
-         * 1) no packets in rate limiter
-         * 2) packet size is small enough or NIC queue is not busy
-         */
-        if (atomic_read(&ctx->nr_pkts_in_rl) == 0 &&
-            (packet_bytes <= Homa_min_throttled_bytes || check_nic_queue(packet_bytes)))
-        {
-            /* this update is safe for no packets in rate limiter */
-            ctx->next_xmit_offset = offset + packet_bytes;
-            return XDP_TX;
-        }
+    if (offset + packet_bytes <= ctx->next_xmit_offset && (atomic_read(&ctx->nr_pkts_in_rl) == 0 &&
+    (packet_bytes <= Homa_min_throttled_bytes || check_nic_queue(packet_bytes)))) {
+        
+        //ctx->next_xmit_offset = offset + packet_bytes;
+        return XDP_TX;
     }
 
     struct rpc_state_cc *cc_node = NULL;
@@ -344,8 +349,7 @@ int send_resp_ep_server(struct data_header *d, struct iphdr *iph, struct app_eve
         /* store pointer in map for future update */
         PUT_POINTER(cc_node, ctx);
     }
-    *rpc_qid = ctx->qid;
-    *trigger = cc_granted >= (offset + packet_bytes);
+    int_out->trigger = cc_granted >= (offset + packet_bytes);
 
     return XDP_REDIRECT;
 }
@@ -1283,3 +1287,74 @@ out:
     return XDP_REDIRECT;
 }
 #endif
+
+
+static __always_inline
+int resend_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
+    struct homa_meta_info *data_meta, struct interm_out *int_out) {
+
+    bool need_kick = false;
+
+    RPC_LOCK(ctx);
+
+    if (ctx->state == BPF_RPC_DEAD) {
+        RPC_UNLOCK(ctx);
+        int_out->type_pkt = UNKNOWN;
+        return UNKNOWN;
+    }
+
+    if (!rpc_is_client(ev->flow_id.rpcid) && ctx->state != BPF_RPC_OUTGOING) {
+        /* We are the server for this RPC. If we haven't received
+         * all of the bytes we've granted then request a resend
+         * of the missing bytes; otherwise just send a BUSY.
+         */
+        if (
+            ctx->message_length - ctx->cc.bytes_remaining > (ctx->cc.incoming/HOMA_MSS) * HOMA_MSS || 
+            ((ctx->message_length - ctx->cc.bytes_remaining == (ctx->cc.incoming/HOMA_MSS) * HOMA_MSS) && 
+            ctx->cc.incoming != ctx->message_length)
+            )
+        {
+            // case#1: we have received all the bytes we've granted
+            int_out->type_pkt = BUSY;
+        }
+        else
+        {
+            // case#2: it seems that we lost some packets, which causes **client** to
+            // send RESEND packets. Leave server timeout to handle this.
+            int_out->type_pkt = 0;
+        }
+
+    } else if (ev->offset >= ctx->next_xmit_offset) {
+        /* We have chosen not to transmit data from this message;
+         * send BUSY instead.
+         */
+        int_out->type_pkt = BUSY;
+        if (ctx->next_xmit_offset < ctx->message_length && 
+            ctx->next_xmit_offset + 1420 <= ctx->cc.granted)
+            need_kick = true;
+    }
+    else
+    {
+        if (ev->length == 0)
+        {
+            /* This RESEND is from a server just trying to determine
+             * whether the client still cares about the RPC; return
+             * BUSY so the server doesn't time us out.
+             */
+            int_out->type_pkt = BUSY;
+        }
+    }
+
+    if (int_out->type_pkt == RESEND) {
+        data_meta->rx.reap_server_buffer_addr = ctx->buffer_head;
+        ctx->resend_count++;
+    }
+
+    RPC_UNLOCK(ctx);
+
+    if (need_kick) {
+        kick_pacer();
+    }
+
+    return int_out->type_pkt;
+}
