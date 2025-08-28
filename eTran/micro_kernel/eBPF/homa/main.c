@@ -467,10 +467,11 @@ int xdp_sock_prog(struct xdp_md *ctx)
 
     } else if(proto_type == RESEND) {
             ret = resend_pkt_ep(&ev, state, data_meta, &int_out);
-            if (ret == UNKNOWN || ret == BUSY) {
-                return xmit_ctrl_pkt(ctx, ret);
-            }
+            ret = tx_resend_resp(&ev, state, data_meta, &int_out, ctx);
     }
+
+    if(ret == XDP_TX)
+        return XDP_TX;
 
     target_xsk = bpf_map_lookup_elem(&port_tbl, &(ev.flow_id.local_port));
     CHECK_AND_DROP_LOG(!target_xsk, "Can't find corresponding XSK fd for this packet");

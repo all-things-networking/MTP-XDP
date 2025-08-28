@@ -135,7 +135,7 @@ void new_ctx_instr_wrapper(struct rpc_state *ctx, struct app_event *ev, struct H
 }
 
 static __always_inline
-void pkt_gen_instr_wrapper(struct data_header *d, struct HOMABP *bp) {
+void pkt_gen_instr_data_wrapper(struct data_header *d, struct HOMABP *bp) {
     d->common.sport = bp->common.src_port;
     d->common.dport = bp->common.dest_port;
     d->common.doff = bp->common.doff;
@@ -198,7 +198,7 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
         else
             set_prio(iph, atomic_read(&ctx->cc.sched_prio));
 
-        pkt_gen_instr_wrapper(d, bp);
+        pkt_gen_instr_data_wrapper(d, bp);
 
         //__u32 bytes_remaining = ev->msg_len - cc_granted;
         //sched_instr_wrapper(bytes_remaining, ctx);
@@ -213,7 +213,7 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
     else
         set_prio(iph, atomic_read(&ctx->cc.sched_prio));
 
-    pkt_gen_instr_wrapper(d, bp);
+    pkt_gen_instr_data_wrapper(d, bp);
 
     if (offset + packet_bytes <= ctx->next_xmit_offset && (atomic_read(&ctx->nr_pkts_in_rl) == 0 &&
         (packet_bytes <= Homa_min_throttled_bytes || check_nic_queue(packet_bytes)))) {
@@ -292,7 +292,7 @@ int send_resp_ep_server(struct data_header *d, struct iphdr *iph, struct app_eve
         else
             set_prio(iph, atomic_read(&ctx->cc.sched_prio));
 
-        pkt_gen_instr_wrapper(d, bp);
+        pkt_gen_instr_data_wrapper(d, bp);
         return XDP_TX;
     }
 
@@ -302,7 +302,7 @@ int send_resp_ep_server(struct data_header *d, struct iphdr *iph, struct app_eve
     else
         set_prio(iph, atomic_read(&ctx->cc.sched_prio));
 
-    pkt_gen_instr_wrapper(d, bp);
+    pkt_gen_instr_data_wrapper(d, bp);
 
     if (offset + packet_bytes <= ctx->next_xmit_offset && (atomic_read(&ctx->nr_pkts_in_rl) == 0 &&
     (packet_bytes <= Homa_min_throttled_bytes || check_nic_queue(packet_bytes)))) {
@@ -1329,6 +1329,8 @@ int resend_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
          * send BUSY instead.
          */
         int_out->type_pkt = BUSY;
+
+        // Question: how to abstract this?
         if (ctx->next_xmit_offset < ctx->message_length && 
             ctx->next_xmit_offset + 1420 <= ctx->cc.granted)
             need_kick = true;
@@ -1352,9 +1354,71 @@ int resend_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
     RPC_UNLOCK(ctx);
 
+    // Question: how to abstract this?
     if (need_kick) {
         kick_pacer();
     }
 
     return int_out->type_pkt;
+}
+
+
+static __always_inline
+int pkt_gen_instr_common_hdr_wrapper(struct HOMABP bp, struct xdp_md *xdp_ctx) {
+
+    __u32 ip_swap;
+    __u8 mac_swap[ETH_ALEN];
+
+    int length = (int)sizeof(struct common_header) - (int)sizeof(struct resend_header); // < 0
+
+    if (bpf_xdp_adjust_tail(xdp_ctx, length))
+    {
+        log_err("bpf_xdp_adjust_tail failed.");
+        return XDP_DROP;
+    }
+
+    void *data = (void *)(long)xdp_ctx->data;
+    void *data_end = (void *)(long)xdp_ctx->data_end;
+    struct ethhdr *eth = (struct ethhdr *)data;
+    if (eth + 1 > data_end)
+        return XDP_DROP;
+    struct iphdr *iph = (struct iphdr *)(eth + 1);
+    if (iph + 1 > data_end)
+        return XDP_DROP;
+    struct common_header *c = (struct common_header *)(iph + 1);
+    if (c + 1 > data_end)
+        return XDP_DROP;
+
+    c->type = bp.common.type;
+    c->sender_id = bpf_cpu_to_be64(local_id(bp.common.sender_id));
+    c->sport = bp.common.src_port;
+    c->dport = bp.common.dest_port;
+
+    ip_swap = iph->saddr;
+    iph->saddr = iph->daddr;
+    iph->daddr = ip_swap;
+
+    __builtin_memcpy(mac_swap, eth->h_source, ETH_ALEN);
+    __builtin_memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
+    __builtin_memcpy(eth->h_dest, mac_swap, ETH_ALEN);
+
+    return XDP_TX;
+}
+
+
+static __always_inline
+int tx_resend_resp(struct net_event *ev, struct rpc_state *ctx,
+    struct homa_meta_info *data_meta, struct interm_out *int_out,
+    struct xdp_md *xdp_ctx) {
+
+    if(int_out->type_pkt != UNKNOWN && int_out->type_pkt != BUSY)
+        return int_out->type_pkt;
+
+    struct HOMABP bp;
+    bp.common.type = int_out->type_pkt;
+    bp.common.sender_id = ev->flow_id.rpcid;
+    bp.common.src_port = ev->flow_id.remote_port;
+    bp.common.dest_port = ev->flow_id.local_port;
+
+    return pkt_gen_instr_common_hdr_wrapper(bp, xdp_ctx);
 }
