@@ -1293,7 +1293,8 @@ static __always_inline
 int resend_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     struct homa_meta_info *data_meta, struct interm_out *int_out) {
 
-    bool need_kick = false;
+    //bool need_kick = false;
+    int_out->type_pkt = RESEND;
 
     RPC_LOCK(ctx);
 
@@ -1330,10 +1331,9 @@ int resend_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
          */
         int_out->type_pkt = BUSY;
 
-        // Question: how to abstract this?
-        if (ctx->next_xmit_offset < ctx->message_length && 
+        /*if (ctx->next_xmit_offset < ctx->message_length && 
             ctx->next_xmit_offset + 1420 <= ctx->cc.granted)
-            need_kick = true;
+            need_kick = true;*/
     }
     else
     {
@@ -1364,10 +1364,9 @@ int resend_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
     RPC_UNLOCK(ctx);
 
-    // Question: how to abstract this?
-    if (need_kick) {
+    /*if (need_kick) {
         kick_pacer();
-    }
+    }*/
 
     return int_out->type_pkt;
 }
@@ -1434,6 +1433,24 @@ int tx_resend_resp(struct net_event *ev, struct rpc_state *ctx,
 }
 
 static __always_inline
+void destroy_ctx_instr_wrapper(struct rpc_state *ctx, struct hkey flow_id,
+    struct homa_meta_info *data_meta, struct xdp_md *xdp_ctx) {
+
+    void *data_end = (void *)(long)xdp_ctx->data_end;
+    struct unknown_header *homa_unknown_h = (struct unknown_header *)(sizeof(struct ethhdr) + sizeof(struct iphdr) + 1);
+    if (homa_unknown_h + 1 > data_end) {
+        return;
+    }
+
+    data_meta->rx.reap_client_buffer_addr = ctx->buffer_head;
+    ctx->buffer_head = __UINT64_MAX__;
+
+    homa_unknown_h->common.type = RESEND;
+
+    bpf_map_delete_elem(&rpc_tbl, &flow_id);
+}
+
+static __always_inline
 int unkown_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     struct homa_meta_info *data_meta, struct interm_out *int_out,
     struct xdp_md *xdp_ctx) {
@@ -1485,22 +1502,13 @@ int unkown_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     }
     else
     {
-        void *data_end = (void *)(long)xdp_ctx->data_end;
-        struct unknown_header *homa_unknown_h = (struct unknown_header *)(sizeof(struct ethhdr) + sizeof(struct iphdr) + 1);
-        if (homa_unknown_h + 1 > data_end) {
-            return -1;
-        }
 
         // Question: do we have a ctx_destroy or something similar in MTP?
         ctx->state = BPF_RPC_DEAD;
-        data_meta->rx.reap_client_buffer_addr = ctx->buffer_head;
-        ctx->buffer_head = __UINT64_MAX__;
 
         RPC_UNLOCK(ctx);
 
-        homa_unknown_h->common.type = RESEND;
-
-        bpf_map_delete_elem(&rpc_tbl, &(ev->flow_id));
+        destroy_ctx_instr_wrapper(ctx, ev->flow_id, data_meta, xdp_ctx);
         
         return 0;
     }
@@ -1518,3 +1526,67 @@ void busy_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
     ctx->busy_count++;
 }
+
+// Question/TODO: how to translate the MTP program to something like this?
+#if 0
+static __always_inline void grant_pkt_ep(struct grant_header *homa_grant_h, __u32 remote_ip)
+{
+    struct rpc_key_t hkey = {0};
+    struct rpc_state *rpc_slot = NULL;
+    struct rpc_state_cc *cc_node = NULL;
+    struct rpc_state_cc *ref_cc_node = NULL;
+
+    __u32 offset = bpf_ntohl(homa_grant_h->offset);
+    __u64 rpcid = bpf_be64_to_cpu(homa_grant_h->common.sender_id);
+    rpcid = local_id(rpcid);
+
+    hkey.rpcid = rpcid;
+    hkey.local_port = bpf_ntohs(homa_grant_h->common.dport);
+    hkey.remote_port = bpf_ntohs(homa_grant_h->common.sport);
+    hkey.remote_ip = remote_ip;
+
+    rpc_slot = bpf_map_lookup_elem(&rpc_tbl, &hkey);
+    if (unlikely(!rpc_slot)) {
+        log_err("receive unknown grant pkt");
+        return;
+    }
+    if (rpc_slot->state != BPF_RPC_OUTGOING)
+        return;
+
+    atomic_xchg(&rpc_slot->cc.sched_prio, homa_grant_h->priority);
+
+    if (rpc_slot->cc.granted < offset)
+    {
+        // Since we don't enforce load balancing for grant packets, only one CPU will
+        // handle this grant packet. So we don't need any lock
+        atomic_xchg(&rpc_slot->cc.granted, offset);
+
+        // bpf_printk("RPC#%llu, grant = %u", rpcid, offset);
+        
+        if (atomic_read(&rpc_slot->qid) != MAX_BUCKET_SIZE)
+        {
+            GET_POINTER(cc_node, rpc_slot);
+            if (unlikely(!cc_node)) {
+                // werid case
+                kick_pacer();
+                return;
+            }
+            ref_cc_node = bpf_refcount_acquire(cc_node);
+            if (unlikely(!ref_cc_node)) {
+                // this should never happen
+                bpf_printk("We are receiving GRANT, but we can't get cc_node reference for RPC#%llu", rpcid);
+                PUT_POINTER(cc_node, rpc_slot);
+                kick_pacer();
+                return;
+            }
+            THROTTLE_LOCK();
+            if (bpf_rbtree_add(&troot, &ref_cc_node->rbtree_link, srpt_less_pacer) == 0)
+                atomic_inc(&nr_rpc_in_throttle);
+            THROTTLE_UNLOCK();
+            PUT_POINTER(cc_node, rpc_slot);
+        }
+    }
+    kick_pacer();
+    // bpf_printk("kick pacer for RPC#%llu", rpcid);
+}
+#endif
