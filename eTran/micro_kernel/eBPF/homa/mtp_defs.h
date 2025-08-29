@@ -1348,6 +1348,16 @@ int resend_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     }
 
     if (int_out->type_pkt == RESEND) {
+        // Question: in this case, we will redirect the packet to userspace to
+        // resend the packets from there. But in case this condition isn't met,
+        // we XDP_TX the packet as BUSY/UNKOWN. How can the compiler differentiate these
+        // two approaches?
+        // Maybe based on the type of the packet? If it is DATA, it goes to userspace,
+        // if not, it goes out through XDP_TX
+
+        // Question: should we have the BP declaration here and use the BP here to
+        // mutate the packet, before sending it back to userspace?
+        // (The line below will be by default when we redirect to userspace)
         data_meta->rx.reap_server_buffer_addr = ctx->buffer_head;
         ctx->resend_count++;
     }
@@ -1421,4 +1431,90 @@ int tx_resend_resp(struct net_event *ev, struct rpc_state *ctx,
     bp.common.dest_port = ev->flow_id.local_port;
 
     return pkt_gen_instr_common_hdr_wrapper(bp, xdp_ctx);
+}
+
+static __always_inline
+int unkown_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
+    struct homa_meta_info *data_meta, struct interm_out *int_out,
+    struct xdp_md *xdp_ctx) {
+        
+    __u32 next_xmit_offset = 0;
+
+    RPC_LOCK(ctx);
+    if (unlikely(ctx->state == BPF_RPC_DEAD))
+    {
+        RPC_UNLOCK(ctx);
+        return XDP_DROP;
+    }
+
+    if (rpc_is_client(ev->flow_id.rpcid))
+    {
+        if (ctx->state == BPF_RPC_OUTGOING)
+        {
+            // Question: here, we would retransmit to userspace,
+            // specifying the buffer from which to start retransmitting
+            // and mutate the packet with a resend header, instead of unknown,
+            // so the userspace treats it as a resend.
+            // How to abstract this?
+            data_meta->rx.reap_server_buffer_addr = ctx->buffer_head;
+            next_xmit_offset = ctx->next_xmit_offset;
+            RPC_UNLOCK(ctx);
+            if (bpf_xdp_adjust_tail(xdp_ctx, sizeof(struct resend_header) - sizeof(struct unknown_header)))
+            {
+                return -1;
+            }
+            void *data = (void *)(long)xdp_ctx->data;
+            void *data_end = (void *)(long)xdp_ctx->data_end;
+            struct ethhdr *eth = (struct ethhdr *)data;
+            if (eth + 1 > data_end) {
+                return -1;
+            }
+            struct iphdr *iph = (struct iphdr *)(eth + 1);
+            if (iph + 1 > data_end) {
+                return -1;
+            }
+            struct resend_header *homa_resend_h = (struct resend_header *)(iph + 1);
+            if (homa_resend_h + 1 > data_end) {
+                return -1;
+            }
+            homa_resend_h->common.type = RESEND;
+            homa_resend_h->offset = 0;
+            homa_resend_h->length = bpf_htonl(next_xmit_offset);
+            return 0;
+        }
+    }
+    else
+    {
+        void *data_end = (void *)(long)xdp_ctx->data_end;
+        struct unknown_header *homa_unknown_h = (struct unknown_header *)(sizeof(struct ethhdr) + sizeof(struct iphdr) + 1);
+        if (homa_unknown_h + 1 > data_end) {
+            return -1;
+        }
+
+        // Question: do we have a ctx_destroy or something similar in MTP?
+        ctx->state = BPF_RPC_DEAD;
+        data_meta->rx.reap_client_buffer_addr = ctx->buffer_head;
+        ctx->buffer_head = __UINT64_MAX__;
+
+        RPC_UNLOCK(ctx);
+
+        homa_unknown_h->common.type = RESEND;
+
+        bpf_map_delete_elem(&rpc_tbl, &(ev->flow_id));
+        
+        return 0;
+    }
+    RPC_UNLOCK(ctx);
+    return -1;
+}
+
+static __always_inline
+void busy_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
+    struct homa_meta_info *data_meta, struct interm_out *int_out) {
+
+    if (ctx->state == BPF_RPC_DEAD) {
+        return;
+    }
+
+    ctx->busy_count++;
 }
