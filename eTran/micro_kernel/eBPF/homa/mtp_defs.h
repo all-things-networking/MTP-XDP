@@ -1553,11 +1553,114 @@ int choose_grants(struct xdp_md *ctx)
             }
         }
     }
-    bpf_tail_call(ctx, &xdp_gen_tail_call_map, XDP_GEN_COMPLETE_GRANT_1);
+    
+    // TODO: change later
+    return XDP_PASS;
+}
 
-    // fallthrough: bpf_tail_call failed
+static __always_inline
+int update_prios(struct xdp_md *ctx)
+{
+
+    __u32 cpu = bpf_get_smp_processor_id();
+    if (unlikely(cpu >= MAX_CPU))
+    {
+        bpf_printk("ERROR: CPU Mapping, cpu=%d\n", cpu);
+        return XDP_ABORTED;
+    }
+    __u16 peer_id = 0;
+    struct remove_info *ri = NULL;
+
+    if (nr_grant_candidate[cpu] < 1)
+    {
+        release_grantable_lock();
+        if (nr_grant_ready[cpu] > 0)
+        {
+            finish_grant_choose[cpu] = 1;
+            return XDP_DROP;
+        }
+        else
+            return XDP_ABORTED;
+    }
+
+    ri = bpf_map_lookup_elem(&per_cpu_remove_info, ZERO_KEY);
+    if (!ri)
+    {
+        // this should never happen
+        release_grantable_lock();
+        return XDP_ABORTED;
+    }
+
+    for(int i = 0; i < 8; i++) {
+        if (remove[cpu][i])
+        {
+            struct rpc_state_cc *cc_node_t0 = NULL;
+            struct rpc_state_cc *cc_node_t1 = NULL;
+            struct bpf_rb_node *rb_node = NULL;
+            peer_id = get_peerid(ri->remote_ip[i]);
+
+            cc_node_t0 = bpf_obj_new(typeof(*cc_node_t0));
+            if (!cc_node_t0)
+            {
+                release_grantable_lock();
+                return XDP_ABORTED;
+            }
+
+            cc_node_t1 = bpf_refcount_acquire(cc_node_t0);
+            if (!cc_node_t1)
+            {
+                bpf_obj_drop(cc_node_t0);
+                release_grantable_lock();
+                return XDP_ABORTED;
+            }
+
+            cc_node_t0->tree_id = 0;
+            cc_node_t0->peer_id = peer_id;
+            cc_node_t0->bytes_remaining = 0;
+            cc_node_t0->hkey.rpcid = 0;
+            cc_node_t0->hkey.local_port = 0;
+            cc_node_t0->hkey.remote_port = 0;
+            cc_node_t0->hkey.remote_ip = 0;
+            GRANT_LOCK();
+            rb_node = bpf_rbtree_lower_bound(&groot, &cc_node_t0->rbtree_link, srpt_less_rpc);
+            if (rb_node)
+            {
+                cc_node_t0 = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                if (cc_node_t0->tree_id == 0 && cc_node_t0->peer_id == peer_id && (cc_node_t0->birth & 1) == 0)
+                {
+                    // we should add this rpc to peer tree
+                    cc_node_t1->tree_id = 1;
+                    cc_node_t1->peer_id = cc_node_t0->peer_id;
+                    cc_node_t1->bytes_remaining = cc_node_t0->bytes_remaining;
+                    cc_node_t1->incoming = cc_node_t0->incoming;
+                    cc_node_t1->hkey.rpcid = cc_node_t0->hkey.rpcid;
+                    cc_node_t1->hkey.local_port = cc_node_t0->hkey.local_port;
+                    cc_node_t1->hkey.remote_ip = cc_node_t0->hkey.remote_ip;
+                    cc_node_t1->hkey.remote_port = cc_node_t0->hkey.remote_port;
+                    cc_node_t1->message_length = cc_node_t0->message_length;
+                    // mark this rpc is in peer tree
+                    cc_node_t0->birth |= (__u64)1;
+                    cc_node_t1->birth = cc_node_t0->birth;
+
+                    bpf_rbtree_add(&groot, &cc_node_t1->rbtree_link, srpt_less_peer);
+                    cc_node_t1 = NULL;
+                }
+            }
+            GRANT_UNLOCK();
+            if (cc_node_t1)
+                bpf_obj_drop(cc_node_t1);
+        }
+    }
+
     release_grantable_lock();
-    return XDP_ABORTED;
+    
+    if (nr_grant_ready[cpu] > 0)
+    {
+        finish_grant_choose[cpu] = 1;
+        return XDP_DROP;
+    }
+    else
+        return XDP_ABORTED;
 }
 
 static __always_inline

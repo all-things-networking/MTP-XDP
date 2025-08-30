@@ -54,7 +54,10 @@ int xdp_gen_prog(struct xdp_md *ctx)
         update_grant_for_cached_rpc(cpu);
 
         //bpf_tail_call(ctx, &xdp_gen_tail_call_map, XDP_GEN_CHOOSE_RPC_TO_GRANT);
-        choose_grants(ctx);
+        if(choose_grants(ctx) == XDP_ABORTED)
+            return XDP_ABORTED;
+
+        update_prios(ctx);
         // fallthrough: bpf_tail_call failed
         return XDP_ABORTED;
     }
