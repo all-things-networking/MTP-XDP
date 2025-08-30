@@ -53,7 +53,8 @@ int xdp_gen_prog(struct xdp_md *ctx)
         // force to clear the last cached rpc
         update_grant_for_cached_rpc(cpu);
 
-        bpf_tail_call(ctx, &xdp_gen_tail_call_map, XDP_GEN_CHOOSE_RPC_TO_GRANT);
+        //bpf_tail_call(ctx, &xdp_gen_tail_call_map, XDP_GEN_CHOOSE_RPC_TO_GRANT);
+        choose_grants(ctx);
         // fallthrough: bpf_tail_call failed
         return XDP_ABORTED;
     }
@@ -472,8 +473,10 @@ int xdp_sock_prog(struct xdp_md *ctx)
 
     } else if(proto_type == UNKNOWN) {
         ret = unkown_pkt_ep(&ev, state, data_meta, &int_out, ctx);
+
     } else if(proto_type == BUSY) {
         busy_pkt_ep(&ev, state, data_meta, &int_out);
+        
     }
 
     if(ret == XDP_TX)

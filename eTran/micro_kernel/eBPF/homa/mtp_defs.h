@@ -1291,6 +1291,276 @@ out:
 }
 
 static __always_inline
+int choose_grants(struct xdp_md *ctx)
+{
+    struct rpc_state_cc * cc_node[8];
+    cc_node[0] = NULL;
+    cc_node[1] = NULL;
+    cc_node[2] = NULL;
+    cc_node[3] = NULL;
+    cc_node[4] = NULL;
+    cc_node[5] = NULL;
+    cc_node[6] = NULL;
+    cc_node[7] = NULL;
+    __u32 cpu = bpf_get_smp_processor_id();
+    if (unlikely(cpu >= MAX_CPU))
+    {
+        bpf_printk("ERROR: CPU Mapping, cpu=%d\n", cpu);
+        return XDP_ABORTED;
+    }
+    struct rpc_state_cc *n = NULL;
+    struct bpf_rb_node *rb_node = NULL;
+    __u16 nr_rpc = 0;
+    struct remove_info *ri = NULL;
+    __u16 next_peer_id = 0;
+    __u32 min_last_bytes_remaining = 0;
+    __u32 new_grant = 0;
+    int available = 0;
+    __u32 increment = 0;
+    __u32 total_increment = 0;
+    int priority = 0;
+    int extra_levels = 0;
+    int prio_idx = 0;
+    int actual_rpc = 0;
+
+    if (!try_grantable_lock())
+    {
+        return XDP_ABORTED;
+    }
+
+    ri = bpf_map_lookup_elem(&per_cpu_remove_info, ZERO_KEY);
+    if (!ri)
+    {
+        release_grantable_lock();
+        return XDP_ABORTED;
+    }
+
+    cc_node[0] = bpf_obj_new(typeof(*cc_node[0]));
+    if (!cc_node[0])
+    {
+        release_grantable_lock();
+        return XDP_ABORTED;
+    }
+    cc_node[1] = bpf_refcount_acquire(cc_node[0]);
+    if (!cc_node[1])
+    {
+        bpf_obj_drop(cc_node[0]);
+        release_grantable_lock();
+        return XDP_ABORTED;
+    }
+    cc_node[2] = bpf_refcount_acquire(cc_node[0]);
+    if (!cc_node[2])
+    {
+        bpf_obj_drop(cc_node[0]);
+        bpf_obj_drop(cc_node[1]);
+        release_grantable_lock();
+        return XDP_ABORTED;
+    }
+    cc_node[3] = bpf_refcount_acquire(cc_node[0]);
+    if (!cc_node[3])
+    {
+        bpf_obj_drop(cc_node[0]);
+        bpf_obj_drop(cc_node[1]);
+        bpf_obj_drop(cc_node[2]);
+        release_grantable_lock();
+        return XDP_ABORTED;
+    }
+    cc_node[4] = bpf_refcount_acquire(cc_node[0]);
+    if (!cc_node[4])
+    {
+        bpf_obj_drop(cc_node[0]);
+        bpf_obj_drop(cc_node[1]);
+        bpf_obj_drop(cc_node[2]);
+        bpf_obj_drop(cc_node[3]);
+        release_grantable_lock();
+        return XDP_ABORTED;
+    }
+    cc_node[5] = bpf_refcount_acquire(cc_node[0]);
+    if (!cc_node[5])
+    {
+        bpf_obj_drop(cc_node[0]);
+        bpf_obj_drop(cc_node[1]);
+        bpf_obj_drop(cc_node[2]);
+        bpf_obj_drop(cc_node[3]);
+        bpf_obj_drop(cc_node[4]);
+        release_grantable_lock();
+        return XDP_ABORTED;
+    }
+    cc_node[6] = bpf_refcount_acquire(cc_node[0]);
+    if (!cc_node[6])
+    {
+        bpf_obj_drop(cc_node[0]);
+        bpf_obj_drop(cc_node[1]);
+        bpf_obj_drop(cc_node[2]);
+        bpf_obj_drop(cc_node[3]);
+        bpf_obj_drop(cc_node[4]);
+        bpf_obj_drop(cc_node[5]);
+        release_grantable_lock();
+        return XDP_ABORTED;
+    }
+    cc_node[7] = bpf_refcount_acquire(cc_node[0]);
+    if (!cc_node[7])
+    {
+        bpf_obj_drop(cc_node[0]);
+        bpf_obj_drop(cc_node[1]);
+        bpf_obj_drop(cc_node[2]);
+        bpf_obj_drop(cc_node[3]);
+        bpf_obj_drop(cc_node[4]);
+        bpf_obj_drop(cc_node[5]);
+        bpf_obj_drop(cc_node[6]);
+        release_grantable_lock();
+        return XDP_ABORTED;
+    }
+
+    // step2: choose rpcs to grant (not dequeue)
+    GRANT_LOCK();
+
+    for(int i = 0; i < 8; i++) {
+        cc_node[i]->tree_id = 1;
+        cc_node[i]->bytes_remaining = min_last_bytes_remaining;
+        cc_node[i]->peer_id = next_peer_id;
+        rb_node = bpf_rbtree_lower_bound(&groot, &cc_node[i]->rbtree_link, srpt_less_peer);
+        cc_node[i] = NULL;
+        if (rb_node)
+        {
+            n = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+            // no need to check, if rb_node!= NULL, tree_id must be 1
+            min_last_bytes_remaining = n->bytes_remaining;
+            ri->rpcid[i] = n->hkey.rpcid;
+            ri->local_port[i] = n->hkey.local_port;
+            ri->remote_port[i] = n->hkey.remote_port;
+            ri->remote_ip[i] = n->hkey.remote_ip;
+            next_peer_id = get_peerid(n->hkey.remote_ip) + 1;
+
+            // grant the rpc
+            new_grant = n->message_length - n->bytes_remaining + Homa_grant_window;
+            if (new_grant > n->message_length)
+                new_grant = n->message_length;
+            available = Homa_max_incoming - total_incoming;
+            increment = new_grant - n->incoming;
+            if (increment > 0 && available > 0)
+            {
+                if (increment > available)
+                {
+                    increment = available;
+                    new_grant = n->incoming + increment;
+                }
+
+                n->incoming = new_grant;
+                remove[cpu][i] = n->incoming >= n->message_length;
+                if (remove[cpu][i])
+                {
+                    rb_node = bpf_rbtree_remove(&groot, &n->rbtree_link);
+                    if (rb_node)
+                    {
+                        n = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                        n->tree_id = 0;
+                        rb_node = bpf_rbtree_lower_bound(&groot, &n->rbtree_link, srpt_less_rpc);
+                        if (rb_node)
+                        {
+                            n = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+
+                            rb_node = bpf_rbtree_remove(&groot, &n->rbtree_link);
+                            cc_node[i] = rb_node ? container_of(rb_node, struct rpc_state_cc, rbtree_link) : NULL;
+                        }
+                    }
+                }
+                total_increment += increment;
+                ri->newgrant[i] = new_grant;
+            }
+            nr_rpc++;
+        }
+        else
+            break;
+    }
+
+    __sync_fetch_and_add(&total_incoming, total_increment);
+
+    grant_nonfifo_left -= total_increment;
+    if (grant_nonfifo_left <= 0)
+    {
+        grant_nonfifo_left += grant_nonfifo;
+#ifndef DISABLE_GRANT_FIFO
+        need_grant_fifo[cpu] = 1;
+#endif
+    }
+
+    GRANT_UNLOCK();
+
+    if (cc_node[0])
+        bpf_obj_drop(cc_node[0]);
+    if (cc_node[1])
+        bpf_obj_drop(cc_node[1]);
+    if (cc_node[2])
+        bpf_obj_drop(cc_node[2]);
+    if (cc_node[3])
+        bpf_obj_drop(cc_node[3]);
+    if (cc_node[4])
+        bpf_obj_drop(cc_node[4]);
+    if (cc_node[5])
+        bpf_obj_drop(cc_node[5]);
+    if (cc_node[6])
+        bpf_obj_drop(cc_node[6]);
+    if (cc_node[7])
+        bpf_obj_drop(cc_node[7]);
+
+    //   bpf_printk("%d RPCs are choosen to grant", nr_rpc);
+    if (nr_rpc == 0)
+    {
+#ifdef HELP_PACER
+        help_pacer();
+#endif
+        release_grantable_lock();
+        return XDP_ABORTED;
+    }
+
+    nr_grant_candidate[cpu] = nr_rpc;
+
+    for (int i = 0; i < nr_rpc; i++)
+    {
+        if (ri->newgrant[i & 7])
+        {
+            actual_rpc++;
+            priority = HOMA_MAX_SCHED_PRIO - (prio_idx++);
+            if (priority < 0)
+                priority = 0;
+            ri->priority[i & 7] = priority;
+            // bpf_printk("Grant to RPC#%llu to offset: %lu", ri->rpcid[i&7], ri->newgrant[i&7]);
+        }
+    }
+    nr_grant_ready[cpu] = actual_rpc;
+
+    if (actual_rpc == 0)
+    {
+#ifdef HELP_PACER
+        help_pacer();
+#endif
+        release_grantable_lock();
+        return XDP_ABORTED;
+    }
+
+    extra_levels = HOMA_MAX_SCHED_PRIO + 1 - actual_rpc;
+    if (extra_levels >= 0)
+    {
+        for (int i = 0; i < nr_rpc; i++)
+        {
+            if (ri->newgrant[i & 7])
+            {
+                priority = ri->priority[i & 7];
+                priority -= extra_levels;
+                if (priority)
+                    ri->priority[i & 7] = priority;
+            }
+        }
+    }
+    bpf_tail_call(ctx, &xdp_gen_tail_call_map, XDP_GEN_COMPLETE_GRANT_1);
+
+    // fallthrough: bpf_tail_call failed
+    release_grantable_lock();
+    return XDP_ABORTED;
+}
+
+static __always_inline
 int resend_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     struct homa_meta_info *data_meta, struct interm_out *int_out) {
 
