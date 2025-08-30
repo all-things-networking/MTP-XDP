@@ -241,9 +241,9 @@ int xdp_egress_prog(struct xdp_md *ctx)
     c = (struct common_header *)(iph + 1);
     d = (struct data_header *)c;
     
-    //CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
-    if(d + 1 > data_end)
-        return XDP_DROP;
+    CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
+    //if(d + 1 > data_end)
+    //    return XDP_DROP;
 
     CHECK_AND_DROP_LOG(iph->protocol != IPPROTO_HOMA, "not HOMA protocol");
 
@@ -457,10 +457,11 @@ int xdp_sock_prog(struct xdp_md *ctx)
         } else {
             if(first_pkt_rpc) {
                 ret = first_req_pkt_ep(&ev, state, data_meta, &int_out);
+                ret = no_ctx_sched_ep(&ev, state, data_meta, &int_out);
             } else {
                 ret = next_req_pkt_ep(&ev, state, data_meta, &int_out);
+                ret = sched_ep(&ev, state, data_meta, &int_out);
             }
-            ret = sched_ep(&ev, state, data_meta, &int_out);
         }
 
         CHECK_AND_DROP_LOG(ret == XDP_DROP, "XDP_DROP for error rpc state");

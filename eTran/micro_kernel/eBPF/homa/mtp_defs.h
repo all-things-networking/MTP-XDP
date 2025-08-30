@@ -815,6 +815,200 @@ int recv_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 }
 
 static __always_inline
+int no_ctx_sched_ep(struct net_event *ev, struct rpc_state *ctx,
+    struct homa_meta_info *data_meta, struct interm_out *int_out) {
+    
+    if (int_out->complete)
+        return XDP_REDIRECT;
+
+    if (!int_out->need_schedule)
+        return XDP_REDIRECT;
+
+    
+    struct rpc_state_cc *elem = NULL;
+    struct rpc_state_cc *next_elem = NULL;
+    struct rpc_state_cc *search_elem = NULL;
+    struct rpc_state_cc *prio_elem = NULL;
+    struct bpf_rb_node *rb_node = NULL;
+    
+    /* allocate new object for Tree0 */
+    elem = bpf_obj_new(typeof(*elem));
+    CHECK_AND_DROP_LOG(!elem, "server_request: bpf_obj_new failed.");
+    /* allocate new object for Tree1 */
+    prio_elem = bpf_obj_new(typeof(*prio_elem));
+    if (unlikely(!prio_elem))
+    {
+        bpf_obj_drop(elem);
+        return XDP_DROP;
+    }
+    /* use bpf_refcount_acquire rather than bpf_obj_new for better performance */
+    search_elem = bpf_refcount_acquire(prio_elem);
+    if (unlikely(!search_elem))
+    {
+        bpf_obj_drop(elem);
+        bpf_obj_drop(prio_elem);
+        return XDP_DROP;
+    }
+
+    next_elem = bpf_refcount_acquire(search_elem);
+    if (unlikely(!next_elem))
+    {
+        bpf_obj_drop(elem);
+        bpf_obj_drop(prio_elem);
+        bpf_obj_drop(search_elem);
+        return XDP_DROP;
+    }
+
+    elem->tree_id = 0;
+    elem->peer_id = get_peerid(ev->flow_id.remote_ip);
+    elem->bytes_remaining = int_out->last_bytes_remaining;
+    elem->incoming = ev->incoming;
+    elem->hkey.rpcid = local_id(ev->flow_id.rpcid);
+    elem->hkey.local_port = ev->flow_id.local_port;
+    elem->hkey.remote_ip = ev->flow_id.remote_ip;
+    elem->hkey.remote_port = ev->flow_id.remote_port;
+    elem->message_length = ev->message_length;
+    // Question: in MTP we use int_out.rpc_birth, but it isn't used anywhere else
+    elem->birth = bpf_ktime_get_ns();
+    elem->birth &= ~(__u64)1;
+
+    GRANT_LOCK();
+    bpf_rbtree_add(&groot, &elem->rbtree_link, srpt_less_rpc);
+
+    search_elem->tree_id = 0;
+    search_elem->peer_id = elem->peer_id;
+    search_elem->bytes_remaining = 0;
+    search_elem->hkey.rpcid = 0;
+    search_elem->hkey.local_port = 0;
+    search_elem->hkey.remote_port = 0;
+    search_elem->hkey.remote_ip = 0;
+
+    rb_node = bpf_rbtree_lower_bound(&groot, &search_elem->rbtree_link, srpt_less_rpc);
+    if (unlikely(!rb_node))
+    {   /* this should never happen */
+        GRANT_UNLOCK();
+        bpf_obj_drop(prio_elem);
+        prio_elem = NULL;
+        search_elem = NULL;
+        goto out;
+    }
+    else
+    {
+        struct rpc_state_cc * highest_prio = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+        //search_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+        if (unlikely(highest_prio->tree_id != 0 || highest_prio->peer_id != elem->peer_id))
+        {   /* this should never happen */
+            GRANT_UNLOCK();
+            bpf_obj_drop(prio_elem);
+            prio_elem = NULL;
+            search_elem = NULL;
+            goto out;
+        } else if(highest_prio->hkey.rpcid == elem->hkey.rpcid &&
+            highest_prio->hkey.local_port == elem->hkey.local_port &&
+            highest_prio->hkey.remote_port == elem->hkey.remote_port &&
+            highest_prio->hkey.remote_ip == elem->hkey.remote_ip){
+
+            next_elem->tree_id = 0;
+            next_elem->peer_id = elem->peer_id;
+            next_elem->bytes_remaining = elem->bytes_remaining;
+            next_elem->hkey.rpcid = elem->hkey.rpcid;
+            next_elem->hkey.local_port = elem->hkey.local_port;
+            next_elem->hkey.remote_port = elem->hkey.remote_port;
+            next_elem->hkey.remote_ip = elem->hkey.remote_ip + 1;
+
+            rb_node = bpf_rbtree_lower_bound(&groot, &next_elem->rbtree_link, srpt_less_rpc);
+            if (rb_node)
+            {
+                next_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                if (next_elem->tree_id != 0 || next_elem->peer_id != elem->peer_id){
+                //if (next_elem->tree_id == 0 && next_elem->peer_id == elem->peer_id){
+                    if(int_out->new_state || !(highest_prio->birth & 1)) { // lowest bit of birth 1 means it is in peer tree) 
+                        
+                        prio_elem->tree_id = 1;
+                        prio_elem->peer_id = elem->peer_id;
+                        prio_elem->bytes_remaining = elem->bytes_remaining;
+                        prio_elem->incoming = ev->incoming;
+                        prio_elem->hkey.rpcid = local_id(ev->flow_id.rpcid);
+                        prio_elem->hkey.local_port = ev->flow_id.local_port;
+                        prio_elem->hkey.remote_ip = ev->flow_id.remote_ip;
+                        prio_elem->hkey.remote_port = ev->flow_id.remote_port;
+                        prio_elem->message_length = ev->message_length;
+                        elem->birth |= (__u64)1;
+                        prio_elem->birth = elem->birth;
+
+                        bpf_rbtree_add(&groot, &prio_elem->rbtree_link, srpt_less_peer);
+                        prio_elem = NULL;
+                    }
+
+                } else {
+                    /* use prio_elem to search and remove it from Tree1 */
+                    prio_elem->tree_id = 1;
+                    prio_elem->peer_id = next_elem->peer_id;
+                    prio_elem->bytes_remaining = next_elem->bytes_remaining;
+                    rb_node = bpf_rbtree_lower_bound(&groot, &prio_elem->rbtree_link, srpt_less_peer);
+                    if (rb_node)
+                    {
+                        prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                        if (prio_elem->tree_id == 1 && prio_elem->peer_id == next_elem->peer_id)
+                        {
+                            rb_node = bpf_rbtree_remove(&groot, &prio_elem->rbtree_link);
+                            if (rb_node)
+                            {
+                                prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                                /* update incoming from Tree1 here as it may be modified */
+                                next_elem->birth &= ~(__u64)1;
+                                next_elem->incoming = prio_elem->incoming;
+
+                                prio_elem->tree_id = 1;
+                                prio_elem->peer_id = elem->peer_id;
+                                prio_elem->bytes_remaining = elem->bytes_remaining;
+                                prio_elem->incoming = ev->incoming;
+                                prio_elem->hkey.rpcid = local_id(ev->flow_id.rpcid);
+                                prio_elem->hkey.local_port = ev->flow_id.local_port;
+                                prio_elem->hkey.remote_ip = ev->flow_id.remote_ip;
+                                prio_elem->hkey.remote_port = ev->flow_id.remote_port;
+                                prio_elem->message_length = ev->message_length;
+                                /* mark this rpc is in Tree1 */
+                                elem->birth |= (__u64)1;
+                                prio_elem->birth = elem->birth;
+                
+                                bpf_rbtree_add(&groot, &prio_elem->rbtree_link, srpt_less_peer);
+                                prio_elem = NULL;
+                            }
+                            else { /* this should never happen */
+                                prio_elem = NULL;
+                            }
+                        }
+                        else { /* this should never happen */
+                            prio_elem = NULL;
+                        }
+                    }
+                    else { /* this should never happen */
+                        prio_elem = NULL;
+                    }
+                }
+            }
+            next_elem = NULL;
+            search_elem = NULL;
+        } else {
+            search_elem = NULL;
+        }
+    }
+
+    GRANT_UNLOCK();
+out:
+    if (prio_elem)
+        bpf_obj_drop(prio_elem);
+    if (search_elem)
+        bpf_obj_drop(search_elem);
+    if (next_elem)
+        bpf_obj_drop(next_elem);
+    
+    return XDP_REDIRECT;
+}
+
+
+/*static __always_inline
 struct rpc_state_cc * find_ge_wrapper(struct rpc_state_cc *elem,
     bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b)) {
 
@@ -826,7 +1020,7 @@ struct rpc_state_cc * find_ge_wrapper(struct rpc_state_cc *elem,
         elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
         return elem;
     }
-}
+}*/
 
 static __always_inline
 int sched_ep(struct net_event *ev, struct rpc_state *ctx,
