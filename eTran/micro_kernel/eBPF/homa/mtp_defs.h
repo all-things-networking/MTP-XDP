@@ -88,6 +88,17 @@ struct HOMABP {
     struct DATA_HDR data;
 };
 
+struct GRANT_HDR {
+    __be32 offset;
+    __u8 priority;
+    __u8 resend_all;
+};
+
+struct HOMABP_GEN {
+    struct COMMON_HDR common;
+    struct GRANT_HDR grant;
+};
+
 
 struct interm_out {
     __u8 type_pkt;
@@ -1662,6 +1673,245 @@ int update_prios(struct xdp_md *ctx)
     else
         return XDP_ABORTED;
 }
+
+static __always_inline
+int pkt_gen_instr_grant_wrapper(struct HOMABP_GEN *bp, struct xdp_md *ctx, __u32 local_ip, __u32 remote_ip) {
+    if (bpf_xdp_adjust_tail(ctx, -HOMA_GRANT_HEADER_CUTOFF))
+    {
+        bpf_printk("ERROR: bpf_xdp_adjust_tail failed\n");
+        return XDP_DROP;
+    }
+
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    // Ethernet header
+    struct ethhdr *eth = (struct ethhdr *)data;
+    if (unlikely(eth + 1 > data_end))
+    {
+        return XDP_DROP;
+    }
+
+    // IP header
+    struct iphdr *iph = (struct iphdr *)(eth + 1);
+    if (unlikely(iph + 1 > data_end))
+    {
+        return XDP_DROP;
+    }
+
+    iph->saddr = bpf_htonl(local_ip);
+    iph->daddr = bpf_htonl(remote_ip);
+    iph->version = IPVERSION;
+    iph->protocol = IPPROTO_HOMA;
+    iph->ihl = 0x5;
+    iph->tos = bp->grant.priority << 5;
+    iph->tot_len = bpf_htons(sizeof(struct iphdr) + sizeof(struct grant_header));
+    iph->id = 0;
+    iph->ttl = IPDEFTTL;
+    iph->check = 0;
+
+    // grant header
+    struct grant_header *gh = (struct grant_header *)(iph + 1);
+    if (unlikely(gh + 1 > data_end))
+    {
+        return XDP_DROP;
+    }
+
+    gh->common.type = bp->common.type;
+    gh->common.dport = bpf_htons(bp->common.dest_port);
+    gh->common.sport = bpf_htons(bp->common.src_port);
+    gh->common.sender_id = bpf_cpu_to_be64(bp->common.sender_id);
+    gh->offset = bpf_htonl(bp->grant.offset);
+    gh->priority = bp->grant.priority;
+    gh->resend_all = bp->grant.resend_all;
+
+    // TODO: this might be problematic, because some parts of
+    // reset_grants_state come first
+    int err = fib_lookup(ctx, eth, iph);
+    if (unlikely(err))
+    {
+        bpf_printk("ERROR: bpf_fib_lookup failed in XDP_GEN, check routing table in kernel");
+        return XDP_DROP;
+    }
+
+    return XDP_TX;
+}
+
+static __always_inline
+int gen_grants(struct xdp_md *ctx, struct interm_out *int_out)
+{
+    __u32 cpu = bpf_get_smp_processor_id();
+
+    if(!finish_grant_choose[cpu]) {
+        return XDP_DROP;
+    }
+
+    int_out->last_grant = false;
+    bool no_work = false;
+    int_out->send_fifo_rpc = false;
+
+    unsigned int gi_idx;
+
+    struct ret_grant_info gi = {0};
+
+    granting_idx[cpu]++;
+    // bpf_printk("DEBUG: granting_idx[cpu]: %d\n", granting_idx[cpu]);
+
+    if (nr_grant_ready[cpu] == 0 && !need_grant_fifo[cpu])
+    {
+        int_out->last_grant = 1;
+        no_work = 1;
+        return XDP_DROP;
+    }
+
+    __u16 cnt = HOMA_OVERCOMMITMENT;
+    if(nr_grant_candidate[cpu] < cnt)
+        cnt = nr_grant_candidate[cpu];
+
+    // bpf_printk("need_grant_fifo[cpu]: %d", need_grant_fifo[cpu]);
+    if (need_grant_fifo[cpu] == 1)
+    {
+        // If we have RPC in the FIFO queue, we should grant it at last
+        if (granting_idx[cpu] == cnt + 1)
+        {
+            int_out->last_grant = 1;
+        }
+    }
+    else if (granting_idx[cpu] == cnt)
+    {
+        // after processing the packet, we should return XDP_ABORTED to terminate
+        int_out->last_grant = 1;
+    }
+
+    
+
+    if (need_grant_fifo[cpu] == 1 && int_out->last_grant == 1)
+    {
+        // it's time to grant the RPC in the FIFO queue
+
+        struct rpc_state_cc __kptr *cc_node_search = NULL;
+        struct bpf_rb_node *rb_node = NULL;
+
+        cc_node_search = bpf_obj_new(typeof(*cc_node_search));
+        if (unlikely(!cc_node_search)) {
+            no_work = 1;
+            need_grant_fifo[cpu] = 0; // error or no fifo rpc to grant
+            return XDP_DROP;
+        }
+
+        cc_node_search->birth = POISON_64;
+
+        GRANT_LOCK();
+
+        rb_node = bpf_rbtree_search_less(&groot, &cc_node_search->rbtree_link, less_birth_grant);
+        if (unlikely(!rb_node)) {
+            GRANT_UNLOCK();
+            no_work = 1;
+            need_grant_fifo[cpu] = 0; // error or no fifo rpc to grant
+            return XDP_DROP;
+        }
+        cc_node_search = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+
+
+        __u64 increment = 0, newgrant = 0;
+        bool need_remove = false;
+
+        increment = GRANT_FIFO_INCREMENT;
+        newgrant = increment + cc_node_search->incoming;
+        cc_node_search->incoming = newgrant;
+        if (newgrant >= cc_node_search->message_length) {
+            increment -= newgrant - cc_node_search->message_length;
+            cc_node_search->incoming = cc_node_search->message_length;
+            need_remove = true;
+        }
+
+        __sync_fetch_and_add(&total_incoming, increment);
+
+        gi.rpcid = cc_node_search->hkey.rpcid;
+        gi.sport = cc_node_search->hkey.local_port;
+        gi.dport = cc_node_search->hkey.remote_port;
+        gi.remote_ip = cc_node_search->hkey.remote_ip;
+        gi.newgrant = cc_node_search->incoming;
+        gi.priority = HOMA_MAX_SCHED_PRIO;
+
+        if (need_remove) {
+            rb_node = bpf_rbtree_remove(&groot, &cc_node_search->rbtree_link);
+            if (rb_node)
+                cc_node_search = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+            else
+                cc_node_search = NULL;
+        }
+        else
+            cc_node_search = NULL;
+
+        GRANT_UNLOCK();
+        
+        if (cc_node_search)
+            bpf_obj_drop(cc_node_search);
+        
+        int_out->send_fifo_rpc = 1;
+    
+    } else {
+        // grant the RPC in the Priority queue
+        gi_idx = (granting_idx[cpu] - 1);
+        gi_idx = gi_idx % HOMA_OVERCOMMITMENT;
+
+        struct remove_info *ri;
+        ri = bpf_map_lookup_elem(&per_cpu_remove_info, ZERO_KEY);
+        if (unlikely(!ri))
+        {
+            no_work = 1;
+            return XDP_DROP;
+        }
+
+        if (unlikely(!ri->newgrant[gi_idx])) {
+            no_work = 1;
+            return XDP_DROP;
+        }
+
+        gi.sport = ri->local_port[gi_idx];
+        gi.dport = ri->remote_port[gi_idx];
+        gi.rpcid = ri->rpcid[gi_idx];
+        gi.newgrant = ri->newgrant[gi_idx];
+        gi.remote_ip = ri->remote_ip[gi_idx];
+        gi.priority = ri->priority[gi_idx];
+
+        ri->newgrant[gi_idx] = 0;
+    }
+
+    struct HOMABP_GEN bp;
+    bp.common.type = GRANT;
+    bp.common.dest_port = gi.dport;
+    bp.common.src_port = gi.sport;
+    bp.common.sender_id = gi.rpcid;
+    bp.grant.offset = gi.newgrant;
+    bp.grant.priority = gi.priority;
+    bp.grant.resend_all = 0;
+
+    return pkt_gen_instr_grant_wrapper(&bp, ctx, local_ip, gi.remote_ip);
+}
+
+
+static __always_inline
+int reset_grants_state(struct xdp_md *ctx, struct interm_out *int_out)
+{
+    __u32 cpu = bpf_get_smp_processor_id();
+
+    if(!finish_grant_choose[cpu]) {
+        return XDP_DROP;
+    }
+    if(int_out->last_grant) {
+        granting_idx[cpu] = 0;
+        nr_grant_candidate[cpu] = 0;
+        finish_grant_choose[cpu] = 0;
+    }
+    if(int_out->send_fifo_rpc)
+        need_grant_fifo[cpu] = 0;
+    
+    return XDP_TX;
+}
+
+
 
 static __always_inline
 int resend_pkt_ep(struct net_event *ev, struct rpc_state *ctx,

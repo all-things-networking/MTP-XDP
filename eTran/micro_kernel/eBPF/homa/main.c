@@ -31,21 +31,24 @@ char LICENSE[] SEC("license") = "GPL";
 SEC("xdp_gen")
 int xdp_gen_prog(struct xdp_md *ctx)
 {
-    int err = 0;
-    int last_grant = 0; // if this is true, we should return XDP_ABORTED
-    int no_work = 0;
     __u32 cpu = bpf_get_smp_processor_id();
     if (unlikely(cpu >= MAX_CPU))
     {
         bpf_printk("ERROR: CPU Mapping, cpu=%d\n", cpu);
         return XDP_ABORTED;
     }
+    #ifndef MTP_ON
+    int err = 0;
+    int last_grant = 0; // if this is true, we should return XDP_ABORTED
+    int no_work = 0;
+    
     struct ret_grant_info gi = {0};
     void *data;
     void *data_end;
     int send_fifo_rpc = 0;
 
     unsigned int gi_idx;
+    #endif
     use_cached_lb_choice[cpu] = 0;
 
     if (finish_grant_choose[cpu] == 0)
@@ -53,14 +56,26 @@ int xdp_gen_prog(struct xdp_md *ctx)
         // force to clear the last cached rpc
         update_grant_for_cached_rpc(cpu);
 
-        //bpf_tail_call(ctx, &xdp_gen_tail_call_map, XDP_GEN_CHOOSE_RPC_TO_GRANT);
+        #ifndef MTP_ON
+        bpf_tail_call(ctx, &xdp_gen_tail_call_map, XDP_GEN_CHOOSE_RPC_TO_GRANT);
+        #else
         if(choose_grants(ctx) == XDP_ABORTED)
             return XDP_ABORTED;
 
         update_prios(ctx);
+        #endif
         // fallthrough: bpf_tail_call failed
         return XDP_ABORTED;
     }
+    #ifdef MTP_ON 
+    else {
+        struct interm_out int_out = {0};
+        int ret;
+        ret = gen_grants(ctx, &int_out);
+        ret = reset_grants_state(ctx, &int_out);
+        return ret;
+    }
+    #else
 
     granting_idx[cpu]++;
     // bpf_printk("DEBUG: granting_idx[cpu]: %d\n", granting_idx[cpu]);
@@ -196,6 +211,7 @@ reset:
         need_grant_fifo[cpu] = 0;
 
     return XDP_TX;
+    #endif
 }
 
 // Fill IP header except for addresses
