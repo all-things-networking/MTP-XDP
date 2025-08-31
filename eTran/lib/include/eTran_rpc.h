@@ -39,32 +39,32 @@ struct app_event {
 };
 
 struct HOMA_ACK {
-    uint64_t rpcid;
-    uint16_t sport;
-    uint16_t dport;
+    __be64 rpcid;
+    __be16 sport;
+    __be16 dport;
 };
 
 struct DATA_SEG {
-    uint32_t offset;
-    uint32_t segment_length;
+    __be32 offset;
+    __be32 segment_length;
     struct HOMA_ACK ack;
 };
 
 struct DATA_HDR {
-    uint32_t message_length;
-    uint32_t incoming;
-    uint16_t cutoff_version;
-    uint8_t retransmit;
+    __be32 message_length;
+    __be32 incoming;
+    __be16 cutoff_version;
+    __u8 retransmit;
     struct DATA_SEG seg;
 };
 
 struct COMMON_HDR {
-    uint32_t src_port;
-    uint32_t dest_port;
-    uint8_t doff;
-    uint8_t type;
-    uint16_t seq;
-    uint64_t sender_id;
+    __be16 src_port;
+    __be16 dest_port;
+    __u8 doff;
+    __u8 type;
+    __u16 seq;
+    __be64 sender_id;
 };
 
 struct HOMABP {

@@ -217,6 +217,7 @@ static __always_inline void fill_ip_hdr(struct iphdr *iph, __u32 len)
 SEC("xdp_egress")
 int xdp_egress_prog(struct xdp_md *ctx)
 {
+    __u32 start = bpf_ktime_get_ns();
     struct homa_meta_info *data_meta = NULL;
     void *data_end = NULL;
     void *data = NULL;
@@ -361,14 +362,24 @@ int xdp_egress_prog(struct xdp_md *ctx)
 
     fill_ip_hdr(iph, (data_end - data));
 
+    __u32 end = bpf_ktime_get_ns();
+
+    bpf_printk("%u", end - start);
+
     if (action == XDP_TX) {
         return xmit_packet(ctx, eth, iph);
     }
     
+    #ifdef MTP_ON
     ret = enqueue_pkt_to_rl(ctx, state->qid, eth, iph);
-    
     if (int_out.trigger)
         kick_pacer();
+    #else
+    ret = enqueue_pkt_to_rl(ctx, rpc_qid, eth, iph);
+
+    if (trigger)
+        kick_pacer();
+    #endif
     
     return ret;
 }

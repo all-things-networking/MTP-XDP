@@ -70,12 +70,12 @@ void RpcSocket::run_event_loop_block(int timeout)
 
 void RpcSocket::server_request(uint8_t qidx, struct data_header *d, uint32_t remote_ip, uint64_t rpcid, char *pkt) {
     auto remote_port = __be16_to_cpu(d->common.sport);
-    /*auto msg_len = __be32_to_cpu(d->message_length);
+    auto msg_len = __be32_to_cpu(d->message_length);
     auto offset = __be32_to_cpu(d->seg.offset);
-    auto seg_len = __be32_to_cpu(d->seg.segment_length);*/
-    auto msg_len = homa_rxmeta_mtp_msg_len(pkt);
+    auto seg_len = __be32_to_cpu(d->seg.segment_length);
+    /*auto msg_len = homa_rxmeta_mtp_msg_len(pkt);
     auto offset = homa_rxmeta_mtp_offset(pkt);
-    auto seg_len = homa_rxmeta_mtp_seg_len(pkt);
+    auto seg_len = homa_rxmeta_mtp_seg_len(pkt);*/
     auto slot_idx = d->unused1;
     char *payload = d->seg.data;
     struct sockaddr_in dest_addr = {
@@ -381,10 +381,11 @@ void RpcSocket::poll_nic_rx(void)
             if (reap_server_buffer_addr != POISON_64)    
                 enqueue_reap_backlog(reap_server_buffer_addr);
 
-            if (client_rpc(rpcid))
+            if (client_rpc(rpcid)) {
                 client_response(qidx, d, pkt);
-            else if (_req_handler)
+            } else if (_req_handler) {
                 server_request(qidx, d, remote_ip, rpcid, pkt);
+            }
 
             /* free the AF_XDP UMEM buffer */
             thread_bcache_prod(bc, addr);
@@ -614,6 +615,7 @@ void RpcSocket::flush_rpc_response_queue(void)
             _pending_response_queue.push(req_meta);
             break;
         }
+
         /* this rpc has been successfully segmented and transmitted, free bounce message buffer */
         free_buffer(req_meta.buffer);
 
@@ -774,6 +776,10 @@ int RpcSocket::message_tx_segmentation(InternalReqMeta *req_meta, unsigned int s
         struct app_event *ev = reinterpret_cast<struct app_event *>(pkt + HOMA_PAYLOAD_OFFSET + plen);
         struct HOMABP *bp = reinterpret_cast<struct HOMABP *>(pkt + HOMA_PAYLOAD_OFFSET + plen + sizeof(struct app_event));
 
+        /*if(req_meta->rpcid < 500) {
+            printf("%lu\n", req_meta->rpcid);
+        }*/
+        //printf("RPCID: %lu\n", req_meta->rpcid);
         parse_app_request(ev, _local_addr.sin_addr.s_addr, dest_addr->sin_addr.s_addr,
             _local_port, dest_addr->sin_port, message_length, addr,
             req_meta->rpcid);
