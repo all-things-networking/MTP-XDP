@@ -762,19 +762,20 @@ int RpcSocket::message_tx_segmentation(InternalReqMeta *req_meta, unsigned int s
         }
         req_meta->prev_buffer_addr = addr;
 
-        plen = std::min((size_t)(HOMA_MSS - sizeof(struct app_event) - sizeof(struct HOMABP)), size);
+        //plen = std::min((size_t)(HOMA_MSS - sizeof(struct app_event) - sizeof(struct HOMABP)), size);
+        plen = std::min((size_t)(HOMA_MSS - sizeof(struct app_event)), size);
 
         #ifdef MTP_ON
         struct iphdr *iph = reinterpret_cast<struct iphdr *>(pkt + sizeof(struct ethhdr));
         iph->saddr = _local_addr.sin_addr.s_addr;
         iph->daddr = dest_addr->sin_addr.s_addr;
-        iph->protocol = IPPROTO_HOMA;
+        iph->protocol = IPPROTO_HOMA; 
 
         struct data_header *d = reinterpret_cast<struct data_header *>(pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
         d->unused1 = slot_idx;
 
         struct app_event *ev = reinterpret_cast<struct app_event *>(pkt + HOMA_PAYLOAD_OFFSET + plen);
-        struct HOMABP *bp = reinterpret_cast<struct HOMABP *>(pkt + HOMA_PAYLOAD_OFFSET + plen + sizeof(struct app_event));
+        //struct HOMABP *bp = reinterpret_cast<struct HOMABP *>(pkt + HOMA_PAYLOAD_OFFSET + plen + sizeof(struct app_event));
 
         /*if(req_meta->rpcid < 500) {
             printf("%lu\n", req_meta->rpcid);
@@ -784,7 +785,7 @@ int RpcSocket::message_tx_segmentation(InternalReqMeta *req_meta, unsigned int s
             _local_port, dest_addr->sin_port, message_length, addr,
             req_meta->rpcid);
 
-        send_req_ep_user(bp, ev, req_meta);
+        //send_req_ep_user(bp, ev, req_meta);
         //printf("%u %u %u\n", message_length, copy_offset, plen);
         #else
         /* fill IP header */
@@ -828,7 +829,11 @@ int RpcSocket::message_tx_segmentation(InternalReqMeta *req_meta, unsigned int s
         desc->addr = addr;
         desc->options = XDP_EGRESS_NO_COMP;
         #ifdef MTP_ON
-        desc->len = HOMA_PAYLOAD_OFFSET + plen + sizeof(struct app_event) + sizeof(struct HOMABP);
+        //desc->len = HOMA_PAYLOAD_OFFSET + plen + sizeof(struct app_event) + sizeof(struct HOMABP);
+        desc->len = HOMA_PAYLOAD_OFFSET + plen + sizeof(struct app_event);
+        req_meta->seq++;
+        copy_offset += plen;
+        size -= plen;
         #else
         req_meta->seq++;
         copy_offset += plen;
@@ -844,7 +849,8 @@ int RpcSocket::message_tx_segmentation(InternalReqMeta *req_meta, unsigned int s
     *send_out += i;
 
     #ifdef MTP_ON
-    return req_meta->curr_offset >= buffer.actual_size ? 1 : 0;
+    //return req_meta->curr_offset >= buffer.actual_size ? 1 : 0;
+    return copy_offset >= buffer.actual_size ? 1 : 0;
     #else
     return copy_offset >= buffer.actual_size ? 1 : 0;
     #endif

@@ -262,9 +262,9 @@ int xdp_egress_prog(struct xdp_md *ctx)
     c = (struct common_header *)(iph + 1);
     d = (struct data_header *)c;
     
-    CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
-    //if(d + 1 > data_end)
-    //    return XDP_DROP;
+    //CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
+    if(d + 1 > data_end)
+        return XDP_DROP;
 
     CHECK_AND_DROP_LOG(iph->protocol != IPPROTO_HOMA, "not HOMA protocol");
 
@@ -285,9 +285,10 @@ int xdp_egress_prog(struct xdp_md *ctx)
     #ifdef MTP_ON
 
     struct app_event *ev;
-    struct HOMABP *bp;
+    //struct HOMABP *bp;
     
-    __u32 seg_len = (data_end - data) - sizeof(*eth) - sizeof(*iph) - sizeof(*d) - sizeof(*ev) - sizeof(*bp);
+    //__u32 seg_len = (data_end - data) - sizeof(*eth) - sizeof(*iph) - sizeof(*d) - sizeof(*ev) - sizeof(*bp);
+    __u32 seg_len = (data_end - data) - sizeof(*eth) - sizeof(*iph) - sizeof(*d) - sizeof(*ev);
     if(seg_len > DEFAULT_MTU) {
         bpf_printk("Error here 1");
         return XDP_DROP;
@@ -301,30 +302,24 @@ int xdp_egress_prog(struct xdp_md *ctx)
     ev = (struct app_event *) payload_end;
     CHECK_AND_DROP_LOG(ev + 1 > data_end, "ev + 1 > data_end");
 
-    bp = (struct HOMABP *)(ev + 1);
-    CHECK_AND_DROP_LOG(bp + 1 > data_end, "bp + 1 > data_end");
+    //bp = (struct HOMABP *)(ev + 1);
+    //CHECK_AND_DROP_LOG(bp + 1 > data_end, "bp + 1 > data_end");
 
-    CHECK_AND_DROP_LOG(bp->common.type != DATA, "not DATA packet");
-
-    struct rpc_key_t hkey = {0};
-    hkey.local_port = bpf_ntohs(bp->common.src_port);
-    hkey.remote_port = bpf_ntohs(bp->common.dest_port);
-    hkey.rpcid = bpf_be64_to_cpu(bp->common.sender_id);
-    hkey.remote_ip = bpf_ntohl(iph->daddr);
+    //CHECK_AND_DROP_LOG(bp->common.type != DATA, "not DATA packet");
 
     struct rpc_state *state = NULL;
-    state = bpf_map_lookup_elem(&rpc_tbl, &hkey);
-    if(!state) {
-        struct rpc_state new_state = {0};
-        CHECK_AND_DROP_LOG(bpf_map_update_elem(&rpc_tbl, &hkey, &new_state, BPF_NOEXIST), "client_request, bpf_map_update_elem failed.");
-        state = bpf_map_lookup_elem(&rpc_tbl, &hkey);
-        CHECK_AND_DROP_LOG(!state, "client_request, bpf_map_lookup_elem failed.");
-    }
+    if(!get_context_mtp_egress(ev, &state) || !state)
+        return XDP_DROP;
+
+    struct HOMABP *bp = NULL;
+    if(!get_pkt_bp_mtp(ev, &bp) || !bp)
+        return XDP_DROP;
+
     struct interm_out int_out = {0};
-    if (rpc_is_client(bpf_be64_to_cpu(bp->common.sender_id)))
-        action = send_req_ep_client(d, iph, ev, bp, state, &int_out);
+    if (rpc_is_client(ev->rpcid))
+        action = send_req_ep_client(d, iph, ev, state, bp, &int_out, seg_len);
     else
-        action = send_resp_ep_server(d, iph, ev, bp, state, &int_out);
+        action = send_resp_ep_server(d, iph, ev, state, bp, &int_out, seg_len);
     #endif
     
     #ifndef MTP_ON
@@ -359,7 +354,8 @@ int xdp_egress_prog(struct xdp_md *ctx)
     data_end = (void *)(long)ctx->data_end;
     data = (void *)(long)ctx->data;
 
-    if (unlikely(err = bpf_xdp_adjust_tail(ctx, -((int)sizeof(struct app_event) + (int)sizeof(struct HOMABP)))))
+    //if (unlikely(err = bpf_xdp_adjust_tail(ctx, -((int)sizeof(struct app_event) + (int)sizeof(struct HOMABP)))))
+    if (unlikely(err = bpf_xdp_adjust_tail(ctx, -((int)sizeof(struct app_event)))))
     {
         return XDP_DROP;
     }
@@ -380,9 +376,8 @@ int xdp_egress_prog(struct xdp_md *ctx)
 
     __u32 end = bpf_ktime_get_ns();
 
-    bpf_printk("%u", end - start);
-
     if (action == XDP_TX) {
+        bpf_printk("%u", end - start);
         return xmit_packet(ctx, eth, iph);
     }
     

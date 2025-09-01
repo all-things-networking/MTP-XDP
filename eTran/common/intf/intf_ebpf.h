@@ -386,7 +386,7 @@ struct rpc_state
     __u64 bitmap_6;
     __u64 bitmap_7;
     __u64 bitmap_8;
-    __u64 bitmap_9;
+    __u64 bitmap_9; 
     __u64 bitmap_10;
     __u64 bitmap_11;
     __u16 resend_count;

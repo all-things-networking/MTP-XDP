@@ -112,34 +112,87 @@ struct interm_out {
     bool trigger;
 };
 
+struct
+{
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct rpc_key_t);
+    __type(value, struct HOMABP);
+    __uint(max_entries, MAX_RPC_TBL_SIZE);
+} pkt_bp_tbl SEC(".maps");
+
+
+static __always_inline
+int get_context_mtp_egress(struct app_event * ev, struct rpc_state **state) {
+    struct rpc_key_t hkey = {0};
+    hkey.local_port = ev->src_port;
+    hkey.remote_port = bpf_ntohs(ev->dest_port);
+    hkey.rpcid = ev->rpcid;
+    hkey.remote_ip = bpf_ntohl(ev->remote_ip);
+
+    *state = bpf_map_lookup_elem(&rpc_tbl, &hkey);
+    if(!(*state)) {
+        struct rpc_state new_state = {0};
+        new_state.local_port = hkey.local_port;
+        bpf_map_update_elem(&rpc_tbl, &hkey, &new_state, BPF_NOEXIST);
+        *state = bpf_map_lookup_elem(&rpc_tbl, &hkey);
+        if(!(*state)) {
+            bpf_printk("Error get_context_mtp_egress");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static __always_inline
+int get_pkt_bp_mtp(struct app_event * ev, struct HOMABP **bp) {
+    struct rpc_key_t hkey = {0};
+    hkey.local_port = ev->src_port;
+    hkey.remote_port = bpf_ntohs(ev->dest_port);
+    hkey.rpcid = ev->rpcid;
+    hkey.remote_ip = bpf_ntohl(ev->remote_ip);
+
+    *bp = bpf_map_lookup_elem(&pkt_bp_tbl, &hkey);
+    if(!(*bp)) {
+        struct HOMABP new_bp = {0};
+        new_bp.common.seq = 0;
+        bpf_map_update_elem(&pkt_bp_tbl, &hkey, &new_bp, BPF_NOEXIST);
+        *bp = bpf_map_lookup_elem(&pkt_bp_tbl, &hkey);
+        if(!(*bp)) {
+            bpf_printk("Error get_pkt_bp_mtp");
+            return 0;
+        }
+    }
+    return 1;
+}
+
 // Question: if we don't use BP to fill the initial context
 // values, what should we use?
 static __always_inline
-void new_ctx_instr_wrapper(struct rpc_state *ctx, struct app_event *ev, struct HOMABP *bp, bool first_packet, bool client) {
+void new_ctx_instr_wrapper(struct rpc_state *ctx, struct app_event *ev, bool first_packet, bool client) {
     if (first_packet) {
         if(client) {
             /* create a new RPC state */
             ctx->state = BPF_RPC_OUTGOING;
-            ctx->message_length = bpf_ntohl(bp->data.message_length);
+            ctx->message_length = ev->msg_len;
             //ctx->next_xmit_offset = bpf_ntohl(bp->data.seg.segment_length);
-            ctx->next_xmit_offset = min(bpf_ntohl(bp->data.message_length), Homa_unsched_bytes);
+            ctx->next_xmit_offset = min(ev->msg_len, Homa_unsched_bytes);
             ctx->buffer_head = ev->addr;
-            ctx->remote_port = bpf_ntohs(bp->common.dest_port);
-            ctx->local_port = bpf_ntohs(bp->common.src_port);
+            ctx->remote_port = ev->dest_port;
+            ctx->local_port = ev->src_port;
             ctx->remote_ip = bpf_ntohl(ev->remote_ip);
-            ctx->id = bpf_be64_to_cpu(bp->common.sender_id);
-            ctx->cc.granted = min(bpf_ntohl(bp->data.message_length), Homa_unsched_bytes);
+            ctx->id = ev->rpcid;
+            ctx->cc.granted = min(ev->msg_len, Homa_unsched_bytes);
             ctx->qid = MAX_BUCKET_SIZE;
         } else {
             /* first received response packet */
             ctx->state = BPF_RPC_OUTGOING;
-            ctx->message_length = bpf_ntohl(bp->data.message_length);
+            ctx->message_length = ev->msg_len;
             //ctx->next_xmit_offset = bpf_ntohl(bp->data.seg.segment_length);
-            ctx->next_xmit_offset = min(bpf_ntohl(bp->data.message_length), Homa_unsched_bytes);
+            ctx->next_xmit_offset = min(ev->msg_len, Homa_unsched_bytes);
             ctx->buffer_head = ev->addr;
             ctx->nr_pkts_in_rl = 0;
             ctx->cc.sched_prio = 0;
-            ctx->cc.granted = min(bpf_ntohl(bp->data.message_length), Homa_unsched_bytes);
+            ctx->cc.granted = min(ev->msg_len, Homa_unsched_bytes);
             ctx->qid = MAX_BUCKET_SIZE;
         }
     }
@@ -165,6 +218,16 @@ void pkt_gen_instr_data_wrapper(struct data_header *d, struct HOMABP *bp) {
     d->seg.ack.rpcid = bp->data.seg.ack.rpcid;
     d->seg.ack.sport = bp->data.seg.ack.sport;
     d->seg.ack.dport = bp->data.seg.ack.dport;
+
+    // Update BP
+    __u32 temp_len = bpf_ntohl(bp->data.seg.segment_length);
+    __u32 temp_offset = bpf_ntohl(bp->data.seg.offset);
+    temp_offset += temp_len;
+    bp->data.seg.offset = bpf_htonl(temp_offset);
+
+    __u16 temp_seq = bpf_ntohs(bp->common.seq);
+    temp_seq += 1;
+    bp->common.seq = bpf_htons(temp_seq);
 }
 
 static __always_inline
@@ -177,33 +240,58 @@ void new_tx_ordered_data_wrapper(__u32 msg_len, struct rpc_state *ctx) {
 void sched_instr_wrapper(__u32 bytes_remaining, struct rpc_state *ctx) {
     ctx->bytes_remaining = bytes_remaining;
 }*/
-
+ 
 static __always_inline
 int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_event *ev, 
-    struct HOMABP *bp, struct rpc_state *ctx, struct interm_out *int_out)
+    struct rpc_state *ctx, struct HOMABP *bp, struct interm_out *int_out, __u32 seg_len)
 {
 
     bool first_packet = bpf_ntohs(bp->common.seq) == 0 ? 1 : 0;
-    __u32 message_length = bpf_ntohl(bp->data.message_length);
+    __u32 message_length = ev->msg_len;
     __u32 offset = bpf_ntohl(bp->data.seg.offset);
-    __u32 packet_bytes = bpf_ntohl(bp->data.seg.segment_length);
+    __u32 packet_bytes = seg_len;
     bool single_packet = message_length <= HOMA_MSS;
     __u64 cc_granted = atomic_read(&ctx->cc.granted);
 
     if(first_packet) {
 
         new_tx_ordered_data_wrapper(message_length, ctx);
-        
-        new_ctx_instr_wrapper(ctx, ev, bp, first_packet, true);
+
+        new_ctx_instr_wrapper(ctx, ev, first_packet, true);
+
+        //struct HOMABP bp;
+        bp->common.src_port = bpf_htons(ev->src_port);
+        bp->common.dest_port = ev->dest_port;
+        bp->common.doff = 40 >> 2;
+        bp->common.type = DATA;
+        bp->common.seq = bpf_htons(0);
+        bp->common.sender_id = bpf_cpu_to_be64(ev->rpcid);
+
+        bp->data.message_length = bpf_htonl(ev->msg_len);
+        bp->data.retransmit = 0;
+        bp->data.incoming = 0;
+        bp->data.cutoff_version = 0;
+
+        bp->data.seg.offset = bpf_htonl(0);
+
+        __u32 plen = ev->msg_len;
+        if(plen > HOMA_MSS)
+            plen = HOMA_MSS;
+        bp->data.seg.segment_length = bpf_htonl(plen);
+
+        bp->data.seg.ack.rpcid = 0;
+        bp->data.seg.ack.dport = 0;
+        bp->data.seg.ack.sport = 0;
 
         bp->data.incoming = bpf_htonl(cc_granted);
 
-        /* optimization for single-packet case */
         if (likely(single_packet)) {
             set_prio(iph, HOMA_MAX_PRIORITY - 1);
             bp->data.incoming = bpf_htonl(message_length);
         }
 
+        // Question: the priority is set also based on the length
+        // of the segment. How should we represent that in MTP and here?
         if (offset + packet_bytes < Homa_unsched_bytes)
             set_prio(iph, get_prio(message_length));
         else
@@ -218,6 +306,8 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
 
     }
 
+    bpf_printk("AQUIIIII %u %u", bpf_ntohs(bp->common.seq), bpf_ntohl(bp->data.seg.offset));
+
     bp->data.incoming = bpf_htonl(cc_granted);
     if (offset + packet_bytes < Homa_unsched_bytes)
         set_prio(iph, get_prio(message_length));
@@ -226,12 +316,14 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
 
     pkt_gen_instr_data_wrapper(d, bp);
 
+    // TODO: debug here
     if (offset + packet_bytes <= ctx->next_xmit_offset && (atomic_read(&ctx->nr_pkts_in_rl) == 0 &&
         (packet_bytes <= Homa_min_throttled_bytes || check_nic_queue(packet_bytes)))) {
             
         //ctx->next_xmit_offset = offset + packet_bytes;
         return XDP_TX;
     }
+    bpf_printk("HERE");
 
     struct rpc_state_cc *cc_node = NULL;
     struct rpc_state_cc *ref_cc_node = NULL;
@@ -277,19 +369,42 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
 
 static __always_inline
 int send_resp_ep_server(struct data_header *d, struct iphdr *iph, struct app_event *ev, 
-    struct HOMABP *bp, struct rpc_state *ctx, struct interm_out *int_out)
+    struct rpc_state *ctx, struct HOMABP *bp, struct interm_out *int_out, __u32 seg_len)
 {
 
-    bool first_packet = bpf_ntohs(bp->common.seq) == 0 ? 1 : 0;
-    __u32 message_length = bpf_ntohl(bp->data.message_length);
-    __u32 offset = bpf_ntohl(bp->data.seg.offset);
-    __u32 packet_bytes = bpf_ntohl(bp->data.seg.segment_length);
+    bool first_packet = bp->common.seq == 0 ? 1 : 0;
+    __u32 message_length = ev->msg_len;
+    __u32 offset = bp->data.seg.offset;
+    __u32 packet_bytes = seg_len;
     bool single_packet = message_length <= HOMA_MSS;
     __u64 cc_granted = atomic_read(&ctx->cc.granted);
 
     if(first_packet) {
 
-        new_ctx_instr_wrapper(ctx, ev, bp, first_packet, false);
+        new_ctx_instr_wrapper(ctx, ev, first_packet, false);
+
+        bp->common.src_port = bpf_htons(ev->src_port);
+        bp->common.dest_port = ev->dest_port;
+        bp->common.doff = 40 >> 2;
+        bp->common.type = DATA;
+        bp->common.seq = bpf_htons(0);
+        bp->common.sender_id = bpf_cpu_to_be64(ev->rpcid);
+
+        bp->data.message_length = bpf_htonl(ev->msg_len);
+        bp->data.retransmit = 0;
+        bp->data.incoming = 0;
+        bp->data.cutoff_version = 0;
+
+        bp->data.seg.offset = bpf_htonl(0);
+
+        __u32 plen = ev->msg_len;
+        if(plen > HOMA_MSS)
+            plen = HOMA_MSS;
+        bp->data.seg.segment_length = bpf_htonl(plen);
+
+        bp->data.seg.ack.rpcid = 0;
+        bp->data.seg.ack.dport = 0;
+        bp->data.seg.ack.sport = 0;
 
         bp->data.incoming = bpf_htonl(cc_granted);
         /* optimization for single-packet case */
@@ -522,6 +637,7 @@ void reclaim_rpc_mtp(struct ack_net_info ack_info, struct homa_meta_info *data_m
         bpf_obj_drop(cc_node);
 
     bpf_map_delete_elem(&rpc_tbl, &delete_hkey);
+    bpf_map_delete_elem(&pkt_bp_tbl, &delete_hkey);
 }
 
 // Question: for both of these functions I set some values
@@ -715,6 +831,7 @@ int recv_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
             hkey.remote_port = ev->flow_id.remote_port;
             hkey.remote_ip = ev->flow_id.remote_ip;
             bpf_map_delete_elem(&rpc_tbl, &hkey);
+            bpf_map_delete_elem(&pkt_bp_tbl, &hkey);
             
             enqueue_dead_crpc(hkey.remote_ip, hkey.remote_port, hkey.local_port, hkey.rpcid);
 
@@ -784,6 +901,7 @@ int recv_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
                 * but it would be finally removed, don't worry about it 
                 */
             bpf_map_delete_elem(&rpc_tbl, &hkey);
+            bpf_map_delete_elem(&pkt_bp_tbl, &hkey);
 
             return XDP_REDIRECT;
         }
@@ -2107,6 +2225,7 @@ void destroy_ctx_instr_wrapper(struct rpc_state *ctx, struct hkey flow_id,
     homa_unknown_h->common.type = RESEND;
 
     bpf_map_delete_elem(&rpc_tbl, &flow_id);
+    bpf_map_delete_elem(&pkt_bp_tbl, &flow_id);
 }
 
 static __always_inline

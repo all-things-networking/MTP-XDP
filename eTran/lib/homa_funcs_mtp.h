@@ -27,7 +27,7 @@ void RpcSocket::send_req_ep_user(struct HOMABP *bp, struct app_event *ev, struct
     bp->common.src_port = __cpu_to_be16(ev->src_port);
     bp->common.dest_port = ev->dest_port;
     bp->common.doff = (sizeof(struct data_header) - sizeof(struct data_segment)) >> 2;
-    bp->common.type = DATA;
+    bp->common.type = DATA; 
     bp->common.seq = __cpu_to_be16(ctx->seq);
     bp->common.sender_id = __cpu_to_be64(ev->rpcid);
 
