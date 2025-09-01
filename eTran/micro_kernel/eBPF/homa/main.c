@@ -507,6 +507,8 @@ int xdp_sock_prog(struct xdp_md *ctx)
     } else if(proto_type == BUSY) {
         busy_pkt_ep(&ev, state, data_meta, &int_out);
         
+    } else if(proto_type == GRANT) {
+        recv_grant_ep(&ev, state, data_meta, &int_out);
     }
 
     if(ret == XDP_TX)

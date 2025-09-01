@@ -524,22 +524,6 @@ void reclaim_rpc_mtp(struct ack_net_info ack_info, struct homa_meta_info *data_m
     bpf_map_delete_elem(&rpc_tbl, &delete_hkey);
 }
 
-/* In MTP program:
-first_req_pkt_ep -> everything in recv_req_ep_server() except the else case.
-    Also, the conditions in the end are transformed into int_out.
-
-next_req_pkt_ep -> is everything in recv_req_ep_server() except the if case.
-    Also, the conditions in the end are transformed into int_out.
-
-sched_ep -> it seems to be insert_grant_list()
-
-choose_grants -> the first XDP_GEN tail call function
-
-update_prios -> the other 8 tail call functions in XDP_GEN
-
-gen_grants -> the main XDP_GEN function (after the tail call happens)
-*/
-
 // Question: for both of these functions I set some values
 // that I added to RX metadata. Is this okay? Because the
 // RX metadata is different in TCP
@@ -2225,43 +2209,29 @@ void busy_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 // Basically, what is defined in the BP was already "used"
 // when the packets were first sent by userspace and enqueued
 // to the RL.
-static __always_inline void recv_grant_ep(struct grant_header *homa_grant_h, __u32 remote_ip)
+static __always_inline
+void recv_grant_ep(struct net_event *ev, struct rpc_state *ctx,
+    struct homa_meta_info *data_meta, struct interm_out *int_out)
 {
-    struct rpc_key_t hkey = {0};
-    struct rpc_state *rpc_slot = NULL;
     struct rpc_state_cc *cc_node = NULL;
     struct rpc_state_cc *ref_cc_node = NULL;
 
-    __u32 offset = bpf_ntohl(homa_grant_h->offset);
-    __u64 rpcid = bpf_be64_to_cpu(homa_grant_h->common.sender_id);
-    rpcid = local_id(rpcid);
-
-    hkey.rpcid = rpcid;
-    hkey.local_port = bpf_ntohs(homa_grant_h->common.dport);
-    hkey.remote_port = bpf_ntohs(homa_grant_h->common.sport);
-    hkey.remote_ip = remote_ip;
-
-    rpc_slot = bpf_map_lookup_elem(&rpc_tbl, &hkey);
-    if (unlikely(!rpc_slot)) {
-        log_err("receive unknown grant pkt");
-        return;
-    }
-    if (rpc_slot->state != BPF_RPC_OUTGOING)
+    if (ctx->state != BPF_RPC_OUTGOING)
         return;
 
-    atomic_xchg(&rpc_slot->cc.sched_prio, homa_grant_h->priority);
+    atomic_xchg(&ctx->cc.sched_prio, ev->priority);
 
-    if (rpc_slot->cc.granted < offset)
+    if (ctx->cc.granted < ev->offset)
     {
         // Since we don't enforce load balancing for grant packets, only one CPU will
         // handle this grant packet. So we don't need any lock
-        atomic_xchg(&rpc_slot->cc.granted, offset);
+        atomic_xchg(&ctx->cc.granted, ev->offset);
 
         // bpf_printk("RPC#%llu, grant = %u", rpcid, offset);
         
-        if (atomic_read(&rpc_slot->qid) != MAX_BUCKET_SIZE)
+        if (atomic_read(&ctx->qid) != MAX_BUCKET_SIZE)
         {
-            GET_POINTER(cc_node, rpc_slot);
+            GET_POINTER(cc_node, ctx);
             if (unlikely(!cc_node)) {
                 // werid case
                 kick_pacer();
@@ -2270,8 +2240,8 @@ static __always_inline void recv_grant_ep(struct grant_header *homa_grant_h, __u
             ref_cc_node = bpf_refcount_acquire(cc_node);
             if (unlikely(!ref_cc_node)) {
                 // this should never happen
-                bpf_printk("We are receiving GRANT, but we can't get cc_node reference for RPC#%llu", rpcid);
-                PUT_POINTER(cc_node, rpc_slot);
+                bpf_printk("We are receiving GRANT, but we can't get cc_node reference for RPC#%llu", ctx->id);
+                PUT_POINTER(cc_node, ctx);
                 kick_pacer();
                 return;
             }
@@ -2279,7 +2249,7 @@ static __always_inline void recv_grant_ep(struct grant_header *homa_grant_h, __u
             if (bpf_rbtree_add(&troot, &ref_cc_node->rbtree_link, srpt_less_pacer) == 0)
                 atomic_inc(&nr_rpc_in_throttle);
             THROTTLE_UNLOCK();
-            PUT_POINTER(cc_node, rpc_slot);
+            PUT_POINTER(cc_node, ctx);
         }
     }
     kick_pacer();
