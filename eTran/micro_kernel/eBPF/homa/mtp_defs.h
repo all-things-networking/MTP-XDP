@@ -1911,11 +1911,49 @@ int reset_grants_state(struct xdp_md *ctx, struct interm_out *int_out)
     return XDP_TX;
 }
 
+static __always_inline
+int pkt_gen_instr_xdp_data_wrapper(struct HOMABP *bp, __u64 addr, __u32 length,
+    struct xdp_md *xdp_ctx, struct homa_meta_info *data_meta, struct rpc_state *ctx) {
 
+    data_meta->rx.reap_server_buffer_addr = addr;
+
+    void *data = (void *)(long)xdp_ctx->data;
+    void *data_end = (void *)(long)xdp_ctx->data_end;
+    int curr_len = (int) (data_end - data);
+
+    int target_len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct resend_header);
+
+    if (bpf_xdp_adjust_tail(xdp_ctx, target_len - curr_len)) {
+        return 0;
+    }
+
+    data = (void *)(long)xdp_ctx->data;
+    data_end = (void *)(long)xdp_ctx->data_end;
+    
+    struct ethhdr *eth = (struct ethhdr *)data;
+    if (eth + 1 > data_end) {
+        return 0;
+    }
+    struct iphdr *iph = (struct iphdr *)(eth + 1);
+    if (iph + 1 > data_end) {
+        return 0;
+    }
+    struct resend_header *homa_resend_h = (struct resend_header *)(iph + 1);
+    if (homa_resend_h + 1 > data_end) {
+        return 0;
+    }
+
+    homa_resend_h->common.type = RESEND;
+    homa_resend_h->offset = bpf_htonl(bp->data.seg.offset);
+    homa_resend_h->length = bpf_htonl(length);
+
+    return 1;
+}
 
 static __always_inline
 int resend_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
-    struct homa_meta_info *data_meta, struct interm_out *int_out) {
+    struct homa_meta_info *data_meta, struct interm_out *int_out,
+    struct xdp_md *xdp_ctx) {
 
     //bool need_kick = false;
     int_out->type_pkt = RESEND;
@@ -1971,22 +2009,35 @@ int resend_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
         }
     }
 
-    if (int_out->type_pkt == RESEND) {
-        // Question: in this case, we will redirect the packet to userspace to
-        // resend the packets from there. But in case this condition isn't met,
-        // we XDP_TX the packet as BUSY/UNKOWN. How can the compiler differentiate these
-        // two approaches?
-        // Maybe based on the type of the packet? If it is DATA, it goes to userspace,
-        // if not, it goes out through XDP_TX
+    RPC_UNLOCK(ctx);
 
-        // Question: should we have the BP declaration here and use the BP here to
-        // mutate the packet, before sending it back to userspace?
-        // (The line below will be by default when we redirect to userspace)
-        data_meta->rx.reap_server_buffer_addr = ctx->buffer_head;
+    if (int_out->type_pkt == RESEND) {
+
+        //data_meta->rx.reap_server_buffer_addr = ctx->buffer_head;
+
+        struct HOMABP bp;
+        bp.common.src_port = ev->flow_id.local_port;
+        bp.common.dest_port = ev->flow_id.remote_port;
+        bp.common.doff = 40 >> 2;
+        bp.common.type = DATA;
+        bp.common.seq = ev->seq;
+        bp.common.sender_id = ctx->id;
+
+        bp.data.incoming = ctx->cc.granted;
+        bp.data.cutoff_version = 0;
+        bp.data.seg.offset = ev->offset;
+        bp.data.retransmit = 1;
+
+        //bp.priority = ev->priority << 5;
+
+        __u64 addr = ctx->buffer_head;
+
+        pkt_gen_instr_xdp_data_wrapper(&bp, addr, ev->length, xdp_ctx, data_meta, ctx);
+
         ctx->resend_count++;
     }
 
-    RPC_UNLOCK(ctx);
+    //RPC_UNLOCK(ctx);
 
     /*if (need_kick) {
         kick_pacer();
@@ -1997,7 +2048,7 @@ int resend_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
 
 static __always_inline
-int pkt_gen_instr_common_hdr_wrapper(struct HOMABP bp, struct xdp_md *xdp_ctx) {
+int pkt_gen_instr_xdp_no_data_wrapper(struct HOMABP bp, struct xdp_md *xdp_ctx) {
 
     __u32 ip_swap;
     __u8 mac_swap[ETH_ALEN];
@@ -2053,7 +2104,7 @@ int tx_resend_resp(struct net_event *ev, struct rpc_state *ctx,
     bp.common.src_port = ev->flow_id.remote_port;
     bp.common.dest_port = ev->flow_id.local_port;
 
-    return pkt_gen_instr_common_hdr_wrapper(bp, xdp_ctx);
+    return pkt_gen_instr_xdp_no_data_wrapper(bp, xdp_ctx);
 }
 
 static __always_inline
@@ -2092,15 +2143,34 @@ int unkown_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     {
         if (ctx->state == BPF_RPC_OUTGOING)
         {
-            // Question: here, we would retransmit to userspace,
-            // specifying the buffer from which to start retransmitting
-            // and mutate the packet with a resend header, instead of unknown,
-            // so the userspace treats it as a resend.
-            // How to abstract this?
-            data_meta->rx.reap_server_buffer_addr = ctx->buffer_head;
+
+            //data_meta->rx.reap_server_buffer_addr = ctx->buffer_head;
+
             next_xmit_offset = ctx->next_xmit_offset;
             RPC_UNLOCK(ctx);
-            if (bpf_xdp_adjust_tail(xdp_ctx, sizeof(struct resend_header) - sizeof(struct unknown_header)))
+
+
+            struct HOMABP bp;
+            bp.common.src_port = ev->flow_id.local_port;
+            bp.common.dest_port = ev->flow_id.remote_port;
+            bp.common.doff = 40 >> 2;
+            bp.common.type = DATA;
+            bp.common.seq = 0;
+            bp.common.sender_id = ctx->id;
+
+            bp.data.incoming = ctx->cc.granted;
+            bp.data.cutoff_version = 0;
+            bp.data.seg.offset = 0;
+            bp.data.retransmit = 1;
+
+            //bp.priority = ev->priority << 5;
+
+            __u64 addr = ctx->buffer_head;
+
+            pkt_gen_instr_xdp_data_wrapper(&bp, addr, next_xmit_offset, xdp_ctx, data_meta, ctx);
+
+
+            /*if (bpf_xdp_adjust_tail(xdp_ctx, sizeof(struct resend_header) - sizeof(struct unknown_header)))
             {
                 return -1;
             }
@@ -2121,7 +2191,7 @@ int unkown_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
             homa_resend_h->common.type = RESEND;
             homa_resend_h->offset = 0;
             homa_resend_h->length = bpf_htonl(next_xmit_offset);
-            return 0;
+            return 0;*/
         }
     }
     else
@@ -2151,9 +2221,11 @@ void busy_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     ctx->busy_count++;
 }
 
-// Question/TODO: how to translate the MTP program to something like this?
-#if 0
-static __always_inline void grant_pkt_ep(struct grant_header *homa_grant_h, __u32 remote_ip)
+// Question: how to abstract this EP?
+// Basically, what is defined in the BP was already "used"
+// when the packets were first sent by userspace and enqueued
+// to the RL.
+static __always_inline void recv_grant_ep(struct grant_header *homa_grant_h, __u32 remote_ip)
 {
     struct rpc_key_t hkey = {0};
     struct rpc_state *rpc_slot = NULL;
@@ -2213,4 +2285,3 @@ static __always_inline void grant_pkt_ep(struct grant_header *homa_grant_h, __u3
     kick_pacer();
     // bpf_printk("kick pacer for RPC#%llu", rpcid);
 }
-#endif

@@ -498,7 +498,7 @@ int xdp_sock_prog(struct xdp_md *ctx)
         CHECK_AND_DROP_LOG(ret == XDP_DROP, "XDP_DROP for error rpc state");
 
     } else if(proto_type == RESEND) {
-        ret = resend_pkt_ep(&ev, state, data_meta, &int_out);
+        ret = resend_pkt_ep(&ev, state, data_meta, &int_out, ctx);
         ret = tx_resend_resp(&ev, state, data_meta, &int_out, ctx);
 
     } else if(proto_type == UNKNOWN) {
