@@ -312,14 +312,22 @@ int xdp_egress_prog(struct xdp_md *ctx)
         return XDP_DROP;
 
     struct HOMABP *bp = NULL;
-    if(!get_pkt_bp_mtp(ev, &bp) || !bp)
+    bool first_packet = false;
+    if(!get_pkt_bp_mtp(ev, &bp, &first_packet) || !bp)
         return XDP_DROP;
 
     struct interm_out int_out = {0};
-    if (rpc_is_client(ev->rpcid))
-        action = send_req_ep_client(d, iph, ev, state, bp, &int_out, seg_len);
-    else
-        action = send_resp_ep_server(d, iph, ev, state, bp, &int_out, seg_len);
+    if (rpc_is_client(ev->rpcid)) {
+        if(first_packet)
+            action = send_req_ep_client(d, iph, ev, state, bp, &int_out, seg_len);
+        else
+            action = fill_other_pkts(d, iph, ev, state, bp, &int_out, seg_len);
+    } else {
+        if(first_packet)
+            action = send_resp_ep_server(d, iph, ev, state, bp, &int_out, seg_len);
+        else
+            action = fill_other_pkts(d, iph, ev, state, bp, &int_out, seg_len);
+    }
     #endif
     
     #ifndef MTP_ON

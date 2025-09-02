@@ -144,7 +144,7 @@ int get_context_mtp_egress(struct app_event * ev, struct rpc_state **state) {
 }
 
 static __always_inline
-int get_pkt_bp_mtp(struct app_event * ev, struct HOMABP **bp) {
+int get_pkt_bp_mtp(struct app_event * ev, struct HOMABP **bp, bool *first_packet) {
     struct rpc_key_t hkey = {0};
     hkey.local_port = ev->src_port;
     hkey.remote_port = bpf_ntohs(ev->dest_port);
@@ -153,6 +153,7 @@ int get_pkt_bp_mtp(struct app_event * ev, struct HOMABP **bp) {
 
     *bp = bpf_map_lookup_elem(&pkt_bp_tbl, &hkey);
     if(!(*bp)) {
+        *first_packet = true;
         struct HOMABP new_bp = {0};
         new_bp.common.seq = 0;
         bpf_map_update_elem(&pkt_bp_tbl, &hkey, &new_bp, BPF_NOEXIST);
@@ -168,33 +169,31 @@ int get_pkt_bp_mtp(struct app_event * ev, struct HOMABP **bp) {
 // Question: if we don't use BP to fill the initial context
 // values, what should we use?
 static __always_inline
-void new_ctx_instr_wrapper(struct rpc_state *ctx, struct app_event *ev, bool first_packet, bool client) {
-    if (first_packet) {
-        if(client) {
-            /* create a new RPC state */
-            ctx->state = BPF_RPC_OUTGOING;
-            ctx->message_length = ev->msg_len;
-            //ctx->next_xmit_offset = bpf_ntohl(bp->data.seg.segment_length);
-            ctx->next_xmit_offset = min(ev->msg_len, Homa_unsched_bytes);
-            ctx->buffer_head = ev->addr;
-            ctx->remote_port = ev->dest_port;
-            ctx->local_port = ev->src_port;
-            ctx->remote_ip = bpf_ntohl(ev->remote_ip);
-            ctx->id = ev->rpcid;
-            ctx->cc.granted = min(ev->msg_len, Homa_unsched_bytes);
-            ctx->qid = MAX_BUCKET_SIZE;
-        } else {
-            /* first received response packet */
-            ctx->state = BPF_RPC_OUTGOING;
-            ctx->message_length = ev->msg_len;
-            //ctx->next_xmit_offset = bpf_ntohl(bp->data.seg.segment_length);
-            ctx->next_xmit_offset = min(ev->msg_len, Homa_unsched_bytes);
-            ctx->buffer_head = ev->addr;
-            ctx->nr_pkts_in_rl = 0;
-            ctx->cc.sched_prio = 0;
-            ctx->cc.granted = min(ev->msg_len, Homa_unsched_bytes);
-            ctx->qid = MAX_BUCKET_SIZE;
-        }
+void new_ctx_instr_wrapper(struct rpc_state *ctx, struct app_event *ev, bool client) {
+    if(client) {
+        /* create a new RPC state */
+        ctx->state = BPF_RPC_OUTGOING;
+        ctx->message_length = ev->msg_len;
+        //ctx->next_xmit_offset = bpf_ntohl(bp->data.seg.segment_length);
+        ctx->next_xmit_offset = min(ev->msg_len, Homa_unsched_bytes);
+        ctx->buffer_head = ev->addr;
+        ctx->remote_port = ev->dest_port;
+        ctx->local_port = ev->src_port;
+        ctx->remote_ip = bpf_ntohl(ev->remote_ip);
+        ctx->id = ev->rpcid;
+        ctx->cc.granted = min(ev->msg_len, Homa_unsched_bytes);
+        ctx->qid = MAX_BUCKET_SIZE;
+    } else {
+        /* first received response packet */
+        ctx->state = BPF_RPC_OUTGOING;
+        ctx->message_length = ev->msg_len;
+        //ctx->next_xmit_offset = bpf_ntohl(bp->data.seg.segment_length);
+        ctx->next_xmit_offset = min(ev->msg_len, Homa_unsched_bytes);
+        ctx->buffer_head = ev->addr;
+        ctx->nr_pkts_in_rl = 0;
+        ctx->cc.sched_prio = 0;
+        ctx->cc.granted = min(ev->msg_len, Homa_unsched_bytes);
+        ctx->qid = MAX_BUCKET_SIZE;
     }
 }
 
@@ -246,65 +245,122 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
     struct rpc_state *ctx, struct HOMABP *bp, struct interm_out *int_out, __u32 seg_len)
 {
 
-    bool first_packet = bpf_ntohs(bp->common.seq) == 0 ? 1 : 0;
     __u32 message_length = ev->msg_len;
     __u32 offset = bpf_ntohl(bp->data.seg.offset);
     __u32 packet_bytes = seg_len;
     bool single_packet = message_length <= HOMA_MSS;
     __u64 cc_granted = atomic_read(&ctx->cc.granted);
 
-    if(first_packet) {
+    new_tx_ordered_data_wrapper(message_length, ctx);
 
-        new_tx_ordered_data_wrapper(message_length, ctx);
+    new_ctx_instr_wrapper(ctx, ev, true);
 
-        new_ctx_instr_wrapper(ctx, ev, first_packet, true);
+    //struct HOMABP bp;
+    bp->common.src_port = bpf_htons(ev->src_port);
+    bp->common.dest_port = ev->dest_port;
+    bp->common.doff = 40 >> 2;
+    bp->common.type = DATA;
+    bp->common.seq = bpf_htons(0);
+    bp->common.sender_id = bpf_cpu_to_be64(ev->rpcid);
 
-        //struct HOMABP bp;
-        bp->common.src_port = bpf_htons(ev->src_port);
-        bp->common.dest_port = ev->dest_port;
-        bp->common.doff = 40 >> 2;
-        bp->common.type = DATA;
-        bp->common.seq = bpf_htons(0);
-        bp->common.sender_id = bpf_cpu_to_be64(ev->rpcid);
+    bp->data.message_length = bpf_htonl(ev->msg_len);
+    bp->data.retransmit = 0;
+    bp->data.incoming = 0;
+    bp->data.cutoff_version = 0;
 
-        bp->data.message_length = bpf_htonl(ev->msg_len);
-        bp->data.retransmit = 0;
-        bp->data.incoming = 0;
-        bp->data.cutoff_version = 0;
+    bp->data.seg.offset = bpf_htonl(0);
 
-        bp->data.seg.offset = bpf_htonl(0);
+    __u32 plen = seg_len;
+    if(plen > HOMA_MSS)
+        plen = HOMA_MSS;
+    bp->data.seg.segment_length = bpf_htonl(plen);
 
-        __u32 plen = seg_len;
-        if(plen > HOMA_MSS)
-            plen = HOMA_MSS;
-        bp->data.seg.segment_length = bpf_htonl(plen);
+    bp->data.seg.ack.rpcid = 0;
+    bp->data.seg.ack.dport = 0;
+    bp->data.seg.ack.sport = 0;
 
-        bp->data.seg.ack.rpcid = 0;
-        bp->data.seg.ack.dport = 0;
-        bp->data.seg.ack.sport = 0;
+    bp->data.incoming = bpf_htonl(cc_granted);
 
-        bp->data.incoming = bpf_htonl(cc_granted);
-
-        if (likely(single_packet)) {
-            set_prio(iph, HOMA_MAX_PRIORITY - 1);
-            bp->data.incoming = bpf_htonl(message_length);
-        }
-
-        // Question: the priority is set also based on the length
-        // of the segment. How should we represent that in MTP and here?
-        if (offset + packet_bytes < Homa_unsched_bytes)
-            set_prio(iph, get_prio(message_length));
-        else
-            set_prio(iph, atomic_read(&ctx->cc.sched_prio));
-
-        pkt_gen_instr_data_wrapper(d, bp);
-
-        //__u32 bytes_remaining = ev->msg_len - cc_granted;
-        //sched_instr_wrapper(bytes_remaining, ctx);
-
-        return XDP_TX;
-
+    if (likely(single_packet)) {
+        set_prio(iph, HOMA_MAX_PRIORITY - 1);
+        bp->data.incoming = bpf_htonl(message_length);
     }
+
+    // Question: the priority is set also based on the length
+    // of the segment. How should we represent that in MTP and here?
+    if (offset + packet_bytes < Homa_unsched_bytes)
+        set_prio(iph, get_prio(message_length));
+    else
+        set_prio(iph, atomic_read(&ctx->cc.sched_prio));
+
+    pkt_gen_instr_data_wrapper(d, bp);
+
+    //__u32 bytes_remaining = ev->msg_len - cc_granted;
+    //sched_instr_wrapper(bytes_remaining, ctx);
+
+    return XDP_TX;
+
+}
+
+static __always_inline
+int send_resp_ep_server(struct data_header *d, struct iphdr *iph, struct app_event *ev, 
+    struct rpc_state *ctx, struct HOMABP *bp, struct interm_out *int_out, __u32 seg_len)
+{
+    __u32 message_length = ev->msg_len;
+    __u32 offset = bp->data.seg.offset;
+    __u32 packet_bytes = seg_len;
+    bool single_packet = message_length <= HOMA_MSS;
+    __u64 cc_granted = atomic_read(&ctx->cc.granted);
+
+    new_ctx_instr_wrapper(ctx, ev, false);
+
+    bp->common.src_port = bpf_htons(ev->src_port);
+    bp->common.dest_port = ev->dest_port;
+    bp->common.doff = 40 >> 2;
+    bp->common.type = DATA;
+    bp->common.seq = bpf_htons(0);
+    bp->common.sender_id = bpf_cpu_to_be64(ev->rpcid);
+
+    bp->data.message_length = bpf_htonl(ev->msg_len);
+    bp->data.retransmit = 0;
+    bp->data.incoming = 0;
+    bp->data.cutoff_version = 0;
+
+    bp->data.seg.offset = bpf_htonl(0);
+
+    __u32 plen = seg_len;
+    if(plen > HOMA_MSS)
+        plen = HOMA_MSS;
+    bp->data.seg.segment_length = bpf_htonl(plen);
+
+    bp->data.seg.ack.rpcid = 0;
+    bp->data.seg.ack.dport = 0;
+    bp->data.seg.ack.sport = 0;
+
+    bp->data.incoming = bpf_htonl(cc_granted);
+    /* optimization for single-packet case */
+    if (likely(single_packet)) {
+        set_prio(iph, HOMA_MAX_PRIORITY - 1);
+        bp->data.incoming = bpf_htonl(message_length);
+    }
+
+    if (offset + packet_bytes < Homa_unsched_bytes)
+        set_prio(iph, get_prio(message_length));
+    else
+        set_prio(iph, atomic_read(&ctx->cc.sched_prio));
+
+    pkt_gen_instr_data_wrapper(d, bp);
+    return XDP_TX;
+}
+
+static __always_inline
+int fill_other_pkts(struct data_header *d, struct iphdr *iph, struct app_event *ev, 
+    struct rpc_state *ctx, struct HOMABP *bp, struct interm_out *int_out, __u32 seg_len) {
+
+    __u32 message_length = ev->msg_len;
+    __u32 offset = bpf_ntohl(bp->data.seg.offset);
+    __u32 packet_bytes = seg_len;
+    __u64 cc_granted = atomic_read(&ctx->cc.granted);
 
     bp->data.incoming = bpf_htonl(cc_granted);
     if (offset + packet_bytes < Homa_unsched_bytes)
@@ -332,11 +388,11 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
     {
         /* this RPC has not been enqueued before */
         ctx->qid = allocate_qid();
-        CHECK_AND_DROP_LOG(ctx->qid == MAX_BUCKET_SIZE, "client_request, allocate_qid failed.");
+        CHECK_AND_DROP_LOG(ctx->qid == MAX_BUCKET_SIZE, "fill_other_pkts, allocate_qid failed.");
 
         /* we create the qid, so we need to create an object and enqueue it to throttle list */
         cc_node = bpf_obj_new(typeof(*cc_node));
-        CHECK_AND_DROP_LOG(!cc_node, "client_request, bpf_obj_new failed.");
+        CHECK_AND_DROP_LOG(!cc_node, "fill_other_pkts, bpf_obj_new failed.");
         
         cc_node->birth = bpf_ktime_get_ns();
         cc_node->hkey.rpcid = ctx->id;
@@ -345,7 +401,7 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
         cc_node->hkey.remote_port = ctx->remote_port;
         cc_node->bytes_remaining = ctx->message_length - ctx->next_xmit_offset;
         ref_cc_node = bpf_refcount_acquire(cc_node);
-        CHECK_AND_DROP_LOG(!ref_cc_node, "client_request, bpf_refcount_acquire failed.");
+        CHECK_AND_DROP_LOG(!ref_cc_node, "fill_other_pkts, bpf_refcount_acquire failed.");
 
         THROTTLE_LOCK();
         
@@ -359,119 +415,6 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
         PUT_POINTER(cc_node, ctx);
     }
 
-    int_out->trigger = cc_granted >= (offset + packet_bytes);
-
-    return XDP_REDIRECT;
-}
-
-static __always_inline
-int send_resp_ep_server(struct data_header *d, struct iphdr *iph, struct app_event *ev, 
-    struct rpc_state *ctx, struct HOMABP *bp, struct interm_out *int_out, __u32 seg_len)
-{
-
-    bool first_packet = bp->common.seq == 0 ? 1 : 0;
-    __u32 message_length = ev->msg_len;
-    __u32 offset = bp->data.seg.offset;
-    __u32 packet_bytes = seg_len;
-    bool single_packet = message_length <= HOMA_MSS;
-    __u64 cc_granted = atomic_read(&ctx->cc.granted);
-
-    if(first_packet) {
-
-        new_ctx_instr_wrapper(ctx, ev, first_packet, false);
-
-        bp->common.src_port = bpf_htons(ev->src_port);
-        bp->common.dest_port = ev->dest_port;
-        bp->common.doff = 40 >> 2;
-        bp->common.type = DATA;
-        bp->common.seq = bpf_htons(0);
-        bp->common.sender_id = bpf_cpu_to_be64(ev->rpcid);
-
-        bp->data.message_length = bpf_htonl(ev->msg_len);
-        bp->data.retransmit = 0;
-        bp->data.incoming = 0;
-        bp->data.cutoff_version = 0;
-
-        bp->data.seg.offset = bpf_htonl(0);
-
-        __u32 plen = seg_len;
-        if(plen > HOMA_MSS)
-            plen = HOMA_MSS;
-        bp->data.seg.segment_length = bpf_htonl(plen);
-
-        bp->data.seg.ack.rpcid = 0;
-        bp->data.seg.ack.dport = 0;
-        bp->data.seg.ack.sport = 0;
-
-        bp->data.incoming = bpf_htonl(cc_granted);
-        /* optimization for single-packet case */
-        if (likely(single_packet)) {
-            set_prio(iph, HOMA_MAX_PRIORITY - 1);
-            bp->data.incoming = bpf_htonl(message_length);
-        }
-
-        if (offset + packet_bytes < Homa_unsched_bytes)
-            set_prio(iph, get_prio(message_length));
-        else
-            set_prio(iph, atomic_read(&ctx->cc.sched_prio));
-
-        pkt_gen_instr_data_wrapper(d, bp);
-        return XDP_TX;
-    }
-
-    bp->data.incoming = bpf_htonl(cc_granted);
-    if (offset + packet_bytes < Homa_unsched_bytes)
-        set_prio(iph, get_prio(message_length));
-    else
-        set_prio(iph, atomic_read(&ctx->cc.sched_prio));
-
-    pkt_gen_instr_data_wrapper(d, bp);
-
-    if (offset + packet_bytes <= ctx->next_xmit_offset && (atomic_read(&ctx->nr_pkts_in_rl) == 0 &&
-    (packet_bytes <= Homa_min_throttled_bytes || check_nic_queue(packet_bytes)))) {
-        
-        //ctx->next_xmit_offset = offset + packet_bytes;
-        return XDP_TX;
-    }
-
-    struct rpc_state_cc *cc_node = NULL;
-    struct rpc_state_cc *ref_cc_node = NULL;
-
-    /* Unfortunately, we should enqueue this packet to rate limiter */
-    atomic_inc(&ctx->nr_pkts_in_rl);
-
-    if (unlikely(ctx->qid == MAX_BUCKET_SIZE))
-    {
-        /* this RPC has not been enqueued before */
-        ctx->qid = allocate_qid();
-        CHECK_AND_DROP_LOG(ctx->qid == MAX_BUCKET_SIZE, "server_response, allocate_qid failed.");
-
-        /* we create the qid, so we need to create an object and enqueue it to throttle list */
-        cc_node = bpf_obj_new(typeof(*cc_node));
-        CHECK_AND_DROP_LOG(!cc_node, "server_response, bpf_obj_new failed.");
-
-
-        cc_node->birth = bpf_ktime_get_ns();
-
-        cc_node->hkey.rpcid = ctx->id;
-        cc_node->hkey.local_port = ctx->local_port;
-        cc_node->hkey.remote_ip = ctx->remote_ip;
-        cc_node->hkey.remote_port = ctx->remote_port;
-        cc_node->bytes_remaining = ctx->message_length - ctx->next_xmit_offset;
-        ref_cc_node = bpf_refcount_acquire(cc_node);
-        CHECK_AND_DROP_LOG(!ref_cc_node, "server_response, bpf_refcount_acquire failed.");
-
-        THROTTLE_LOCK();
-        
-        /* insert ref pointer to throttle list */
-        bpf_rbtree_add(&troot, &ref_cc_node->rbtree_link, srpt_less_pacer);
-        atomic_inc(&nr_rpc_in_throttle);
-        
-        THROTTLE_UNLOCK();
-
-        /* store pointer in map for future update */
-        PUT_POINTER(cc_node, ctx);
-    }
     int_out->trigger = cc_granted >= (offset + packet_bytes);
 
     return XDP_REDIRECT;
