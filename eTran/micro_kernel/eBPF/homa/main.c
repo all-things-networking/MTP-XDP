@@ -383,8 +383,10 @@ int xdp_egress_prog(struct xdp_md *ctx)
     
     #ifdef MTP_ON
     ret = enqueue_pkt_to_rl(ctx, state->qid, eth, iph);
-    if (int_out.trigger)
+    
+    if (int_out.trigger) {
         kick_pacer();
+    }
     #else
     ret = enqueue_pkt_to_rl(ctx, rpc_qid, eth, iph);
 

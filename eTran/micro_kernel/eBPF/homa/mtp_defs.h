@@ -274,7 +274,7 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
 
         bp->data.seg.offset = bpf_htonl(0);
 
-        __u32 plen = ev->msg_len;
+        __u32 plen = seg_len;
         if(plen > HOMA_MSS)
             plen = HOMA_MSS;
         bp->data.seg.segment_length = bpf_htonl(plen);
@@ -306,8 +306,6 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
 
     }
 
-    bpf_printk("AQUIIIII %u %u", bpf_ntohs(bp->common.seq), bpf_ntohl(bp->data.seg.offset));
-
     bp->data.incoming = bpf_htonl(cc_granted);
     if (offset + packet_bytes < Homa_unsched_bytes)
         set_prio(iph, get_prio(message_length));
@@ -323,7 +321,6 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
         //ctx->next_xmit_offset = offset + packet_bytes;
         return XDP_TX;
     }
-    bpf_printk("HERE");
 
     struct rpc_state_cc *cc_node = NULL;
     struct rpc_state_cc *ref_cc_node = NULL;
@@ -397,7 +394,7 @@ int send_resp_ep_server(struct data_header *d, struct iphdr *iph, struct app_eve
 
         bp->data.seg.offset = bpf_htonl(0);
 
-        __u32 plen = ev->msg_len;
+        __u32 plen = seg_len;
         if(plen > HOMA_MSS)
             plen = HOMA_MSS;
         bp->data.seg.segment_length = bpf_htonl(plen);
