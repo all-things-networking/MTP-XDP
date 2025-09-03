@@ -233,7 +233,7 @@ static __always_inline void fill_ip_hdr(struct iphdr *iph, __u32 len)
 SEC("xdp_egress")
 int xdp_egress_prog(struct xdp_md *ctx)
 {
-    __u32 start = bpf_ktime_get_ns();
+    //__u32 start = bpf_ktime_get_ns();
     struct homa_meta_info *data_meta = NULL;
     void *data_end = NULL;
     void *data = NULL;
@@ -382,10 +382,11 @@ int xdp_egress_prog(struct xdp_md *ctx)
 
     fill_ip_hdr(iph, (data_end - data));
 
-    __u32 end = bpf_ktime_get_ns();
+    //__u32 end = bpf_ktime_get_ns();
 
     if (action == XDP_TX) {
-        bpf_printk("%u", end - start);
+        //bpf_printk("%u", end - start);
+        bpf_printk("");
         return xmit_packet(ctx, eth, iph);
     }
     

@@ -368,6 +368,8 @@ int fill_other_pkts(struct data_header *d, struct iphdr *iph, struct app_event *
     else
         set_prio(iph, atomic_read(&ctx->cc.sched_prio));
 
+
+    bp->data.seg.segment_length = bpf_htonl(seg_len);
     pkt_gen_instr_data_wrapper(d, bp);
 
     // TODO: debug here
