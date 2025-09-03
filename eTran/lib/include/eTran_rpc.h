@@ -36,6 +36,7 @@ struct app_event {
     uint16_t src_port;
     uint16_t dest_port;
     uint64_t rpcid;
+    uint32_t slot_idx;
 };
 
 struct HOMA_ACK {
@@ -238,7 +239,7 @@ class RpcSocket
 
     /* MTP functions */
     void parse_app_request(struct app_event *ev, uint32_t local_ip, uint32_t remote_ip, uint16_t src_port,
-        uint16_t dest_port, uint32_t msg_len, uint64_t addr, uint64_t rpcid);
+        uint16_t dest_port, uint32_t msg_len, uint64_t addr, uint64_t rpcid, uint32_t slot_idx);
     void send_req_ep_user(struct HOMABP *bp, struct app_event *ev, struct InternalReqMeta *ctx);
 
   private:

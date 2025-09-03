@@ -52,6 +52,7 @@ struct app_event {
     __u16 src_port;
     __u16 dest_port;
     __u64 rpcid;
+    __u32 slot_idx;
 };
 
 struct HOMA_ACK {
@@ -611,7 +612,7 @@ int first_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
     CHECK_AND_DROP_LOG(ev->retransmit, "server_request: retransmitted packet tries to create state.");
 
-    RPC_LOCK(ctx);
+    //RPC_LOCK(ctx);
     ctx->remote_ip = ev->flow_id.remote_ip;
     ctx->remote_port = ev->flow_id.remote_port;
     ctx->local_port = ev->flow_id.local_port;
@@ -634,7 +635,7 @@ int first_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     int_out->need_schedule = message_length > ctx->cc.incoming;
     int_out->last_bytes_remaining = message_length - seg_length;
 
-    RPC_UNLOCK(ctx);
+    //RPC_UNLOCK(ctx);
 
     __sync_fetch_and_add(&total_incoming, (__u64)(incoming - seg_length));
 
@@ -783,7 +784,7 @@ int recv_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
         }
         
         ctx->state = BPF_RPC_INCOMING;
-        ctx->bit_width = DIV_ROUND_UP(message_length, HOMA_MSS);
+        ctx->bit_width = ceil(message_length, HOMA_MSS);
         
         clear_all_bitmaps(ctx);
 
@@ -1957,7 +1958,7 @@ int reset_grants_state(struct xdp_md *ctx, struct interm_out *int_out)
 
 static __always_inline
 int pkt_gen_instr_xdp_data_wrapper(struct HOMABP *bp, __u64 addr, __u32 length,
-    struct xdp_md *xdp_ctx, struct homa_meta_info *data_meta, struct rpc_state *ctx) {
+    struct xdp_md *xdp_ctx, struct homa_meta_info *data_meta) {
 
     data_meta->rx.reap_server_buffer_addr = addr;
 
@@ -2076,7 +2077,7 @@ int resend_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
         __u64 addr = ctx->buffer_head;
 
-        pkt_gen_instr_xdp_data_wrapper(&bp, addr, ev->length, xdp_ctx, data_meta, ctx);
+        pkt_gen_instr_xdp_data_wrapper(&bp, addr, ev->length, xdp_ctx, data_meta);
 
         ctx->resend_count++;
     }
@@ -2212,7 +2213,7 @@ int unkown_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
             __u64 addr = ctx->buffer_head;
 
-            pkt_gen_instr_xdp_data_wrapper(&bp, addr, next_xmit_offset, xdp_ctx, data_meta, ctx);
+            pkt_gen_instr_xdp_data_wrapper(&bp, addr, next_xmit_offset, xdp_ctx, data_meta);
 
 
             /*if (bpf_xdp_adjust_tail(xdp_ctx, sizeof(struct resend_header) - sizeof(struct unknown_header)))
@@ -2245,9 +2246,9 @@ int unkown_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
         // Question: do we have a ctx_destroy or something similar in MTP?
         ctx->state = BPF_RPC_DEAD;
 
-        RPC_UNLOCK(ctx);
-
         destroy_ctx_instr_wrapper(ctx, ev->flow_id, data_meta, xdp_ctx);
+
+        RPC_UNLOCK(ctx);
         
         return 0;
     }
