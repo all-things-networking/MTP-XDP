@@ -255,6 +255,7 @@ int xdp_egress_prog(struct xdp_md *ctx)
     data_end = (void *)(long)ctx->data_end;
     data = (void *)(long)ctx->data;
     
+    
     CHECK_AND_DROP_LOG(data_meta + 1 > data, "data_meta + 1 > data_end");
 
     eth = (struct ethhdr *)data;
@@ -366,6 +367,7 @@ int xdp_egress_prog(struct xdp_md *ctx)
     struct dead_client_rpc_info dead_crpc = {0};
     ret = dequeue_dead_crpc(bpf_ntohl(iph->daddr), &dead_crpc);
     if (!ret) {
+        //bpf_printk("%lu", dead_crpc.rpcid);
         d->seg.ack.rpcid = bpf_cpu_to_be64(dead_crpc.rpcid);
         d->seg.ack.dport = bpf_htons(dead_crpc.remote_port);
         d->seg.ack.sport = bpf_htons(dead_crpc.local_port);
@@ -489,7 +491,6 @@ int xdp_sock_prog(struct xdp_md *ctx)
     proto_type = parse_packet_mtp(&nh, iph, data_end, &ev);
     CHECK_AND_DROP_LOG(proto_type < 0, "parse_packet_mtp failed");
 
-
     struct rpc_state *state = NULL;
     bool first_pkt_rpc = false;
     if(!get_context_mtp(ev.flow_id, &state, &first_pkt_rpc) || !state)
@@ -536,6 +537,7 @@ int xdp_sock_prog(struct xdp_md *ctx)
         return XDP_TX;
 
     target_xsk = bpf_map_lookup_elem(&port_tbl, &(ev.flow_id.local_port));
+
     CHECK_AND_DROP_LOG(!target_xsk, "Can't find corresponding XSK fd for this packet");
     
     socket_id = target_xsk->xsk_map_idx[current_cpu];

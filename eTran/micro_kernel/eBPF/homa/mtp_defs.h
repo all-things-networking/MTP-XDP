@@ -490,7 +490,12 @@ static __always_inline int parse_packet_mtp(struct hdr_cursor *nh, struct iphdr 
         case RESEND:
             parse_resend_hdr_mtp(homa_common_h, data_end, ev);
             break;
+        case UNKNOWN:
+            break;
+        case BUSY:
+            break;
         default:
+            bpf_printk("%x", ev->type);
             return -1;
     }
 
@@ -2121,8 +2126,8 @@ int pkt_gen_instr_xdp_no_data_wrapper(struct HOMABP bp, struct xdp_md *xdp_ctx) 
 
     c->type = bp.common.type;
     c->sender_id = bpf_cpu_to_be64(local_id(bp.common.sender_id));
-    c->sport = bp.common.src_port;
-    c->dport = bp.common.dest_port;
+    c->sport = bpf_htons(bp.common.src_port);
+    c->dport = bpf_htons(bp.common.dest_port);
 
     ip_swap = iph->saddr;
     iph->saddr = iph->daddr;
@@ -2147,20 +2152,25 @@ int tx_resend_resp(struct net_event *ev, struct rpc_state *ctx,
     struct HOMABP bp;
     bp.common.type = int_out->type_pkt;
     bp.common.sender_id = ev->flow_id.rpcid;
-    bp.common.src_port = ev->flow_id.remote_port;
-    bp.common.dest_port = ev->flow_id.local_port;
+    bp.common.dest_port = ev->flow_id.remote_port;
+    bp.common.src_port = ev->flow_id.local_port;
 
     return pkt_gen_instr_xdp_no_data_wrapper(bp, xdp_ctx);
 }
 
 static __always_inline
-void destroy_ctx_instr_wrapper(struct rpc_state *ctx, struct hkey flow_id,
-    struct homa_meta_info *data_meta, struct xdp_md *xdp_ctx) {
+int destroy_ctx_instr_wrapper(struct rpc_state *ctx, struct xdp_md *xdp_ctx) {
 
     void *data_end = (void *)(long)xdp_ctx->data_end;
-    struct unknown_header *homa_unknown_h = (struct unknown_header *)(sizeof(struct ethhdr) + sizeof(struct iphdr) + 1);
+    void *data = (void *)(long)xdp_ctx->data;
+    struct unknown_header *homa_unknown_h = (struct unknown_header *)(data + sizeof(struct ethhdr) + sizeof(struct iphdr) + 1);
     if (homa_unknown_h + 1 > data_end) {
-        return;
+        return -1;
+    }
+
+    struct homa_meta_info *data_meta = (struct homa_meta_info *)(long)xdp_ctx->data_meta;
+    if(data_meta + 1 > data) {
+        return -1;
     }
 
     data_meta->rx.reap_client_buffer_addr = ctx->buffer_head;
@@ -2168,8 +2178,7 @@ void destroy_ctx_instr_wrapper(struct rpc_state *ctx, struct hkey flow_id,
 
     homa_unknown_h->common.type = RESEND;
 
-    bpf_map_delete_elem(&rpc_tbl, &flow_id);
-    bpf_map_delete_elem(&pkt_bp_tbl, &flow_id);
+    return 1;
 }
 
 static __always_inline
@@ -2180,6 +2189,7 @@ int unkown_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     __u32 next_xmit_offset = 0;
 
     RPC_LOCK(ctx);
+
     if (unlikely(ctx->state == BPF_RPC_DEAD))
     {
         RPC_UNLOCK(ctx);
@@ -2239,21 +2249,29 @@ int unkown_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
             homa_resend_h->offset = 0;
             homa_resend_h->length = bpf_htonl(next_xmit_offset);
             return 0;*/
+        } else {
+            RPC_UNLOCK(ctx);
         }
     }
     else
     {
-
         // Question: do we have a ctx_destroy or something similar in MTP?
         ctx->state = BPF_RPC_DEAD;
 
-        destroy_ctx_instr_wrapper(ctx, ev->flow_id, data_meta, xdp_ctx);
+        int ret = destroy_ctx_instr_wrapper(ctx, xdp_ctx);
 
         RPC_UNLOCK(ctx);
+
+        if(ret == -1) {
+            bpf_printk("destroy_ctx_instr_wrapper data_meta error");
+        } else {
+            bpf_map_delete_elem(&rpc_tbl, &(ev->flow_id));
+            bpf_map_delete_elem(&pkt_bp_tbl, &(ev->flow_id));
+        }
         
         return 0;
     }
-    RPC_UNLOCK(ctx);
+
     return -1;
 }
 
