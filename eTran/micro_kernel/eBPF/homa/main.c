@@ -261,10 +261,14 @@ int xdp_egress_prog(struct xdp_md *ctx)
     iph = (struct iphdr *)(eth + 1);
     c = (struct common_header *)(iph + 1);
     d = (struct data_header *)c;
-    
+
     //CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
-    if(d + 1 > data_end)
+    if(d + 1 > data_end) {
+        bpf_printk("Trying retransmit");
         return XDP_DROP;
+    }
+
+    #ifndef MTP_ON
 
     CHECK_AND_DROP_LOG(iph->protocol != IPPROTO_HOMA, "not HOMA protocol");
 
@@ -281,6 +285,7 @@ int xdp_egress_prog(struct xdp_md *ctx)
         // TODO: we should throttle retransmitted packets
         return xmit_packet(ctx, eth, iph);
     }
+    #endif
 
     #ifdef MTP_ON
 
@@ -288,18 +293,20 @@ int xdp_egress_prog(struct xdp_md *ctx)
     //struct HOMABP *bp;
     
     //__u32 seg_len = (data_end - data) - sizeof(*eth) - sizeof(*iph) - sizeof(*d) - sizeof(*ev) - sizeof(*bp);
-    __u32 seg_len = (data_end - data) - sizeof(*eth) - sizeof(*iph) - sizeof(*d) - sizeof(*ev);
+    //__u32 seg_len = (data_end - data) - sizeof(*eth) - sizeof(*iph) - sizeof(*d) - sizeof(*ev);
+    __u32 seg_len = (data_end - data) - sizeof(*eth) - sizeof(*iph) - sizeof(*d);
     if(seg_len > DEFAULT_MTU) {
         bpf_printk("Error here 1");
         return XDP_DROP;
     }
-    if((void *)d + sizeof(*d) + seg_len > data_end) {
+    /*if((void *)d + sizeof(*d) + seg_len > data_end) {
         bpf_printk("Error here 2");
         return XDP_DROP;
     }
     void *payload_end = (void *)d + sizeof(*d) + seg_len;
 
-    ev = (struct app_event *) payload_end;
+    ev = (struct app_event *) payload_end;*/
+    ev = (struct app_event *) data;
     CHECK_AND_DROP_LOG(ev + 1 > data_end, "ev + 1 > data_end");
 
     //bp = (struct HOMABP *)(ev + 1);
@@ -342,6 +349,20 @@ int xdp_egress_prog(struct xdp_md *ctx)
     CHECK_AND_DROP_LOG(action != XDP_TX && action != XDP_REDIRECT, "action != XDP_TX && action != XDP_REDIRECT");
 
     /* piggyback ACK in this packet to free server rpc at remote side */
+
+    eth = (struct ethhdr *)data;
+    iph = (struct iphdr *)(eth + 1);
+    c = (struct common_header *)(iph + 1);
+    d = (struct data_header *)c;
+    
+    CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
+
+    iph->saddr = ev->local_ip;
+    iph->daddr = ev->remote_ip;
+    iph->protocol = IPPROTO_HOMA;
+
+    d->unused1 = ev->slot_idx;
+
     struct dead_client_rpc_info dead_crpc = {0};
     ret = dequeue_dead_crpc(bpf_ntohl(iph->daddr), &dead_crpc);
     if (!ret) {
@@ -358,24 +379,17 @@ int xdp_egress_prog(struct xdp_md *ctx)
     //bpf_printk("%u", data_end - data);
 
     #ifdef MTP_ON
-    int err = 0;
+    //int err = 0;
     data_end = (void *)(long)ctx->data_end;
     data = (void *)(long)ctx->data;
 
     //if (unlikely(err = bpf_xdp_adjust_tail(ctx, -((int)sizeof(struct app_event) + (int)sizeof(struct HOMABP)))))
-    if (unlikely(err = bpf_xdp_adjust_tail(ctx, -((int)sizeof(struct app_event)))))
+    /*if (unlikely(err = bpf_xdp_adjust_tail(ctx, -((int)sizeof(struct app_event)))))
     {
         return XDP_DROP;
     }
     data_end = (void *)(long)ctx->data_end;
-    data = (void *)(long)ctx->data;
-
-    eth = (struct ethhdr *)data;
-    iph = (struct iphdr *)(eth + 1);
-    c = (struct common_header *)(iph + 1);
-    d = (struct data_header *)c;
-    
-    CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
+    data = (void *)(long)ctx->data;*/
 
     //bpf_printk("%u", data_end - data);
     #endif
@@ -386,7 +400,7 @@ int xdp_egress_prog(struct xdp_md *ctx)
 
     if (action == XDP_TX) {
         //bpf_printk("%u", end - start);
-        bpf_printk("");
+        
         return xmit_packet(ctx, eth, iph);
     }
     
@@ -394,6 +408,7 @@ int xdp_egress_prog(struct xdp_md *ctx)
     ret = enqueue_pkt_to_rl(ctx, state->qid, eth, iph);
     
     if (int_out.trigger) {
+        //bpf_printk("HEREEEE");
         kick_pacer();
     }
     #else

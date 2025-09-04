@@ -9,7 +9,7 @@
 #define MTP_ON 1
 
 void RpcSocket::parse_app_request(struct app_event *ev, uint32_t local_ip, uint32_t remote_ip, uint16_t src_port,
-    uint16_t dest_port, uint32_t msg_len, uint64_t addr, uint64_t rpcid) {
+    uint16_t dest_port, uint32_t msg_len, uint64_t addr, uint64_t rpcid, uint32_t slot_idx) {
     ev->local_ip = local_ip;
     ev->remote_ip = remote_ip;
     ev->src_port = src_port;
@@ -17,6 +17,7 @@ void RpcSocket::parse_app_request(struct app_event *ev, uint32_t local_ip, uint3
     ev->msg_len = msg_len;
     ev->addr = addr;
     ev->rpcid = rpcid;
+    ev->slot_idx = slot_idx;
 }
 
 void RpcSocket::send_req_ep_user(struct HOMABP *bp, struct app_event *ev, struct InternalReqMeta *ctx) {

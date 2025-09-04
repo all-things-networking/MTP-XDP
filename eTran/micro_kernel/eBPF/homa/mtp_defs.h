@@ -52,6 +52,7 @@ struct app_event {
     __u16 src_port;
     __u16 dest_port;
     __u64 rpcid;
+    __u32 slot_idx;
 };
 
 struct HOMA_ACK {
@@ -169,15 +170,16 @@ int get_pkt_bp_mtp(struct app_event * ev, struct HOMABP **bp, bool *first_packet
 // Question: if we don't use BP to fill the initial context
 // values, what should we use?
 static __always_inline
-void new_ctx_instr_wrapper(struct rpc_state *ctx, struct app_event *ev, bool client) {
+void new_ctx_instr_wrapper(struct rpc_state *ctx, struct app_event *ev, bool client, __u32 packet_bytes) {
+
     if(client) {
         /* create a new RPC state */
         ctx->state = BPF_RPC_OUTGOING;
         ctx->message_length = ev->msg_len;
         //ctx->next_xmit_offset = bpf_ntohl(bp->data.seg.segment_length);
-        ctx->next_xmit_offset = min(ev->msg_len, Homa_unsched_bytes);
+        ctx->next_xmit_offset = packet_bytes;
         ctx->buffer_head = ev->addr;
-        ctx->remote_port = ev->dest_port;
+        ctx->remote_port = bpf_ntohs(ev->dest_port);
         ctx->local_port = ev->src_port;
         ctx->remote_ip = bpf_ntohl(ev->remote_ip);
         ctx->id = ev->rpcid;
@@ -188,7 +190,7 @@ void new_ctx_instr_wrapper(struct rpc_state *ctx, struct app_event *ev, bool cli
         ctx->state = BPF_RPC_OUTGOING;
         ctx->message_length = ev->msg_len;
         //ctx->next_xmit_offset = bpf_ntohl(bp->data.seg.segment_length);
-        ctx->next_xmit_offset = min(ev->msg_len, Homa_unsched_bytes);
+        ctx->next_xmit_offset = packet_bytes;
         ctx->buffer_head = ev->addr;
         ctx->nr_pkts_in_rl = 0;
         ctx->cc.sched_prio = 0;
@@ -253,7 +255,7 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
 
     new_tx_ordered_data_wrapper(message_length, ctx);
 
-    new_ctx_instr_wrapper(ctx, ev, true);
+    new_ctx_instr_wrapper(ctx, ev, true, packet_bytes);
 
     //struct HOMABP bp;
     bp->common.src_port = bpf_htons(ev->src_port);
@@ -312,7 +314,7 @@ int send_resp_ep_server(struct data_header *d, struct iphdr *iph, struct app_eve
     bool single_packet = message_length <= HOMA_MSS;
     __u64 cc_granted = atomic_read(&ctx->cc.granted);
 
-    new_ctx_instr_wrapper(ctx, ev, false);
+    new_ctx_instr_wrapper(ctx, ev, false, packet_bytes);
 
     bp->common.src_port = bpf_htons(ev->src_port);
     bp->common.dest_port = ev->dest_port;
@@ -373,10 +375,10 @@ int fill_other_pkts(struct data_header *d, struct iphdr *iph, struct app_event *
     pkt_gen_instr_data_wrapper(d, bp);
 
     // TODO: debug here
-    if (offset + packet_bytes <= ctx->next_xmit_offset && (atomic_read(&ctx->nr_pkts_in_rl) == 0 &&
+    if (offset + packet_bytes <= cc_granted && (atomic_read(&ctx->nr_pkts_in_rl) == 0 &&
         (packet_bytes <= Homa_min_throttled_bytes || check_nic_queue(packet_bytes)))) {
             
-        //ctx->next_xmit_offset = offset + packet_bytes;
+        ctx->next_xmit_offset = offset + packet_bytes;
         return XDP_TX;
     }
 
@@ -395,7 +397,7 @@ int fill_other_pkts(struct data_header *d, struct iphdr *iph, struct app_event *
         /* we create the qid, so we need to create an object and enqueue it to throttle list */
         cc_node = bpf_obj_new(typeof(*cc_node));
         CHECK_AND_DROP_LOG(!cc_node, "fill_other_pkts, bpf_obj_new failed.");
-        
+
         cc_node->birth = bpf_ktime_get_ns();
         cc_node->hkey.rpcid = ctx->id;
         cc_node->hkey.local_port = ctx->local_port;
@@ -611,7 +613,7 @@ int first_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
     CHECK_AND_DROP_LOG(ev->retransmit, "server_request: retransmitted packet tries to create state.");
 
-    RPC_LOCK(ctx);
+    //RPC_LOCK(ctx);
     ctx->remote_ip = ev->flow_id.remote_ip;
     ctx->remote_port = ev->flow_id.remote_port;
     ctx->local_port = ev->flow_id.local_port;
@@ -634,7 +636,7 @@ int first_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     int_out->need_schedule = message_length > ctx->cc.incoming;
     int_out->last_bytes_remaining = message_length - seg_length;
 
-    RPC_UNLOCK(ctx);
+    //RPC_UNLOCK(ctx);
 
     __sync_fetch_and_add(&total_incoming, (__u64)(incoming - seg_length));
 
@@ -783,7 +785,7 @@ int recv_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
         }
         
         ctx->state = BPF_RPC_INCOMING;
-        ctx->bit_width = DIV_ROUND_UP(message_length, HOMA_MSS);
+        ctx->bit_width = ceil(message_length, HOMA_MSS);
         
         clear_all_bitmaps(ctx);
 
@@ -1957,7 +1959,7 @@ int reset_grants_state(struct xdp_md *ctx, struct interm_out *int_out)
 
 static __always_inline
 int pkt_gen_instr_xdp_data_wrapper(struct HOMABP *bp, __u64 addr, __u32 length,
-    struct xdp_md *xdp_ctx, struct homa_meta_info *data_meta, struct rpc_state *ctx) {
+    struct xdp_md *xdp_ctx, struct homa_meta_info *data_meta) {
 
     data_meta->rx.reap_server_buffer_addr = addr;
 
@@ -2076,7 +2078,7 @@ int resend_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
         __u64 addr = ctx->buffer_head;
 
-        pkt_gen_instr_xdp_data_wrapper(&bp, addr, ev->length, xdp_ctx, data_meta, ctx);
+        pkt_gen_instr_xdp_data_wrapper(&bp, addr, ev->length, xdp_ctx, data_meta);
 
         ctx->resend_count++;
     }
@@ -2212,7 +2214,7 @@ int unkown_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
             __u64 addr = ctx->buffer_head;
 
-            pkt_gen_instr_xdp_data_wrapper(&bp, addr, next_xmit_offset, xdp_ctx, data_meta, ctx);
+            pkt_gen_instr_xdp_data_wrapper(&bp, addr, next_xmit_offset, xdp_ctx, data_meta);
 
 
             /*if (bpf_xdp_adjust_tail(xdp_ctx, sizeof(struct resend_header) - sizeof(struct unknown_header)))
@@ -2245,9 +2247,9 @@ int unkown_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
         // Question: do we have a ctx_destroy or something similar in MTP?
         ctx->state = BPF_RPC_DEAD;
 
-        RPC_UNLOCK(ctx);
-
         destroy_ctx_instr_wrapper(ctx, ev->flow_id, data_meta, xdp_ctx);
+
+        RPC_UNLOCK(ctx);
         
         return 0;
     }
