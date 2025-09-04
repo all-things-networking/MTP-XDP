@@ -36,35 +36,36 @@ struct app_event {
     uint16_t src_port;
     uint16_t dest_port;
     uint64_t rpcid;
+    uint32_t slot_idx;
 };
 
 struct HOMA_ACK {
-    uint64_t rpcid;
-    uint16_t sport;
-    uint16_t dport;
+    __be64 rpcid;
+    __be16 sport;
+    __be16 dport;
 };
 
 struct DATA_SEG {
-    uint32_t offset;
-    uint32_t segment_length;
+    __be32 offset;
+    __be32 segment_length;
     struct HOMA_ACK ack;
 };
 
 struct DATA_HDR {
-    uint32_t message_length;
-    uint32_t incoming;
-    uint16_t cutoff_version;
-    uint8_t retransmit;
+    __be32 message_length;
+    __be32 incoming;
+    __be16 cutoff_version;
+    __u8 retransmit;
     struct DATA_SEG seg;
 };
 
 struct COMMON_HDR {
-    uint32_t src_port;
-    uint32_t dest_port;
-    uint8_t doff;
-    uint8_t type;
-    uint16_t seq;
-    uint64_t sender_id;
+    __be16 src_port;
+    __be16 dest_port;
+    __u8 doff;
+    __u8 type;
+    __u16 seq;
+    __be64 sender_id;
 };
 
 struct HOMABP {
@@ -238,7 +239,7 @@ class RpcSocket
 
     /* MTP functions */
     void parse_app_request(struct app_event *ev, uint32_t local_ip, uint32_t remote_ip, uint16_t src_port,
-        uint16_t dest_port, uint32_t msg_len, uint64_t addr, uint64_t rpcid);
+        uint16_t dest_port, uint32_t msg_len, uint64_t addr, uint64_t rpcid, uint32_t slot_idx);
     void send_req_ep_user(struct HOMABP *bp, struct app_event *ev, struct InternalReqMeta *ctx);
 
   private:
@@ -395,10 +396,10 @@ class RpcSocket
     }
 
     /* handler for client RPC when receiving response */
-    void client_response(uint8_t qidx, struct data_header *d);
+    void client_response(uint8_t qidx, struct data_header *d, char *pkt);
 
     /* handler for server RPC when receiving request */
-    void server_request(uint8_t qidx, struct data_header *d, uint32_t remote_ip, uint64_t rpcid);
+    void server_request(uint8_t qidx, struct data_header *d, uint32_t remote_ip, uint64_t rpcid, char *pkt);
 
     /* called by server RPC when multi-packet request is completed */
     inline void multi_pkt_req_complete(std::unordered_map<struct eTran_homa_rpc_tuple, struct InternalReqHandle, 

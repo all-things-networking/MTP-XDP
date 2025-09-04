@@ -250,15 +250,21 @@ struct target_xsk
 };
 
 typedef struct __attribute__((packed)) {
+    __u32 flag;
     __u32 slowpath;
     __u64 buffer_next;
     __u64 buffer_addr;
+    __u32 unused1;
+    __u32 unused2;
 } homa_tx_t;
 
 typedef struct __attribute__((packed)) {
     __u32 qid;
     __u64 reap_client_buffer_addr;
     __u64 reap_server_buffer_addr;
+    __u32 msg_len;
+    __u32 seg_len;
+    __u32 offset;
 } homa_rx_t;
 
 struct homa_meta_info
@@ -269,9 +275,9 @@ struct homa_meta_info
     } __attribute__((packed));
 } __attribute__((packed));
 #ifdef __cplusplus
-static_assert(sizeof(struct homa_meta_info) == 20, "homa_meta_info size is not 20 bytes");
+static_assert(sizeof(struct homa_meta_info) == 32, "homa_meta_info size is not 32 bytes");
 #else
-_Static_assert (sizeof(struct homa_meta_info) == 20, "homa_meta_info size is not 20 bytes");
+_Static_assert (sizeof(struct homa_meta_info) == 32, "homa_meta_info size is not 32 bytes");
 #endif
 
 // RPC state macros
@@ -323,6 +329,9 @@ struct rpc_state {
     __u16 resend_count;
     void *cc_node;
     struct bpf_spin_lock hash_lock; // 4B
+
+    __u32 new_rx_ord_data_msg_len;
+    //__u32 bytes_remaining;
 } __attribute__((aligned(64)));
 static_assert(sizeof(struct rpc_state) == 256, "rpc_state size is not 256 bytes");
 #else
@@ -377,13 +386,16 @@ struct rpc_state
     __u64 bitmap_6;
     __u64 bitmap_7;
     __u64 bitmap_8;
-    __u64 bitmap_9;
+    __u64 bitmap_9; 
     __u64 bitmap_10;
     __u64 bitmap_11;
     __u16 resend_count;
     // used for throttle list to avoid allocation overhead
     struct rpc_state_cc __kptr *cc_node;
     struct bpf_spin_lock hash_lock; // 4B
+
+    __u32 new_rx_ord_data_msg_len;
+    //__u32 bytes_remaining;
 } __attribute__((aligned(64)));
 _Static_assert (sizeof(struct rpc_state) == 256, "rpc_state size is not 256 bytes");
 #endif

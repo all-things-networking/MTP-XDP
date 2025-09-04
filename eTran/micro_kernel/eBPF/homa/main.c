@@ -31,21 +31,24 @@ char LICENSE[] SEC("license") = "GPL";
 SEC("xdp_gen")
 int xdp_gen_prog(struct xdp_md *ctx)
 {
-    int err = 0;
-    int last_grant = 0; // if this is true, we should return XDP_ABORTED
-    int no_work = 0;
     __u32 cpu = bpf_get_smp_processor_id();
     if (unlikely(cpu >= MAX_CPU))
     {
         bpf_printk("ERROR: CPU Mapping, cpu=%d\n", cpu);
         return XDP_ABORTED;
     }
+    #ifndef MTP_ON
+    int err = 0;
+    int last_grant = 0; // if this is true, we should return XDP_ABORTED
+    int no_work = 0;
+    
     struct ret_grant_info gi = {0};
     void *data;
     void *data_end;
     int send_fifo_rpc = 0;
 
     unsigned int gi_idx;
+    #endif
     use_cached_lb_choice[cpu] = 0;
 
     if (finish_grant_choose[cpu] == 0)
@@ -53,10 +56,26 @@ int xdp_gen_prog(struct xdp_md *ctx)
         // force to clear the last cached rpc
         update_grant_for_cached_rpc(cpu);
 
+        #ifndef MTP_ON
         bpf_tail_call(ctx, &xdp_gen_tail_call_map, XDP_GEN_CHOOSE_RPC_TO_GRANT);
+        #else
+        if(choose_grants(ctx) == XDP_ABORTED)
+            return XDP_ABORTED;
+
+        update_prios(ctx);
+        #endif
         // fallthrough: bpf_tail_call failed
         return XDP_ABORTED;
     }
+    #ifdef MTP_ON 
+    else {
+        struct interm_out int_out = {0};
+        int ret;
+        ret = gen_grants(ctx, &int_out);
+        ret = reset_grants_state(ctx, &int_out);
+        return ret;
+    }
+    #else
 
     granting_idx[cpu]++;
     // bpf_printk("DEBUG: granting_idx[cpu]: %d\n", granting_idx[cpu]);
@@ -192,6 +211,7 @@ reset:
         need_grant_fifo[cpu] = 0;
 
     return XDP_TX;
+    #endif
 }
 
 // Fill IP header except for addresses
@@ -213,6 +233,7 @@ static __always_inline void fill_ip_hdr(struct iphdr *iph, __u32 len)
 SEC("xdp_egress")
 int xdp_egress_prog(struct xdp_md *ctx)
 {
+    //__u32 start = bpf_ktime_get_ns();
     struct homa_meta_info *data_meta = NULL;
     void *data_end = NULL;
     void *data = NULL;
@@ -221,8 +242,10 @@ int xdp_egress_prog(struct xdp_md *ctx)
     struct common_header *c;
     struct data_header *d;
     int action, ret;
+    #ifndef MTP_ON
     __u64 rpc_qid = MAX_BUCKET_SIZE;
     bool trigger = false;
+    #endif
 
     /* adjust data_meta to access metadata in headroom */
     CHECK_AND_DROP_LOG(bpf_xdp_adjust_meta(ctx, -(int)sizeof(*data_meta)) != 0, "xdp_adjust_meta failed");
@@ -232,14 +255,21 @@ int xdp_egress_prog(struct xdp_md *ctx)
     data_end = (void *)(long)ctx->data_end;
     data = (void *)(long)ctx->data;
     
+    
     CHECK_AND_DROP_LOG(data_meta + 1 > data, "data_meta + 1 > data_end");
 
     eth = (struct ethhdr *)data;
     iph = (struct iphdr *)(eth + 1);
     c = (struct common_header *)(iph + 1);
     d = (struct data_header *)c;
-    
-    CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
+
+    //CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
+    if(d + 1 > data_end) {
+        bpf_printk("Trying retransmit");
+        return XDP_DROP;
+    }
+
+    #ifndef MTP_ON
 
     CHECK_AND_DROP_LOG(iph->protocol != IPPROTO_HOMA, "not HOMA protocol");
 
@@ -256,49 +286,56 @@ int xdp_egress_prog(struct xdp_md *ctx)
         // TODO: we should throttle retransmitted packets
         return xmit_packet(ctx, eth, iph);
     }
+    #endif
 
     #ifdef MTP_ON
 
     struct app_event *ev;
-    struct HOMABP *bp;
+    //struct HOMABP *bp;
     
-    __u32 seg_len = (data_end - data) - sizeof(*eth) - sizeof(*iph) - sizeof(*d) - sizeof(*ev) - sizeof(*bp);
+    //__u32 seg_len = (data_end - data) - sizeof(*eth) - sizeof(*iph) - sizeof(*d) - sizeof(*ev) - sizeof(*bp);
+    //__u32 seg_len = (data_end - data) - sizeof(*eth) - sizeof(*iph) - sizeof(*d) - sizeof(*ev);
+    __u32 seg_len = (data_end - data) - sizeof(*eth) - sizeof(*iph) - sizeof(*d);
     if(seg_len > DEFAULT_MTU) {
         bpf_printk("Error here 1");
         return XDP_DROP;
     }
-    if((void *)d + sizeof(*d) + seg_len > data_end) {
+    /*if((void *)d + sizeof(*d) + seg_len > data_end) {
         bpf_printk("Error here 2");
         return XDP_DROP;
     }
     void *payload_end = (void *)d + sizeof(*d) + seg_len;
 
-    ev = (struct app_event *) payload_end;
+    ev = (struct app_event *) payload_end;*/
+    ev = (struct app_event *) data;
     CHECK_AND_DROP_LOG(ev + 1 > data_end, "ev + 1 > data_end");
 
-    bp = (struct HOMABP *)(ev + 1);
-    CHECK_AND_DROP_LOG(bp + 1 > data_end, "bp + 1 > data_end");
+    //bp = (struct HOMABP *)(ev + 1);
+    //CHECK_AND_DROP_LOG(bp + 1 > data_end, "bp + 1 > data_end");
 
-    CHECK_AND_DROP_LOG(bp->common.type != DATA, "not DATA packet");
-
-    struct rpc_key_t hkey = {0};
-    hkey.local_port = bpf_ntohs(bp->common.src_port);
-    hkey.remote_port = bpf_ntohs(bp->common.dest_port);
-    hkey.rpcid = bpf_be64_to_cpu(bp->common.sender_id);
-    hkey.remote_ip = bpf_ntohl(iph->daddr);
+    //CHECK_AND_DROP_LOG(bp->common.type != DATA, "not DATA packet");
 
     struct rpc_state *state = NULL;
-    state = bpf_map_lookup_elem(&rpc_tbl, &hkey);
-    if(!state) {
-        struct rpc_state new_state = {0};
-        CHECK_AND_DROP_LOG(bpf_map_update_elem(&rpc_tbl, &hkey, &new_state, BPF_NOEXIST), "client_request, bpf_map_update_elem failed.");
-        state = bpf_map_lookup_elem(&rpc_tbl, &hkey);
-        CHECK_AND_DROP_LOG(!state, "client_request, bpf_map_lookup_elem failed.");
+    if(!get_context_mtp_egress(ev, &state) || !state)
+        return XDP_DROP;
+
+    struct HOMABP *bp = NULL;
+    bool first_packet = false;
+    if(!get_pkt_bp_mtp(ev, &bp, &first_packet) || !bp)
+        return XDP_DROP;
+
+    struct interm_out int_out = {0};
+    if (rpc_is_client(ev->rpcid)) {
+        if(first_packet)
+            action = send_req_ep_client(d, iph, ev, state, bp, &int_out, seg_len);
+        else
+            action = fill_other_pkts(d, iph, ev, state, bp, &int_out, seg_len);
+    } else {
+        if(first_packet)
+            action = send_resp_ep_server(d, iph, ev, state, bp, &int_out, seg_len);
+        else
+            action = fill_other_pkts(d, iph, ev, state, bp, &int_out, seg_len);
     }
-    if (rpc_is_client(bpf_be64_to_cpu(bp->common.sender_id)))
-        action = send_req_ep_cient(d, iph, ev, bp, state, &rpc_qid, &trigger);
-    else
-        action = send_resp_ep_server(d, iph, ev, bp, state, &rpc_qid, &trigger);
     #endif
     
     #ifndef MTP_ON
@@ -313,9 +350,24 @@ int xdp_egress_prog(struct xdp_md *ctx)
     CHECK_AND_DROP_LOG(action != XDP_TX && action != XDP_REDIRECT, "action != XDP_TX && action != XDP_REDIRECT");
 
     /* piggyback ACK in this packet to free server rpc at remote side */
+
+    eth = (struct ethhdr *)data;
+    iph = (struct iphdr *)(eth + 1);
+    c = (struct common_header *)(iph + 1);
+    d = (struct data_header *)c;
+    
+    CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
+
+    iph->saddr = ev->local_ip;
+    iph->daddr = ev->remote_ip;
+    iph->protocol = IPPROTO_HOMA;
+
+    d->unused1 = ev->slot_idx;
+
     struct dead_client_rpc_info dead_crpc = {0};
     ret = dequeue_dead_crpc(bpf_ntohl(iph->daddr), &dead_crpc);
     if (!ret) {
+        //bpf_printk("%lu", dead_crpc.rpcid);
         d->seg.ack.rpcid = bpf_cpu_to_be64(dead_crpc.rpcid);
         d->seg.ack.dport = bpf_htons(dead_crpc.remote_port);
         d->seg.ack.sport = bpf_htons(dead_crpc.local_port);
@@ -326,37 +378,47 @@ int xdp_egress_prog(struct xdp_md *ctx)
         d->seg.ack.sport = 0;
     }
 
-    fill_ip_hdr(iph, (data_end - data));
+    //bpf_printk("%u", data_end - data);
 
-    // TODO: understand why this is problematic
     #ifdef MTP_ON
-    int err = 0;
+    //int err = 0;
     data_end = (void *)(long)ctx->data_end;
     data = (void *)(long)ctx->data;
 
-    if (unlikely(err = bpf_xdp_adjust_tail(ctx, -((int)sizeof(struct app_event) + (int)sizeof(struct HOMABP)))))
+    //if (unlikely(err = bpf_xdp_adjust_tail(ctx, -((int)sizeof(struct app_event) + (int)sizeof(struct HOMABP)))))
+    /*if (unlikely(err = bpf_xdp_adjust_tail(ctx, -((int)sizeof(struct app_event)))))
     {
         return XDP_DROP;
     }
     data_end = (void *)(long)ctx->data_end;
-    data = (void *)(long)ctx->data;
+    data = (void *)(long)ctx->data;*/
 
-    eth = (struct ethhdr *)data;
-    iph = (struct iphdr *)(eth + 1);
-    c = (struct common_header *)(iph + 1);
-    d = (struct data_header *)c;
-    
-    CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
+    //bpf_printk("%u", data_end - data);
     #endif
 
+    fill_ip_hdr(iph, (data_end - data));
+
+    //__u32 end = bpf_ktime_get_ns();
+
     if (action == XDP_TX) {
+        //bpf_printk("%u", end - start);
+        
         return xmit_packet(ctx, eth, iph);
     }
     
-    ret = enqueue_pkt_to_rl(ctx, rpc_qid, eth, iph);
+    #ifdef MTP_ON
+    ret = enqueue_pkt_to_rl(ctx, state->qid, eth, iph);
     
+    if (int_out.trigger) {
+        //bpf_printk("HEREEEE");
+        kick_pacer();
+    }
+    #else
+    ret = enqueue_pkt_to_rl(ctx, rpc_qid, eth, iph);
+
     if (trigger)
         kick_pacer();
+    #endif
     
     return ret;
 }
@@ -373,22 +435,22 @@ int xdp_sock_prog(struct xdp_md *ctx)
     struct hdr_cursor nh = {0};
     
     struct iphdr *iph;
-    //#ifndef MTP_ON
+    #ifndef MTP_ON
     struct common_header *homa_common_hdr;
     struct data_header *homa_data_hdr;
     struct grant_header *homa_grant_hdr;
     struct busy_header *homa_busy_hdr;
     struct resend_header *homa_resend_hdr;
     struct unknown_header *homa_unknown_hdr;
-    //#endif
     struct slow_path_info *sp;
-    
-    int proto_type;
+
     int single_packet = 0;
-    int ret = 0;
     __u32 remote_ip = 0;
     __u32 qid = ctx->rx_queue_index;
     __u16 local_port = 0;
+    #endif
+    int ret = 0;
+    int proto_type;
     struct target_xsk *target_xsk;
 
     #ifdef TEST_PACKET_LOST
@@ -411,16 +473,82 @@ int xdp_sock_prog(struct xdp_md *ctx)
     data_meta->rx.reap_client_buffer_addr = POISON_64;
     data_meta->rx.reap_server_buffer_addr = POISON_64;
     data_meta->rx.qid = ctx->rx_queue_index;
+    data_meta->rx.msg_len = 0;
+    data_meta->rx.seg_len = 0;
+    data_meta->rx.offset = 0;
 
     /* Ethernet and IP header has already been parsed by the entrance program */
     nh.pos = data + sizeof(struct ethhdr) + sizeof(struct iphdr);
     iph = (struct iphdr *)(data + sizeof(struct ethhdr));
 
-    struct net_event ev;
-    proto_type = parse_packet_mtp(&nh, iph, data_end, &ev);
-    CHECK_AND_DROP_LOG(proto_type < 0, "homa_parse_common_hdr failed");
 
-    //#ifndef MTP_ON
+
+
+
+    /*************** MTP START ****************/
+
+    struct net_event ev = {0};
+    proto_type = parse_packet_mtp(&nh, iph, data_end, &ev);
+    CHECK_AND_DROP_LOG(proto_type < 0, "parse_packet_mtp failed");
+
+    struct rpc_state *state = NULL;
+    bool first_pkt_rpc = false;
+    if(!get_context_mtp(ev.flow_id, &state, &first_pkt_rpc) || !state)
+        return XDP_DROP;
+
+    struct interm_out int_out = {0};
+    if(proto_type == DATA) {
+        // Question: should we have an EP for this? Or how can we abstract it?
+        struct ack_net_info ack_info = {0};
+        if(!parse_ack_info(&nh, data_end, &ack_info, ev.flow_id.remote_ip))
+            return XDP_DROP;
+        reclaim_rpc_mtp(ack_info, data_meta);
+
+        if (rpc_is_client(local_id(ev.flow_id.rpcid))) {
+            ret = recv_resp_pkt_ep(&ev, state, data_meta, &int_out);
+            ret = sched_ep(&ev, state, data_meta, &int_out);
+        } else {
+            if(first_pkt_rpc) {
+                ret = first_req_pkt_ep(&ev, state, data_meta, &int_out);
+                ret = no_ctx_sched_ep(&ev, state, data_meta, &int_out);
+            } else {
+                ret = next_req_pkt_ep(&ev, state, data_meta, &int_out);
+                ret = sched_ep(&ev, state, data_meta, &int_out);
+            }
+        }
+
+        CHECK_AND_DROP_LOG(ret == XDP_DROP, "XDP_DROP for error rpc state");
+
+    } else if(proto_type == RESEND) {
+        ret = resend_pkt_ep(&ev, state, data_meta, &int_out, ctx);
+        ret = tx_resend_resp(&ev, state, data_meta, &int_out, ctx);
+
+    } else if(proto_type == UNKNOWN) {
+        ret = unkown_pkt_ep(&ev, state, data_meta, &int_out, ctx);
+
+    } else if(proto_type == BUSY) {
+        busy_pkt_ep(&ev, state, data_meta, &int_out);
+        
+    } else if(proto_type == GRANT) {
+        recv_grant_ep(&ev, state, data_meta, &int_out);
+    }
+
+    if(ret == XDP_TX)
+        return XDP_TX;
+
+    target_xsk = bpf_map_lookup_elem(&port_tbl, &(ev.flow_id.local_port));
+
+    CHECK_AND_DROP_LOG(!target_xsk, "Can't find corresponding XSK fd for this packet");
+    
+    socket_id = target_xsk->xsk_map_idx[current_cpu];
+    CHECK_AND_DROP_LOG(socket_id < 0, "socket_id < 0");
+    
+    return bpf_redirect_map(&xsks_map, socket_id, XDP_DROP);
+
+    /*************** MTP END ****************/
+
+
+    #ifndef MTP_ON
     proto_type = homa_parse_common_hdr(&nh, data_end, &homa_common_hdr);
     CHECK_AND_DROP_LOG(proto_type < 0, "homa_parse_common_hdr failed");
     
@@ -432,7 +560,6 @@ int xdp_sock_prog(struct xdp_md *ctx)
     
     single_packet = homa_parse_data_hdr(&nh, data_end, &homa_data_hdr);
     CHECK_AND_DROP_LOG(single_packet < 0, "homa_parse_data_hdr failed");
-    //#endif
 
 // load balancing
 #ifdef LB
@@ -480,8 +607,9 @@ bypass_lb:
     
     if (rpc_is_client(local_id(bpf_be64_to_cpu(homa_data_hdr->common.sender_id))))
         ret = client_response(homa_data_hdr, remote_ip, data_meta, single_packet);
-    else
+    else {
         ret = server_request(homa_data_hdr, remote_ip, single_packet);
+    }
 
     CHECK_AND_DROP_LOG(ret == XDP_DROP, "XDP_DROP for error rpc state");
 
@@ -534,6 +662,7 @@ drop:
     CHECK_AND_DROP_LOG(socket_id < 0, "socket_id < 0");
     
     return bpf_redirect_map(&xsks_map, socket_id, XDP_DROP);
+    #endif
 }
 
 SEC("xdp/cpumap")

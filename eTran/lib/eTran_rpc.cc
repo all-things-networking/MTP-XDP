@@ -68,11 +68,14 @@ void RpcSocket::run_event_loop_block(int timeout)
     flush_rpc_retransmission_queue();
 }
 
-void RpcSocket::server_request(uint8_t qidx, struct data_header *d, uint32_t remote_ip, uint64_t rpcid) {
+void RpcSocket::server_request(uint8_t qidx, struct data_header *d, uint32_t remote_ip, uint64_t rpcid, char *pkt) {
     auto remote_port = __be16_to_cpu(d->common.sport);
     auto msg_len = __be32_to_cpu(d->message_length);
     auto offset = __be32_to_cpu(d->seg.offset);
     auto seg_len = __be32_to_cpu(d->seg.segment_length);
+    /*auto msg_len = homa_rxmeta_mtp_msg_len(pkt);
+    auto offset = homa_rxmeta_mtp_offset(pkt);
+    auto seg_len = homa_rxmeta_mtp_seg_len(pkt);*/
     auto slot_idx = d->unused1;
     char *payload = d->seg.data;
     struct sockaddr_in dest_addr = {
@@ -117,14 +120,20 @@ void RpcSocket::server_request(uint8_t qidx, struct data_header *d, uint32_t rem
     }
 }
 
-void RpcSocket::client_response(uint8_t qidx, struct data_header *d)
+void RpcSocket::client_response(uint8_t qidx, struct data_header *d, char *pkt)
 {
     auto msg_len = __be32_to_cpu(d->message_length);
     auto offset = __be32_to_cpu(d->seg.offset);
     auto seg_len = __be32_to_cpu(d->seg.segment_length);
+    //auto msg_len1 = homa_rxmeta_mtp_msg_len(pkt);
+    //auto offset1 = homa_rxmeta_mtp_offset(pkt);
+    //auto seg_len1 = homa_rxmeta_mtp_seg_len(pkt);
     char *payload = d->seg.data;
     auto slot_idx = d->unused1;
     InternalReqMeta *req_meta = &_reqmeta_slots[slot_idx];
+
+    //printf("\nPacket: %u %u %u\n", msg_len, offset, seg_len);
+    //printf("Meta: %u %u %u\n", msg_len1, offset1, seg_len1);
 
     /* single-packet message */
     if (likely(msg_len <= HOMA_MSS)) {
@@ -194,7 +203,11 @@ int RpcSocket::message_tx_retransmission(struct InternalResendMeta rm)
     for (int i = 0; i < rm.nr_pkt; i++) {
         struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk_info->tx, idx_tx + i);
         tx_desc->addr = addr;
+        /*#ifdef MTP_ON
+        tx_desc->len = sizeof(struct ethhdr) + sizeof(struct iphdr) + (i == rm.nr_pkt - 1 ? rm.len : HOMA_MSS) + sizeof(struct app_event) + sizeof(struct HOMABP);
+        #else*/
         tx_desc->len = sizeof(struct ethhdr) + sizeof(struct iphdr) + (i == rm.nr_pkt - 1 ? rm.len : HOMA_MSS);
+        //#endif
         tx_desc->options = XDP_EGRESS_NO_COMP;
         addr = homa_txmeta_get_buffer_next(xsk_info->umem_area, addr);
     }
@@ -368,10 +381,11 @@ void RpcSocket::poll_nic_rx(void)
             if (reap_server_buffer_addr != POISON_64)    
                 enqueue_reap_backlog(reap_server_buffer_addr);
 
-            if (client_rpc(rpcid))
-                client_response(qidx, d);
-            else if (_req_handler)
-                server_request(qidx, d, remote_ip, rpcid);
+            if (client_rpc(rpcid)) {
+                client_response(qidx, d, pkt);
+            } else if (_req_handler) {
+                server_request(qidx, d, remote_ip, rpcid, pkt);
+            }
 
             /* free the AF_XDP UMEM buffer */
             thread_bcache_prod(bc, addr);
@@ -504,9 +518,9 @@ void RpcSocket::poll_nic_rx_block(int timeout)
                 enqueue_reap_backlog(reap_server_buffer_addr);
 
             if (client_rpc(rpcid))
-                client_response(qidx, d);
+                client_response(qidx, d, pkt);
             else if (_req_handler)
-                server_request(qidx, d, remote_ip, rpcid);
+                server_request(qidx, d, remote_ip, rpcid, pkt);
 
             /* free the AF_XDP UMEM buffer */
             thread_bcache_prod(bc, addr);
@@ -601,6 +615,7 @@ void RpcSocket::flush_rpc_response_queue(void)
             _pending_response_queue.push(req_meta);
             break;
         }
+
         /* this rpc has been successfully segmented and transmitted, free bounce message buffer */
         free_buffer(req_meta.buffer);
 
@@ -692,6 +707,9 @@ int RpcSocket::message_tx_segmentation(InternalReqMeta *req_meta, unsigned int s
     /* continue from the last segment */
     unsigned int copy_offset = req_meta->seq * HOMA_MSS;
     size -= copy_offset;
+
+    req_meta->curr_offset = copy_offset;
+    req_meta->rest_msg_len = (unsigned int) size;
     
     /* figure out how many buffers are needed */
     unsigned int nr_buffers = homa_get_nr_buffers_from_len(size);
@@ -744,25 +762,32 @@ int RpcSocket::message_tx_segmentation(InternalReqMeta *req_meta, unsigned int s
         }
         req_meta->prev_buffer_addr = addr;
 
-        plen = std::min((size_t)HOMA_MSS, size);
+        //plen = std::min((size_t)(HOMA_MSS - sizeof(struct app_event) - sizeof(struct HOMABP)), size);
+        plen = std::min((size_t)(HOMA_MSS), size);
 
         #ifdef MTP_ON
-        struct iphdr *iph = reinterpret_cast<struct iphdr *>(pkt + sizeof(struct ethhdr));
+        /*struct iphdr *iph = reinterpret_cast<struct iphdr *>(pkt + sizeof(struct ethhdr));
         iph->saddr = _local_addr.sin_addr.s_addr;
         iph->daddr = dest_addr->sin_addr.s_addr;
-        iph->protocol = IPPROTO_HOMA;
+        iph->protocol = IPPROTO_HOMA;*/
 
-        struct data_header *d = reinterpret_cast<struct data_header *>(pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
-        d->unused1 = slot_idx;
+        /*struct data_header *d = reinterpret_cast<struct data_header *>(pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
+        d->unused1 = slot_idx;*/
 
-        struct app_event *ev = reinterpret_cast<struct app_event *>(pkt + HOMA_PAYLOAD_OFFSET + plen);
-        struct HOMABP *bp = reinterpret_cast<struct HOMABP *>(pkt + HOMA_PAYLOAD_OFFSET + plen + sizeof(struct app_event));
+        //struct app_event *ev = reinterpret_cast<struct app_event *>(pkt + HOMA_PAYLOAD_OFFSET + plen);
+        struct app_event *ev = reinterpret_cast<struct app_event *>(pkt);
+        //struct HOMABP *bp = reinterpret_cast<struct HOMABP *>(pkt + HOMA_PAYLOAD_OFFSET + plen + sizeof(struct app_event));
 
+        /*if(req_meta->rpcid < 500) {
+            printf("%lu\n", req_meta->rpcid);
+        }*/
+        //printf("RPCID: %lu\n", req_meta->rpcid);
         parse_app_request(ev, _local_addr.sin_addr.s_addr, dest_addr->sin_addr.s_addr,
             _local_port, dest_addr->sin_port, message_length, addr,
-            req_meta->rpcid);
+            req_meta->rpcid, slot_idx);
 
-        send_req_ep_user(bp, ev, req_meta);
+        //send_req_ep_user(bp, ev, req_meta);
+        //printf("%u %u %u\n", message_length, copy_offset, plen);
         #else
         /* fill IP header */
         struct iphdr *iph = reinterpret_cast<struct iphdr *>(pkt + sizeof(struct ethhdr));
@@ -805,7 +830,12 @@ int RpcSocket::message_tx_segmentation(InternalReqMeta *req_meta, unsigned int s
         desc->addr = addr;
         desc->options = XDP_EGRESS_NO_COMP;
         #ifdef MTP_ON
-        desc->len = HOMA_PAYLOAD_OFFSET + plen + sizeof(struct app_event) + sizeof(struct HOMABP);
+        //desc->len = HOMA_PAYLOAD_OFFSET + plen + sizeof(struct app_event) + sizeof(struct HOMABP);
+        //desc->len = HOMA_PAYLOAD_OFFSET + plen + sizeof(struct app_event);
+        desc->len = HOMA_PAYLOAD_OFFSET + plen;
+        req_meta->seq++;
+        copy_offset += plen;
+        size -= plen;
         #else
         req_meta->seq++;
         copy_offset += plen;
@@ -821,7 +851,8 @@ int RpcSocket::message_tx_segmentation(InternalReqMeta *req_meta, unsigned int s
     *send_out += i;
 
     #ifdef MTP_ON
-    return req_meta->curr_offset >= buffer.actual_size ? 1 : 0;
+    //return req_meta->curr_offset >= buffer.actual_size ? 1 : 0;
+    return copy_offset >= buffer.actual_size ? 1 : 0;
     #else
     return copy_offset >= buffer.actual_size ? 1 : 0;
     #endif
