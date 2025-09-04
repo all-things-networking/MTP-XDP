@@ -251,7 +251,6 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
     __u32 offset = bpf_ntohl(bp->data.seg.offset);
     __u32 packet_bytes = seg_len;
     bool single_packet = message_length <= HOMA_MSS;
-    __u64 cc_granted = atomic_read(&ctx->cc.granted);
 
     new_tx_ordered_data_wrapper(message_length, ctx);
 
@@ -281,6 +280,7 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
     bp->data.seg.ack.dport = 0;
     bp->data.seg.ack.sport = 0;
 
+    __u64 cc_granted = atomic_read(&ctx->cc.granted);
     bp->data.incoming = bpf_htonl(cc_granted);
 
     if (likely(single_packet)) {
@@ -301,7 +301,6 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
     //sched_instr_wrapper(bytes_remaining, ctx);
 
     return XDP_TX;
-
 }
 
 static __always_inline
@@ -312,7 +311,6 @@ int send_resp_ep_server(struct data_header *d, struct iphdr *iph, struct app_eve
     __u32 offset = bp->data.seg.offset;
     __u32 packet_bytes = seg_len;
     bool single_packet = message_length <= HOMA_MSS;
-    __u64 cc_granted = atomic_read(&ctx->cc.granted);
 
     new_ctx_instr_wrapper(ctx, ev, false, packet_bytes);
 
@@ -339,6 +337,7 @@ int send_resp_ep_server(struct data_header *d, struct iphdr *iph, struct app_eve
     bp->data.seg.ack.dport = 0;
     bp->data.seg.ack.sport = 0;
 
+    __u64 cc_granted = atomic_read(&ctx->cc.granted);
     bp->data.incoming = bpf_htonl(cc_granted);
     /* optimization for single-packet case */
     if (likely(single_packet)) {
@@ -495,7 +494,6 @@ static __always_inline int parse_packet_mtp(struct hdr_cursor *nh, struct iphdr 
         case BUSY:
             break;
         default:
-            bpf_printk("%x", ev->type);
             return -1;
     }
 
@@ -671,6 +669,7 @@ int first_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     hkey.remote_port = ev->flow_id.remote_port;
     hkey.remote_ip = ev->flow_id.remote_ip;
     return insert_grant_list(ctx, &hkey, message_length);*/
+
     return XDP_REDIRECT;
 }
 
@@ -887,7 +886,6 @@ int no_ctx_sched_ep(struct net_event *ev, struct rpc_state *ctx,
 
     if (!int_out->need_schedule)
         return XDP_REDIRECT;
-
     
     struct rpc_state_cc *elem = NULL;
     struct rpc_state_cc *next_elem = NULL;
