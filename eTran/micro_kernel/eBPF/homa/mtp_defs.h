@@ -948,7 +948,7 @@ int no_ctx_sched_ep(struct net_event *ev, struct rpc_state *ctx,
     search_elem->hkey.remote_port = 0;
     search_elem->hkey.remote_ip = 0;
 
-    int value = 0;
+    //int value = 0;
 
     rb_node = bpf_rbtree_lower_bound(&groot, &search_elem->rbtree_link, srpt_less_rpc);
     if (unlikely(!rb_node))
@@ -987,7 +987,7 @@ int no_ctx_sched_ep(struct net_event *ev, struct rpc_state *ctx,
             next_elem->hkey.remote_port = elem->hkey.remote_port;
             next_elem->hkey.remote_ip = elem->hkey.remote_ip + 1;
 
-            value = 99;
+            //value = 11;
 
             rb_node = bpf_rbtree_lower_bound(&groot, &next_elem->rbtree_link, srpt_less_rpc);
             // DPDK: if (old_ind < 0 || MTP_all_rpcs[old_ind].peer_id != elem.peer_id)
@@ -1009,9 +1009,9 @@ int no_ctx_sched_ep(struct net_event *ev, struct rpc_state *ctx,
                         bpf_rbtree_add(&groot, &prio_elem->rbtree_link, srpt_less_peer);
                         prio_elem = NULL;
 
-                        value = 80085;
+                        //value = 7;
                     } else {
-                        value = 54321;
+                        //value = 9;
                     }
                 }
             } else {
@@ -1030,7 +1030,7 @@ int no_ctx_sched_ep(struct net_event *ev, struct rpc_state *ctx,
                         rb_node = bpf_rbtree_remove(&groot, &prio_elem->rbtree_link);
                         if (rb_node)
                         {
-                            value = 2;
+                            //value = 2;
 
                             prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
                             // DPDK: MTP_all_rpcs[old_ind].in_prio_list = false;
@@ -1057,29 +1057,29 @@ int no_ctx_sched_ep(struct net_event *ev, struct rpc_state *ctx,
                         }
                         else { /* this should never happen */
                             prio_elem = NULL;
-                            value = 3;
+                            //value = 3;
                         }
                     }
                     else { /* this should never happen */
                         prio_elem = NULL;
-                        value = 4;
+                        //value = 4;
                     }
                 }
                 else { /* this should never happen */
                     prio_elem = NULL;
-                    value = 5;
+                    //value = 5;
                 }
             }
             next_elem = NULL;
             search_elem = NULL;
         } else {
-            value = 666;
+            //value = 666;
             search_elem = NULL;
         }
     }
 
     GRANT_UNLOCK();
-    bpf_printk("IIIIIIIRRA %d", value);
+    //bpf_printk("no_ctx_sched_ep %d", value);
 out:
     if (prio_elem)
         bpf_obj_drop(prio_elem);
@@ -1270,13 +1270,13 @@ middle:
     search_elem->hkey.remote_port = 0;
     search_elem->hkey.remote_ip = 0;
 
-    int value = 0;
+    //int value = 0;
 
     rb_node = bpf_rbtree_lower_bound(&groot, &search_elem->rbtree_link, srpt_less_rpc);
     if (unlikely(!rb_node))
     {   /* this should never happen */
         GRANT_UNLOCK();
-        bpf_printk("no_ctx_sched_ep rb_node error");
+        bpf_printk("sched_ep rb_node error");
         bpf_obj_drop(prio_elem);
         prio_elem = NULL;
         search_elem = NULL;
@@ -1309,7 +1309,7 @@ middle:
             next_elem->hkey.remote_port = elem->hkey.remote_port;
             next_elem->hkey.remote_ip = elem->hkey.remote_ip + 1;
 
-            value = 99;
+            //value = 99;
 
             // DPDK: int old_ind = find_ge_sorted_list_1(&next_elem);
             rb_node = bpf_rbtree_lower_bound(&groot, &next_elem->rbtree_link, srpt_less_rpc);
@@ -1332,9 +1332,9 @@ middle:
                         bpf_rbtree_add(&groot, &prio_elem->rbtree_link, srpt_less_peer);
                         prio_elem = NULL;
 
-                        value = 80085;
+                        //value = 11;
                     } else {
-                        value = 54321;
+                        //value = 13;
                     }
                 }
             } else {
@@ -1353,7 +1353,7 @@ middle:
                         rb_node = bpf_rbtree_remove(&groot, &prio_elem->rbtree_link);
                         if (rb_node)
                         {
-                            value = 2;
+                            //value = 2;
 
                             prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
                             // DPDK: MTP_all_rpcs[old_ind].in_prio_list = false;
@@ -1380,29 +1380,29 @@ middle:
                         }
                         else { /* this should never happen */
                             prio_elem = NULL;
-                            value = 3;
+                            //value = 3;
                         }
                     }
                     else { /* this should never happen */
                         prio_elem = NULL;
-                        value = 4;
+                        //value = 4;
                     }
                 }
                 else { /* this should never happen */
                     prio_elem = NULL;
-                    value = 5;
+                    //value = 5;
                 }
             }
             next_elem = NULL;
             search_elem = NULL;
         } else {
-            value = 666;
+            //value = 666;
             search_elem = NULL;
         }
     }
 
     GRANT_UNLOCK();
-    bpf_printk("SCHED_EP %d", value);
+    //bpf_printk("SCHED_EP %d", value);
     
 out:
     bpf_obj_drop(elem);
@@ -1687,7 +1687,6 @@ int choose_grants(struct xdp_md *ctx)
 static __always_inline
 int update_prios(struct xdp_md *ctx)
 {
-
     __u32 cpu = bpf_get_smp_processor_id();
     if (unlikely(cpu >= MAX_CPU))
     {
@@ -1697,18 +1696,6 @@ int update_prios(struct xdp_md *ctx)
     __u16 peer_id = 0;
     struct remove_info *ri = NULL;
 
-    if (nr_grant_candidate[cpu] < 1)
-    {
-        release_grantable_lock();
-        if (nr_grant_ready[cpu] > 0)
-        {
-            finish_grant_choose[cpu] = 1;
-            return XDP_DROP;
-        }
-        else
-            return XDP_ABORTED;
-    }
-
     ri = bpf_map_lookup_elem(&per_cpu_remove_info, ZERO_KEY);
     if (!ri)
     {
@@ -1717,7 +1704,21 @@ int update_prios(struct xdp_md *ctx)
         return XDP_ABORTED;
     }
 
+
     for(int i = 0; i < 8; i++) {
+        if (nr_grant_candidate[cpu] < i + 1)
+        {
+            release_grantable_lock();
+            if (nr_grant_ready[cpu] > 0)
+            {
+                finish_grant_choose[cpu] = 1;
+                return XDP_DROP;
+                
+            } else {
+                return XDP_ABORTED;
+            }
+        }
+
         if (remove[cpu][i])
         {
             struct rpc_state_cc *cc_node_t0 = NULL;
@@ -1784,9 +1785,10 @@ int update_prios(struct xdp_md *ctx)
     {
         finish_grant_choose[cpu] = 1;
         return XDP_DROP;
-    }
-    else
+
+    } else {
         return XDP_ABORTED;
+    }
 }
 
 static __always_inline

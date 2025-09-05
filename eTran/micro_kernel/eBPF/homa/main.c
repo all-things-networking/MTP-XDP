@@ -58,14 +58,15 @@ int xdp_gen_prog(struct xdp_md *ctx)
 
         #ifndef MTP_ON
         bpf_tail_call(ctx, &xdp_gen_tail_call_map, XDP_GEN_CHOOSE_RPC_TO_GRANT);
+
+        // fallthrough: bpf_tail_call failed
+        return XDP_ABORTED;
         #else
         if(choose_grants(ctx) == XDP_ABORTED)
             return XDP_ABORTED;
 
-        update_prios(ctx);
+        return update_prios(ctx);
         #endif
-        // fallthrough: bpf_tail_call failed
-        return XDP_ABORTED;
     }
     #ifdef MTP_ON 
     else {
