@@ -197,6 +197,7 @@ void new_ctx_instr_wrapper(struct rpc_state *ctx, struct app_event *ev, bool cli
         ctx->cc.sched_prio = 0;
         ctx->cc.granted = min(ev->msg_len, Homa_unsched_bytes);
         ctx->qid = MAX_BUCKET_SIZE;
+        ctx->birth = bpf_ktime_get_ns();
     }
 }
 
@@ -756,6 +757,7 @@ int recv_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     }
 
     int_out->new_state = ctx->state == BPF_RPC_OUTGOING;
+    int_out->rpc_birth = ctx->birth;
 
     bool single_packet = ev->message_length <= HOMA_MSS;
     
@@ -1141,9 +1143,10 @@ int sched_ep(struct net_event *ev, struct rpc_state *ctx,
     elem->hkey.remote_ip = ev->flow_id.remote_ip;
     elem->hkey.remote_port = ev->flow_id.remote_port;
     elem->message_length = ctx->message_length;
-    // Question: what is ctx->birth and why is it used here?
-    elem->birth = bpf_ktime_get_ns();
+    elem->birth = ctx->birth;
     elem->birth &= ~(__u64)1;
+
+    __u32 temp = int_out->last_bytes_remaining;
 
     GRANT_LOCK();
     if(int_out->new_state) {
@@ -1156,48 +1159,56 @@ int sched_ep(struct net_event *ev, struct rpc_state *ctx,
             goto middle;
         } else {
             // elem is ctx.all_rpcs[ind] here
-            struct rpc_state_cc * temp = container_of(rb_node, struct rpc_state_cc, rbtree_link);   
-            if (temp->tree_id != 0) {
+            struct rpc_state_cc * temp = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+            // DPDK: if(ind < 0 || !equal_sorted_list_1(&elem, &MTP_all_rpcs[ind]))  
+            if (temp->hkey.rpcid != elem->hkey.rpcid ||
+                temp->hkey.local_port != elem->hkey.local_port ||
+                temp->hkey.remote_port != elem->hkey.remote_port ||
+                temp->hkey.remote_ip != elem->hkey.remote_ip) {
+
                 ctx->cc.incoming = ctx->message_length;
                 int_out->need_schedule = false;
                 GRANT_UNLOCK();
                 goto middle;
-            } else {
-                temp->bytes_remaining -= ev->segment_length;
+            }
+            temp->bytes_remaining -= ev->segment_length;
 
-                if(temp->birth & 1) { // lowest bit of birth 1 means it is in peer tree)
-                    prio_elem->tree_id = 1;
-                    prio_elem->bytes_remaining = temp->bytes_remaining + ev->segment_length;
-                    prio_elem->peer_id = temp->peer_id;
-                    rb_node = bpf_rbtree_lower_bound(&groot, &prio_elem->rbtree_link, srpt_less_peer);
-                    if (likely(rb_node != NULL))
+            // DPDK: if (MTP_all_rpcs[ind].in_prio_list)
+            if(temp->birth & 1) { // lowest bit of birth 1 means it is in peer tree)
+                prio_elem->tree_id = 1;
+                // Question: we removed this line. Why?
+                //prio_elem->bytes_remaining = temp->bytes_remaining + ev->segment_length;
+                prio_elem->peer_id = temp->peer_id;
+                rb_node = bpf_rbtree_lower_bound(&groot, &prio_elem->rbtree_link, srpt_less_peer);
+                if (likely(rb_node != NULL))
+                {
+                    prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                    // DPDK: if (MTP_all_rpcs[ind].in_prio_list)
+                    if (likely(prio_elem->tree_id == 1 && prio_elem->peer_id == temp->peer_id))
                     {
-                        prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
-                        if (likely(prio_elem->tree_id == 1 && prio_elem->peer_id == temp->peer_id))
+                        rb_node = bpf_rbtree_remove(&groot, &prio_elem->rbtree_link);
+                        if (likely(rb_node != NULL))
                         {
-                            rb_node = bpf_rbtree_remove(&groot, &prio_elem->rbtree_link);
-                            if (likely(rb_node != NULL))
-                            {
-                                prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
-                                prio_elem->bytes_remaining = temp->bytes_remaining;
-                                bpf_rbtree_add(&groot, &prio_elem->rbtree_link, srpt_less_peer);
-                            }
-                            prio_elem = NULL;
+                            prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                            // DPDK: MTP_highest_prio_rpcs[prio_ind].bytes_remaining -= ev_segment_length;
+                            prio_elem->bytes_remaining -= ev->segment_length;
+                            bpf_rbtree_add(&groot, &prio_elem->rbtree_link, srpt_less_peer);
                         }
-                        else {
-                            /* this should never happen */
-                            prio_elem = NULL;
-                        }
+                        prio_elem = NULL;
                     }
                     else {
                         /* this should never happen */
                         prio_elem = NULL;
                     }
                 }
+                else {
+                    /* this should never happen */
+                    prio_elem = NULL;
+                }
             }
         }
-
         elem->bytes_remaining -= ev->segment_length;
+        temp = elem->bytes_remaining;
     }
 
     GRANT_UNLOCK();
@@ -1205,9 +1216,25 @@ middle:
     if (prio_elem)
         bpf_obj_drop(prio_elem);
 
+    if (!int_out->need_schedule)
+        return XDP_REDIRECT;
+
     /* allocate new object for Tree0 */
     elem = bpf_obj_new(typeof(*elem));
     CHECK_AND_DROP_LOG(!elem, "server_request: bpf_obj_new failed.");
+
+    elem->tree_id = 0;
+    elem->peer_id = get_peerid(ev->flow_id.remote_ip);
+    elem->bytes_remaining = temp;
+    elem->incoming = ctx->cc.incoming;
+    elem->hkey.rpcid = local_id(ev->flow_id.rpcid);
+    elem->hkey.local_port = ev->flow_id.local_port;
+    elem->hkey.remote_ip = ev->flow_id.remote_ip;
+    elem->hkey.remote_port = ev->flow_id.remote_port;
+    elem->message_length = ctx->message_length;
+    elem->birth = ctx->birth;
+    elem->birth &= ~(__u64)1;
+
     /* allocate new object for Tree1 */
     prio_elem = bpf_obj_new(typeof(*prio_elem));
     if (unlikely(!prio_elem))
@@ -1243,11 +1270,13 @@ middle:
     search_elem->hkey.remote_port = 0;
     search_elem->hkey.remote_ip = 0;
 
+    int value = 0;
 
     rb_node = bpf_rbtree_lower_bound(&groot, &search_elem->rbtree_link, srpt_less_rpc);
     if (unlikely(!rb_node))
     {   /* this should never happen */
         GRANT_UNLOCK();
+        bpf_printk("no_ctx_sched_ep rb_node error");
         bpf_obj_drop(prio_elem);
         prio_elem = NULL;
         search_elem = NULL;
@@ -1260,10 +1289,13 @@ middle:
         if (unlikely(highest_prio->tree_id != 0 || highest_prio->peer_id != elem->peer_id))
         {   /* this should never happen */
             GRANT_UNLOCK();
+            bpf_printk("no_ctx_sched_ep highest_prio error");
             bpf_obj_drop(prio_elem);
             prio_elem = NULL;
             search_elem = NULL;
             goto out;
+        
+        // DPDK: if (equal_sorted_list_1(&elem, &highest_prio))
         } else if(highest_prio->hkey.rpcid == elem->hkey.rpcid &&
             highest_prio->hkey.local_port == elem->hkey.local_port &&
             highest_prio->hkey.remote_port == elem->hkey.remote_port &&
@@ -1277,86 +1309,100 @@ middle:
             next_elem->hkey.remote_port = elem->hkey.remote_port;
             next_elem->hkey.remote_ip = elem->hkey.remote_ip + 1;
 
+            value = 99;
+
+            // DPDK: int old_ind = find_ge_sorted_list_1(&next_elem);
             rb_node = bpf_rbtree_lower_bound(&groot, &next_elem->rbtree_link, srpt_less_rpc);
-            if (rb_node)
-            {
-                next_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
-                if (next_elem->tree_id != 0 || next_elem->peer_id != elem->peer_id){
-                //if (next_elem->tree_id == 0 && next_elem->peer_id == elem->peer_id){
-                    if(int_out->new_state || !(highest_prio->birth & 1)) { // lowest bit of birth 1 means it is in peer tree) 
-                        
+            // DPDK: if (old_ind < 0 || MTP_all_rpcs[old_ind].peer_id != elem.peer_id)
+            if(!rb_node) {
+                if(int_out->new_state || !(highest_prio->birth & 1)) {
+                    if(prio_elem) {
                         prio_elem->tree_id = 1;
-                        prio_elem->peer_id = elem->peer_id;
                         prio_elem->bytes_remaining = elem->bytes_remaining;
-                        prio_elem->incoming = elem->incoming;
+                        prio_elem->peer_id = elem->peer_id;
                         prio_elem->hkey.rpcid = local_id(ev->flow_id.rpcid);
                         prio_elem->hkey.local_port = ev->flow_id.local_port;
-                        prio_elem->hkey.remote_ip = ev->flow_id.remote_ip;
                         prio_elem->hkey.remote_port = ev->flow_id.remote_port;
+                        prio_elem->hkey.remote_ip = ev->flow_id.remote_ip;
+                        prio_elem->incoming = elem->incoming;
                         prio_elem->message_length = elem->message_length;
                         elem->birth |= (__u64)1;
                         prio_elem->birth = elem->birth;
 
                         bpf_rbtree_add(&groot, &prio_elem->rbtree_link, srpt_less_peer);
                         prio_elem = NULL;
+
+                        value = 80085;
+                    } else {
+                        value = 54321;
                     }
-
-                } else {
-                    /* use prio_elem to search and remove it from Tree1 */
-                    prio_elem->tree_id = 1;
-                    prio_elem->peer_id = next_elem->peer_id;
-                    prio_elem->bytes_remaining = next_elem->bytes_remaining;
-                    rb_node = bpf_rbtree_lower_bound(&groot, &prio_elem->rbtree_link, srpt_less_peer);
-                    if (rb_node)
-                    {
-                        prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
-                        if (prio_elem->tree_id == 1 && prio_elem->peer_id == next_elem->peer_id)
-                        {
-                            rb_node = bpf_rbtree_remove(&groot, &prio_elem->rbtree_link);
-                            if (rb_node)
-                            {
-                                prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
-                                /* update incoming from Tree1 here as it may be modified */
-                                next_elem->birth &= ~(__u64)1;
-                                next_elem->incoming = prio_elem->incoming;
-
-                                prio_elem->tree_id = 1;
-                                prio_elem->peer_id = elem->peer_id;
-                                prio_elem->bytes_remaining = elem->bytes_remaining;
-                                prio_elem->incoming = elem->incoming;
-                                prio_elem->hkey.rpcid = local_id(ev->flow_id.rpcid);
-                                prio_elem->hkey.local_port = ev->flow_id.local_port;
-                                prio_elem->hkey.remote_ip = ev->flow_id.remote_ip;
-                                prio_elem->hkey.remote_port = ev->flow_id.remote_port;
-                                prio_elem->message_length = elem->message_length;
-                                /* mark this rpc is in Tree1 */
-                                elem->birth |= (__u64)1;
-                                prio_elem->birth = elem->birth;
+                }
+            } else {
+                next_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
                 
-                                bpf_rbtree_add(&groot, &prio_elem->rbtree_link, srpt_less_peer);
-                                prio_elem = NULL;
-                            }
-                            else { /* this should never happen */
-                                prio_elem = NULL;
-                            }
+                /* use prio_elem to search and remove it from Tree1 */
+                prio_elem->tree_id = 1;
+                prio_elem->peer_id = next_elem->peer_id;
+                prio_elem->bytes_remaining = next_elem->bytes_remaining;
+                rb_node = bpf_rbtree_lower_bound(&groot, &prio_elem->rbtree_link, srpt_less_peer);
+                if (rb_node) {
+                    prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                    if (prio_elem->tree_id == 1 && prio_elem->peer_id == next_elem->peer_id)
+                    {
+                        // DPDK: rpc_info_2 rmvd = remove_from_sorted_list_2(&old_prio_elem);
+                        rb_node = bpf_rbtree_remove(&groot, &prio_elem->rbtree_link);
+                        if (rb_node)
+                        {
+                            value = 2;
+
+                            prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                            // DPDK: MTP_all_rpcs[old_ind].in_prio_list = false;
+                            next_elem->birth &= ~(__u64)1;
+                            // DPDK: MTP_all_rpcs[old_ind].incoming = rmvd.incoming;
+                            next_elem->incoming = prio_elem->incoming;
+
+                            prio_elem->tree_id = 1;
+                            prio_elem->bytes_remaining = elem->bytes_remaining;
+                            prio_elem->peer_id = elem->peer_id;
+                            prio_elem->hkey.rpcid = local_id(ev->flow_id.rpcid);
+                            prio_elem->hkey.local_port = ev->flow_id.local_port;
+                            prio_elem->hkey.remote_port = ev->flow_id.remote_port;
+                            prio_elem->hkey.remote_ip = ev->flow_id.remote_ip;
+                            prio_elem->message_length = elem->message_length;
+                            prio_elem->incoming = elem->incoming;
+                            
+                            // DPDK: MTP_all_rpcs[my_ind].in_prio_list = true;
+                            elem->birth |= (__u64)1;
+                            prio_elem->birth = elem->birth;
+            
+                            bpf_rbtree_add(&groot, &prio_elem->rbtree_link, srpt_less_peer);
+                            prio_elem = NULL;
                         }
                         else { /* this should never happen */
                             prio_elem = NULL;
+                            value = 3;
                         }
                     }
                     else { /* this should never happen */
                         prio_elem = NULL;
+                        value = 4;
                     }
+                }
+                else { /* this should never happen */
+                    prio_elem = NULL;
+                    value = 5;
                 }
             }
             next_elem = NULL;
             search_elem = NULL;
         } else {
+            value = 666;
             search_elem = NULL;
         }
     }
 
     GRANT_UNLOCK();
+    bpf_printk("SCHED_EP %d", value);
     
 out:
     bpf_obj_drop(elem);
@@ -2308,6 +2354,10 @@ void busy_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 // Basically, what is defined in the BP was already "used"
 // when the packets were first sent by userspace and enqueued
 // to the RL.
+
+// Question: what is the cur_stream part in the DPDK implementation?
+// Why is ctx->birth used there?
+// TODO: set ctx->birth there
 static __always_inline
 void recv_grant_ep(struct net_event *ev, struct rpc_state *ctx,
     struct homa_meta_info *data_meta, struct interm_out *int_out)
