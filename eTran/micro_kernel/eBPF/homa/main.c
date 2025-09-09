@@ -73,7 +73,7 @@ int xdp_gen_prog(struct xdp_md *ctx)
         struct interm_out int_out = {0};
         int ret;
         ret = gen_grants(ctx, &int_out);
-        ret = reset_grants_state(ctx, &int_out);
+        //ret = reset_grants_state(ctx, &int_out);
         return ret;
     }
     #else
@@ -507,16 +507,16 @@ int xdp_sock_prog(struct xdp_md *ctx)
 
         if (rpc_is_client(local_id(ev.flow_id.rpcid))) {
             ret = recv_resp_pkt_ep(&ev, state, data_meta, &int_out);
-            ret = sched_ep(&ev, state, data_meta, &int_out);
         } else {
             if(first_pkt_rpc) {
                 ret = first_req_pkt_ep(&ev, state, data_meta, &int_out);
-                ret = no_ctx_sched_ep(&ev, state, data_meta, &int_out);
             } else {
                 ret = next_req_pkt_ep(&ev, state, data_meta, &int_out);
-                ret = sched_ep(&ev, state, data_meta, &int_out);
             }
         }
+        ret = update_with_cache(&ev, state, data_meta, &int_out);
+        ret = save_cached_rpc(&ev, state, data_meta, &int_out);
+        ret = insert_into_tree(&ev, state, data_meta, &int_out);
 
         CHECK_AND_DROP_LOG(ret == XDP_DROP, "XDP_DROP for error rpc state");
 

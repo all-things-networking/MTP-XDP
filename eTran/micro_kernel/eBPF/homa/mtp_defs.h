@@ -12,16 +12,16 @@ struct ack_net_info {
     __u32 remote_ip;
 };
 
-struct hkey
+/*struct hkey
 {
     __u64 rpcid;
     __u16 local_port;
     __u16 remote_port;
     __u32 remote_ip;
-};
+};*/
 
 struct net_event {
-    struct hkey flow_id;
+    struct rpc_key_t flow_id;
 
     // Common header
     __u8 type;
@@ -112,6 +112,7 @@ struct interm_out {
     bool send_fifo_rpc;
     bool trigger;
     __u64 rpc_birth;
+    bool delayed;
 };
 
 struct
@@ -518,7 +519,7 @@ int parse_ack_info(struct hdr_cursor *nh, void *data_end,
 }
 
 static __always_inline
-int get_context_mtp(struct hkey key, struct rpc_state **state, bool *first_req) {
+int get_context_mtp(struct rpc_key_t key, struct rpc_state **state, bool *first_req) {
     struct rpc_key_t hkey = {0};
     hkey.rpcid = local_id(key.rpcid);
     hkey.local_port = key.local_port;
@@ -607,6 +608,585 @@ void add_rx_data_seg_wrapper(__u32 seg_len, __u32 offset, struct homa_meta_info 
 }
 
 static __always_inline
+int update_with_cache(struct net_event *ev, struct rpc_state *ctx,
+    struct homa_meta_info *data_meta, struct interm_out *int_out) {
+
+    if(!int_out->need_schedule)
+        return XDP_REDIRECT;
+    
+    __u32 cpu = bpf_get_smp_processor_id();
+    if (unlikely(cpu >= MAX_CPU)) return XDP_REDIRECT;
+
+    ev->flow_id.rpcid = local_id(ev->flow_id.rpcid);
+
+    if (cache_has_rpc[cpu])
+    {
+        if (cache_rpc[cpu].remote_ip == ev->flow_id.remote_ip && cache_rpc[cpu].local_port == ev->flow_id.local_port &&
+            cache_rpc[cpu].remote_port == ev->flow_id.remote_port && cache_rpc[cpu].rpcid == ev->flow_id.rpcid)
+        {
+            /* same rpc */
+            update_delay_packets[cpu]++;
+            if (update_delay_packets[cpu] < MAX_UPDATE_DELAY_PACKETS) {
+                int_out->delayed = true;
+                return XDP_REDIRECT;
+            }
+        }
+
+        if (cache_has_rpc[cpu] == 0)
+            return XDP_REDIRECT;
+
+        cache_has_rpc[cpu] = 0;
+        update_delay_packets[cpu] = 0;
+
+        struct rpc_key_t hkey = cache_rpc[cpu];
+        struct rpc_state *rpc_slot = NULL;
+        struct rpc_state_cc *elem = NULL;
+        struct rpc_state_cc *search_elem = NULL;
+        struct rpc_state_cc *next_elem = NULL;
+        struct rpc_state_cc *prio_elem = NULL;
+        struct bpf_rb_node *rb_node = NULL;
+        __u32 old_br = POISON_32, new_br = POISON_32;
+
+        rpc_slot = bpf_map_lookup_elem(&rpc_tbl, &hkey);
+        if (unlikely(!rpc_slot)) return XDP_REDIRECT;
+
+        if (rpc_slot->cc.incoming >= rpc_slot->message_length)
+            return XDP_REDIRECT;
+
+        elem = bpf_obj_new(typeof(*elem));
+        if (unlikely(!elem)) {
+            log_err("bpf_obj_new for elem failed.");
+            return XDP_REDIRECT;
+        }
+
+        prio_elem = bpf_obj_new(typeof(*prio_elem));
+        if (unlikely(!prio_elem)) {
+            log_err("bpf_obj_new for prio_elem failed.");
+            bpf_obj_drop(elem);
+            return XDP_REDIRECT;
+        }
+
+        search_elem = bpf_refcount_acquire(prio_elem);
+        if (unlikely(!search_elem)) {
+            log_err("bpf_refcount_acquire for search_elem failed.");
+            bpf_obj_drop(elem);
+            bpf_obj_drop(prio_elem);
+            return XDP_REDIRECT;
+        }
+
+        next_elem = bpf_refcount_acquire(search_elem);
+        if (unlikely(!next_elem)) {
+            log_err("bpf_refcount_acquire for next_elem failed.");
+            bpf_obj_drop(elem);
+            bpf_obj_drop(prio_elem);
+            bpf_obj_drop(search_elem);
+            return XDP_REDIRECT;
+        }
+
+        elem->tree_id = 0;
+        elem->peer_id = get_peerid(hkey.remote_ip);
+        elem->hkey.rpcid = hkey.rpcid;
+        elem->hkey.local_port = hkey.local_port;
+        elem->hkey.remote_port = hkey.remote_port;
+        elem->hkey.remote_ip = hkey.remote_ip;
+
+        GRANT_LOCK();
+        /* last_bytes_remaining is protected by grant lock */
+        elem->bytes_remaining = rpc_slot->cc.last_bytes_remaining;
+
+        rb_node = bpf_rbtree_lower_bound(&groot, &elem->rbtree_link, srpt_less_rpc);
+        if (unlikely(!rb_node)) {
+            /* this is not an error, the rpc has finished granting */
+            GRANT_UNLOCK();
+            goto out;
+        }
+
+        elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+
+        if (elem->tree_id != 0 || elem->peer_id != get_peerid(hkey.remote_ip) ||
+            elem->hkey.rpcid != hkey.rpcid || elem->hkey.local_port != hkey.local_port ||
+            elem->hkey.remote_port != hkey.remote_port || elem->hkey.remote_ip != hkey.remote_ip)
+        {
+            GRANT_UNLOCK();
+            /* this is not an error, the rpc has finished granting */
+            goto out;
+        }
+
+        new_br = rpc_slot->cc.bytes_remaining;
+        old_br = elem->bytes_remaining;
+
+        if (unlikely(old_br == new_br)) {
+            GRANT_UNLOCK();
+            goto out;
+        }
+
+        /* record the value in rbtree for furture finding */
+        rpc_slot->cc.last_bytes_remaining = new_br;
+
+        rb_node = bpf_rbtree_remove(&groot, &elem->rbtree_link);
+        if (unlikely(!rb_node)) { /* this should never happen */
+            GRANT_UNLOCK();
+            goto out;
+        }
+        elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+
+        elem->bytes_remaining = new_br;
+
+        /* we can still use elem until GRANT_UNLOCK() */
+        bpf_rbtree_add(&groot, &elem->rbtree_link, srpt_less_rpc);
+
+        /* we are already in Tree1 */
+        if ((elem->birth & 1))
+        {
+            prio_elem->tree_id = 1;
+            prio_elem->bytes_remaining = old_br;
+            prio_elem->peer_id = elem->peer_id;
+            rb_node = bpf_rbtree_lower_bound(&groot, &prio_elem->rbtree_link, srpt_less_peer);
+            if (likely(rb_node != NULL))
+            {
+                prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                if (likely(prio_elem->tree_id == 1 && prio_elem->peer_id == elem->peer_id))
+                {
+                    rb_node = bpf_rbtree_remove(&groot, &prio_elem->rbtree_link);
+                    if (likely(rb_node != NULL))
+                    {
+                        prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                        prio_elem->bytes_remaining = new_br;
+                        bpf_rbtree_add(&groot, &prio_elem->rbtree_link, srpt_less_peer);
+                    }
+                    prio_elem = NULL;
+                }
+                else {
+                    /* this should never happen */
+                    prio_elem = NULL;
+                }
+            }
+            else {
+                /* this should never happen */
+                prio_elem = NULL;
+            }
+            
+            GRANT_UNLOCK();
+            goto out;
+        }
+
+        /* we get here because we was not the highest priority rpc */
+        search_elem->tree_id = 0;
+        search_elem->peer_id = elem->peer_id;
+        search_elem->bytes_remaining = 0;
+        search_elem->hkey.rpcid = 0;
+        search_elem->hkey.local_port = 0;
+        search_elem->hkey.remote_port = 0;
+        search_elem->hkey.remote_ip = 0;
+
+        rb_node = bpf_rbtree_lower_bound(&groot, &search_elem->rbtree_link, srpt_less_rpc);
+        if (!rb_node) { /* this should never happen */
+            GRANT_UNLOCK();
+            bpf_obj_drop(prio_elem);
+            prio_elem = NULL;
+            search_elem = NULL;
+            log_panic("update_grant_for_cached_rpc: impossible branch, seems a bug.");
+            goto out;
+        }
+        else
+        {
+            search_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+            if (unlikely(search_elem->tree_id != 0 || search_elem->peer_id != elem->peer_id))
+            {
+                /* this should never happen */
+                GRANT_UNLOCK();
+                bpf_obj_drop(prio_elem);
+                prio_elem = NULL;
+                search_elem = NULL;
+                log_panic("update_grant_for_cached_rpc: impossible branch, seems a bug.");
+                goto out;
+            }
+            else if (search_elem->hkey.rpcid == elem->hkey.rpcid &&
+                    search_elem->hkey.local_port == elem->hkey.local_port &&
+                    search_elem->hkey.remote_port == elem->hkey.remote_port &&
+                    search_elem->hkey.remote_ip == elem->hkey.remote_ip)
+            {
+                /* we find that we are the highest priority one now, but we shoud first check that
+                * if there is a rpc from this peer that is in Tree1 already, if so, we should remove it first
+                */
+                next_elem->tree_id = 0;
+                next_elem->peer_id = elem->peer_id;
+
+                next_elem->bytes_remaining = elem->bytes_remaining;
+                next_elem->hkey.rpcid = elem->hkey.rpcid;
+                next_elem->hkey.local_port = elem->hkey.local_port;
+                next_elem->hkey.remote_port = elem->hkey.remote_port;
+                next_elem->hkey.remote_ip = elem->hkey.remote_ip + 1;
+
+                rb_node = bpf_rbtree_lower_bound(&groot, &next_elem->rbtree_link, srpt_less_rpc);
+                if(!rb_node) {
+                    if(int_out->new_state || !(search_elem->birth & 1)) {
+                        if(prio_elem) {
+                            /* copy states to prio_elem from elem except for tree_id */
+                            {
+                                prio_elem->tree_id = 1;
+                                prio_elem->peer_id = elem->peer_id;
+                                prio_elem->bytes_remaining = elem->bytes_remaining;
+                                prio_elem->incoming = elem->incoming;
+                                prio_elem->hkey.rpcid = elem->hkey.rpcid;
+                                prio_elem->hkey.local_port = elem->hkey.local_port;
+                                prio_elem->hkey.remote_ip = elem->hkey.remote_ip;
+                                prio_elem->hkey.remote_port = elem->hkey.remote_port;
+                                prio_elem->message_length = elem->message_length;
+                                /* mark this rpc is in Tree1 */
+                                elem->birth |= (__u64)1;
+                                prio_elem->birth = elem->birth;
+                            }
+
+                            bpf_rbtree_add(&groot, &prio_elem->rbtree_link, srpt_less_peer);
+                            prio_elem = NULL;
+    
+                            //value = 7;
+                        } else {
+                            //value = 9;
+                        }
+                    }
+                } else {
+                    next_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                    
+                    if (next_elem->tree_id == 0 && next_elem->peer_id == elem->peer_id) { // X
+                        next_elem->birth &= ~(__u64)1; // X
+                    /* use prio_elem to search and remove it from Tree1 */
+                        prio_elem->tree_id = 1;
+                        prio_elem->peer_id = next_elem->peer_id;
+                        prio_elem->bytes_remaining = next_elem->bytes_remaining;
+                        rb_node = bpf_rbtree_lower_bound(&groot, &prio_elem->rbtree_link, srpt_less_peer);
+                        if (rb_node) {
+                            prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                            if (prio_elem->tree_id == 1 && prio_elem->peer_id == next_elem->peer_id)
+                            {
+                                // DPDK: rpc_info_2 rmvd = remove_from_sorted_list_2(&old_prio_elem);
+                                rb_node = bpf_rbtree_remove(&groot, &prio_elem->rbtree_link);
+                                if (rb_node)
+                                {
+                                    //value = 2;
+    
+                                    prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                                    // DPDK: MTP_all_rpcs[old_ind].in_prio_list = false;
+                                    //next_elem->birth &= ~(__u64)1; // X
+                                    // DPDK: MTP_all_rpcs[old_ind].incoming = rmvd.incoming;
+                                    next_elem->incoming = prio_elem->incoming;
+
+                                    /* copy states to prio_elem from elem except for tree_id */
+                                    {
+                                        prio_elem->tree_id = 1;
+                                        prio_elem->peer_id = elem->peer_id;
+                                        prio_elem->bytes_remaining = elem->bytes_remaining;
+                                        prio_elem->incoming = elem->incoming;
+                                        prio_elem->hkey.rpcid = elem->hkey.rpcid;
+                                        prio_elem->hkey.local_port = elem->hkey.local_port;
+                                        prio_elem->hkey.remote_ip = elem->hkey.remote_ip;
+                                        prio_elem->hkey.remote_port = elem->hkey.remote_port;
+                                        prio_elem->message_length = elem->message_length;
+                                        /* mark this rpc is in Tree1 */
+                                        elem->birth |= (__u64)1;
+                                        prio_elem->birth = elem->birth;
+                                    }
+                                    
+                                    // DPDK: MTP_all_rpcs[my_ind].in_prio_list = true;
+                                    elem->birth |= (__u64)1;
+                                    prio_elem->birth = elem->birth;
+                    
+                                    bpf_rbtree_add(&groot, &prio_elem->rbtree_link, srpt_less_peer);
+                                    prio_elem = NULL;
+                                }
+                                else { /* this should never happen */
+                                    prio_elem = NULL;
+                                    //value = 3;
+                                }
+                            }
+                            else { /* this should never happen */
+                                prio_elem = NULL;
+                                //value = 4;
+                            }
+                        }
+                        else { /* this should never happen */
+                            prio_elem = NULL;
+                            //value = 5;
+                        }
+                    }
+                }
+                next_elem = NULL;
+                search_elem = NULL;
+            }
+            else { /* we are not the highest priority one, do nothing */
+                search_elem = NULL;
+            }
+        }
+
+        GRANT_UNLOCK();
+
+    out:
+        if (prio_elem)
+            bpf_obj_drop(prio_elem);
+        if (search_elem)
+            bpf_obj_drop(search_elem);
+        if (next_elem)
+            bpf_obj_drop(next_elem);
+    }
+
+    return XDP_REDIRECT;
+}
+
+static __always_inline
+int save_cached_rpc(struct net_event *ev, struct rpc_state *ctx,
+    struct homa_meta_info *data_meta, struct interm_out *int_out) {
+
+    if(int_out->delayed)
+        return XDP_REDIRECT;
+    
+    __u32 cpu = bpf_get_smp_processor_id();
+    /* cache the new RPC */
+    cache_rpc[cpu] = ev->flow_id;
+    cache_has_rpc[cpu] = 1;
+    update_delay_packets[cpu] = 1;
+    return XDP_REDIRECT;
+}
+
+static __always_inline
+int insert_into_tree(struct net_event *ev, struct rpc_state *ctx,
+    struct homa_meta_info *data_meta, struct interm_out *int_out) {
+
+    if (!int_out->new_state || !int_out->need_schedule)
+        return XDP_REDIRECT;
+
+    struct rpc_key_t *hkey = &(ev->flow_id);
+    __u32 message_length = ev->message_length;
+
+    struct rpc_state_cc *elem = NULL;
+    struct rpc_state_cc *next_elem = NULL;
+    struct rpc_state_cc *search_elem = NULL;
+    struct rpc_state_cc *prio_elem = NULL;
+    struct bpf_rb_node *rb_node = NULL;
+    
+    /* allocate new object for Tree0 */
+    elem = bpf_obj_new(typeof(*elem));
+    CHECK_AND_DROP_LOG(!elem, "server_request: bpf_obj_new failed.");
+    /* allocate new object for Tree1 */
+    prio_elem = bpf_obj_new(typeof(*prio_elem));
+    if (unlikely(!prio_elem))
+    {
+        bpf_obj_drop(elem);
+        return XDP_DROP;
+    }
+    /* use bpf_refcount_acquire rather than bpf_obj_new for better performance */
+    search_elem = bpf_refcount_acquire(prio_elem);
+    if (unlikely(!search_elem))
+    {
+        bpf_obj_drop(elem);
+        bpf_obj_drop(prio_elem);
+        return XDP_DROP;
+    }
+
+    next_elem = bpf_refcount_acquire(search_elem);
+    if (unlikely(!next_elem))
+    {
+        bpf_obj_drop(elem);
+        bpf_obj_drop(prio_elem);
+        bpf_obj_drop(search_elem);
+        return XDP_DROP;
+    }
+
+    /* prepare elem */
+    {
+        elem->tree_id = 0;
+        elem->peer_id = get_peerid(hkey->remote_ip);
+        
+        /* note: the following two fields may be updated by other CPU, but it's OK */
+        elem->bytes_remaining = ctx->cc.bytes_remaining;
+        elem->incoming = ctx->cc.incoming;
+        
+        elem->hkey.rpcid = hkey->rpcid;
+        elem->hkey.local_port = hkey->local_port;
+        elem->hkey.remote_ip = hkey->remote_ip;
+        elem->hkey.remote_port = hkey->remote_port;
+
+        elem->message_length = message_length;
+
+        elem->birth = bpf_ktime_get_ns();
+        elem->birth &= ~(__u64)1;
+    }
+
+    /* prepare search_elem */
+    {
+        search_elem->tree_id = 0;
+        search_elem->peer_id = get_peerid(hkey->remote_ip);
+        search_elem->bytes_remaining = 0;
+        search_elem->hkey.rpcid = 0;
+        search_elem->hkey.local_port = 0;
+        search_elem->hkey.remote_port = 0;
+        search_elem->hkey.remote_ip = 0;
+    }
+
+    GRANT_LOCK();
+    /* last_bytes_remaining is used for future search, 
+        * update here is safe as we can only modify it with grant lock 
+        */
+    ctx->cc.last_bytes_remaining = elem->bytes_remaining;
+
+    /* insert CC object in Tree0
+        * note: we can still use elem until GRANT_UNLOCK(), see Linux kernel doc of BPF Graph Data Structures 
+        */
+    bpf_rbtree_add(&groot, &elem->rbtree_link, srpt_less_rpc);
+
+    rb_node = bpf_rbtree_lower_bound(&groot, &search_elem->rbtree_link, srpt_less_rpc);
+    if (!rb_node) { /* this should never happen */
+        GRANT_UNLOCK();
+        bpf_obj_drop(prio_elem);
+        prio_elem = NULL;
+        search_elem = NULL;
+        log_panic("update_grant_for_cached_rpc: impossible branch, seems a bug.");
+        goto out;
+    }
+    else
+    {
+        search_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+        if (unlikely(search_elem->tree_id != 0 || search_elem->peer_id != elem->peer_id))
+        {
+            /* this should never happen */
+            GRANT_UNLOCK();
+            bpf_obj_drop(prio_elem);
+            prio_elem = NULL;
+            search_elem = NULL;
+            log_panic("update_grant_for_cached_rpc: impossible branch, seems a bug.");
+            goto out;
+        }
+        else if (search_elem->hkey.rpcid == elem->hkey.rpcid &&
+                search_elem->hkey.local_port == elem->hkey.local_port &&
+                search_elem->hkey.remote_port == elem->hkey.remote_port &&
+                search_elem->hkey.remote_ip == elem->hkey.remote_ip)
+        {
+            /* we find that we are the highest priority one now, but we shoud first check that
+            * if there is a rpc from this peer that is in Tree1 already, if so, we should remove it first
+            */
+            next_elem->tree_id = 0;
+            next_elem->peer_id = elem->peer_id;
+
+            next_elem->bytes_remaining = elem->bytes_remaining;
+            next_elem->hkey.rpcid = elem->hkey.rpcid;
+            next_elem->hkey.local_port = elem->hkey.local_port;
+            next_elem->hkey.remote_port = elem->hkey.remote_port;
+            next_elem->hkey.remote_ip = elem->hkey.remote_ip + 1;
+
+            rb_node = bpf_rbtree_lower_bound(&groot, &next_elem->rbtree_link, srpt_less_rpc);
+            if(!rb_node) {
+                if(int_out->new_state || !(search_elem->birth & 1)) {
+                    if(prio_elem) {
+                        /* copy states to prio_elem from elem except for tree_id */
+                        {
+                            prio_elem->tree_id = 1;
+                            prio_elem->peer_id = elem->peer_id;
+                            prio_elem->bytes_remaining = elem->bytes_remaining;
+                            prio_elem->incoming = elem->incoming;
+                            prio_elem->hkey.rpcid = elem->hkey.rpcid;
+                            prio_elem->hkey.local_port = elem->hkey.local_port;
+                            prio_elem->hkey.remote_ip = elem->hkey.remote_ip;
+                            prio_elem->hkey.remote_port = elem->hkey.remote_port;
+                            prio_elem->message_length = elem->message_length;
+                            /* mark this rpc is in Tree1 */
+                            elem->birth |= (__u64)1;
+                            prio_elem->birth = elem->birth;
+                        }
+
+                        bpf_rbtree_add(&groot, &prio_elem->rbtree_link, srpt_less_peer);
+                        prio_elem = NULL;
+
+                        //value = 7;
+                    } else {
+                        //value = 9;
+                    }
+                }
+            } else {
+                next_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                
+                if (next_elem->tree_id == 0 && next_elem->peer_id == elem->peer_id) { // X
+                    next_elem->birth &= ~(__u64)1; // X
+                /* use prio_elem to search and remove it from Tree1 */
+                    prio_elem->tree_id = 1;
+                    prio_elem->peer_id = next_elem->peer_id;
+                    prio_elem->bytes_remaining = next_elem->bytes_remaining;
+                    rb_node = bpf_rbtree_lower_bound(&groot, &prio_elem->rbtree_link, srpt_less_peer);
+                    if (rb_node) {
+                        prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                        if (prio_elem->tree_id == 1 && prio_elem->peer_id == next_elem->peer_id)
+                        {
+                            // DPDK: rpc_info_2 rmvd = remove_from_sorted_list_2(&old_prio_elem);
+                            rb_node = bpf_rbtree_remove(&groot, &prio_elem->rbtree_link);
+                            if (rb_node)
+                            {
+                                //value = 2;
+
+                                prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+                                // DPDK: MTP_all_rpcs[old_ind].in_prio_list = false;
+                                //next_elem->birth &= ~(__u64)1; // X
+                                // DPDK: MTP_all_rpcs[old_ind].incoming = rmvd.incoming;
+                                next_elem->incoming = prio_elem->incoming;
+
+                                /* copy states to prio_elem from elem except for tree_id */
+                                {
+                                    prio_elem->tree_id = 1;
+                                    prio_elem->peer_id = elem->peer_id;
+                                    prio_elem->bytes_remaining = elem->bytes_remaining;
+                                    prio_elem->incoming = elem->incoming;
+                                    prio_elem->hkey.rpcid = elem->hkey.rpcid;
+                                    prio_elem->hkey.local_port = elem->hkey.local_port;
+                                    prio_elem->hkey.remote_ip = elem->hkey.remote_ip;
+                                    prio_elem->hkey.remote_port = elem->hkey.remote_port;
+                                    prio_elem->message_length = elem->message_length;
+                                    /* mark this rpc is in Tree1 */
+                                    elem->birth |= (__u64)1;
+                                    prio_elem->birth = elem->birth;
+                                }
+                                
+                                // DPDK: MTP_all_rpcs[my_ind].in_prio_list = true;
+                                elem->birth |= (__u64)1;
+                                prio_elem->birth = elem->birth;
+                
+                                bpf_rbtree_add(&groot, &prio_elem->rbtree_link, srpt_less_peer);
+                                prio_elem = NULL;
+                            }
+                            else { /* this should never happen */
+                                prio_elem = NULL;
+                                //value = 3;
+                            }
+                        }
+                        else { /* this should never happen */
+                            prio_elem = NULL;
+                            //value = 4;
+                        }
+                    }
+                    else { /* this should never happen */
+                        prio_elem = NULL;
+                        //value = 5;
+                    }
+                }
+            }
+            next_elem = NULL;
+            search_elem = NULL;
+        }
+        else { /* we are not the highest priority one, do nothing */
+            search_elem = NULL;
+        }
+    }
+    GRANT_UNLOCK();
+out:
+    if (prio_elem)
+        bpf_obj_drop(prio_elem);
+    if (search_elem)
+        bpf_obj_drop(search_elem);
+    if (next_elem)
+        bpf_obj_drop(next_elem);
+    
+    return XDP_REDIRECT;
+}
+
+
+static __always_inline
 int first_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     struct homa_meta_info *data_meta, struct interm_out *int_out) {
 
@@ -650,7 +1230,6 @@ int first_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
     add_rx_data_seg_wrapper(ev->segment_length, ev->offset, data_meta, ctx);
 
-    /*
     if (int_out->complete) {
         // Question: I also wanted to have some kind of wrapper for
         // flush_and_notify, but there isn't enough space in RX metadata
@@ -659,19 +1238,17 @@ int first_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
         return XDP_REDIRECT;
     }
 
-    //if (need_schedule)
-    //    cache_this_rpc(hkey);
+    //ev->flow_id.rpcid = local_id(ev->flow_id.rpcid);
+
+    /*if (int_out->need_schedule) {
+        no_ctx_sched_ep(ev, ctx, data_meta, int_out);
+        save_cached_rpc(ev, ctx, data_meta, int_out);
+    }
 
     if (!int_out->new_state || !int_out->need_schedule)
         return XDP_REDIRECT;
 
-
-    struct rpc_key_t hkey = {0};
-    hkey.rpcid = local_id(ev->flow_id.rpcid);
-    hkey.local_port = ev->flow_id.local_port;
-    hkey.remote_port = ev->flow_id.remote_port;
-    hkey.remote_ip = ev->flow_id.remote_ip;
-    return insert_grant_list(ctx, &hkey, message_length);*/
+    return insert_new(ev, ctx, data_meta, int_out);*/
 
     return XDP_REDIRECT;
 }
@@ -721,22 +1298,20 @@ int next_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
     add_rx_data_seg_wrapper(ev->segment_length, ev->offset, data_meta, ctx);
 
-    /*if (int_out->complete)
+    if (int_out->complete)
         return XDP_REDIRECT;
 
-    //if (need_schedule)
-    //    cache_this_rpc(hkey);
+    //ev->flow_id.rpcid = local_id(ev->flow_id.rpcid);
+
+    /*if (int_out->need_schedule) {
+        no_ctx_sched_ep(ev, ctx, data_meta, int_out);
+        save_cached_rpc(ev, ctx, data_meta, int_out);
+    }
 
     if (!int_out->new_state || !int_out->need_schedule)
         return XDP_REDIRECT;
 
-
-    struct rpc_key_t hkey = {0};
-    hkey.rpcid = local_id(ev->flow_id.rpcid);
-    hkey.local_port = ev->flow_id.local_port;
-    hkey.remote_port = ev->flow_id.remote_port;
-    hkey.remote_ip = ev->flow_id.remote_ip;
-    return insert_grant_list(ctx, &hkey, message_length);*/
+    return insert_new(ev, ctx, data_meta, int_out);*/
     return XDP_REDIRECT;
 }
 
@@ -865,22 +1440,23 @@ int recv_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
     int_out->need_schedule = message_length > ctx->cc.incoming;
 
-    //if (need_schedule)
-    //    cache_this_rpc(hkey);
-    
-    /*if (!int_out->new_state || !need_schedule)
+    //ev->flow_id.rpcid = local_id(ev->flow_id.rpcid);
+
+    /*if (int_out->need_schedule) {
+        no_ctx_sched_ep(ev, ctx, data_meta, int_out);
+        save_cached_rpc(ev, ctx, data_meta, int_out);
+    }
+
+    if (!int_out->new_state || !int_out->need_schedule)
         return XDP_REDIRECT;
 
-    struct rpc_key_t hkey = {0};
-    hkey.rpcid = local_id(ev->flow_id.rpcid);
-    hkey.local_port = ev->flow_id.local_port;
-    hkey.remote_port = ev->flow_id.remote_port;
-    hkey.remote_ip = ev->flow_id.remote_ip;
-    return insert_grant_list(ctx, &hkey, message_length);*/
+    return insert_new(ev, ctx, data_meta, int_out);*/
 
     return XDP_REDIRECT;
 }
 
+
+#if 0
 static __always_inline
 int no_ctx_sched_ep(struct net_event *ev, struct rpc_state *ctx,
     struct homa_meta_info *data_meta, struct interm_out *int_out) {
@@ -1472,6 +2048,7 @@ out:
 
     return XDP_REDIRECT;
 }
+#endif
 
 static __always_inline
 int choose_grants(struct xdp_md *ctx)
@@ -1779,7 +2356,7 @@ int update_prios(struct xdp_md *ctx)
         if (remove[cpu][i])
         {
             struct rpc_state_cc *cc_node_t0 = NULL;
-            struct rpc_state_cc *cc_node_t1 = NULL;
+            struct rpc_state_cc *prio_elem = NULL;
             struct bpf_rb_node *rb_node = NULL;
             peer_id = get_peerid(ri->remote_ip[i]);
 
@@ -1790,8 +2367,8 @@ int update_prios(struct xdp_md *ctx)
                 return XDP_ABORTED;
             }
 
-            cc_node_t1 = bpf_refcount_acquire(cc_node_t0);
-            if (!cc_node_t1)
+            prio_elem = bpf_refcount_acquire(cc_node_t0);
+            if (!prio_elem)
             {
                 bpf_obj_drop(cc_node_t0);
                 release_grantable_lock();
@@ -1813,26 +2390,26 @@ int update_prios(struct xdp_md *ctx)
                 if (cc_node_t0->tree_id == 0 && cc_node_t0->peer_id == peer_id && (cc_node_t0->birth & 1) == 0)
                 {
                     // we should add this rpc to peer tree
-                    cc_node_t1->tree_id = 1;
-                    cc_node_t1->peer_id = cc_node_t0->peer_id;
-                    cc_node_t1->bytes_remaining = cc_node_t0->bytes_remaining;
-                    cc_node_t1->incoming = cc_node_t0->incoming;
-                    cc_node_t1->hkey.rpcid = cc_node_t0->hkey.rpcid;
-                    cc_node_t1->hkey.local_port = cc_node_t0->hkey.local_port;
-                    cc_node_t1->hkey.remote_ip = cc_node_t0->hkey.remote_ip;
-                    cc_node_t1->hkey.remote_port = cc_node_t0->hkey.remote_port;
-                    cc_node_t1->message_length = cc_node_t0->message_length;
+                    prio_elem->tree_id = 1;
+                    prio_elem->peer_id = cc_node_t0->peer_id;
+                    prio_elem->bytes_remaining = cc_node_t0->bytes_remaining;
+                    prio_elem->incoming = cc_node_t0->incoming;
+                    prio_elem->hkey.rpcid = cc_node_t0->hkey.rpcid;
+                    prio_elem->hkey.local_port = cc_node_t0->hkey.local_port;
+                    prio_elem->hkey.remote_ip = cc_node_t0->hkey.remote_ip;
+                    prio_elem->hkey.remote_port = cc_node_t0->hkey.remote_port;
+                    prio_elem->message_length = cc_node_t0->message_length;
                     // mark this rpc is in peer tree
                     cc_node_t0->birth |= (__u64)1;
-                    cc_node_t1->birth = cc_node_t0->birth;
+                    prio_elem->birth = cc_node_t0->birth;
 
-                    bpf_rbtree_add(&groot, &cc_node_t1->rbtree_link, srpt_less_peer);
-                    cc_node_t1 = NULL;
+                    bpf_rbtree_add(&groot, &prio_elem->rbtree_link, srpt_less_peer);
+                    prio_elem = NULL;
                 }
             }
             GRANT_UNLOCK();
-            if (cc_node_t1)
-                bpf_obj_drop(cc_node_t1);
+            if (prio_elem)
+                bpf_obj_drop(prio_elem);
         }
     }
 
@@ -1911,6 +2488,8 @@ int pkt_gen_instr_grant_wrapper(struct HOMABP_GEN *bp, struct xdp_md *ctx, __u32
     return XDP_TX;
 }
 
+#define XDP_GEN_RETURN_DROP(last_grant) (last_grant ? XDP_ABORTED : XDP_DROP)
+
 static __always_inline
 int gen_grants(struct xdp_md *ctx, struct interm_out *int_out)
 {
@@ -1935,7 +2514,7 @@ int gen_grants(struct xdp_md *ctx, struct interm_out *int_out)
     {
         int_out->last_grant = 1;
         no_work = 1;
-        return XDP_DROP;
+        goto reset;
     }
 
     __u16 cnt = HOMA_OVERCOMMITMENT;
@@ -1970,7 +2549,8 @@ int gen_grants(struct xdp_md *ctx, struct interm_out *int_out)
         if (unlikely(!cc_node_search)) {
             no_work = 1;
             need_grant_fifo[cpu] = 0; // error or no fifo rpc to grant
-            return XDP_DROP;
+            goto reset;
+
         }
 
         cc_node_search->birth = POISON_64;
@@ -1982,7 +2562,7 @@ int gen_grants(struct xdp_md *ctx, struct interm_out *int_out)
             GRANT_UNLOCK();
             no_work = 1;
             need_grant_fifo[cpu] = 0; // error or no fifo rpc to grant
-            return XDP_DROP;
+            goto reset;
         }
         cc_node_search = container_of(rb_node, struct rpc_state_cc, rbtree_link);
 
@@ -2035,12 +2615,12 @@ int gen_grants(struct xdp_md *ctx, struct interm_out *int_out)
         if (unlikely(!ri))
         {
             no_work = 1;
-            return XDP_DROP;
+            goto reset;
         }
 
         if (unlikely(!ri->newgrant[gi_idx])) {
             no_work = 1;
-            return XDP_DROP;
+            goto reset;
         }
 
         gi.sport = ri->local_port[gi_idx];
@@ -2062,7 +2642,60 @@ int gen_grants(struct xdp_md *ctx, struct interm_out *int_out)
     bp.grant.priority = gi.priority;
     bp.grant.resend_all = 0;
 
-    return pkt_gen_instr_grant_wrapper(&bp, ctx, local_ip, gi.remote_ip);
+    if(pkt_gen_instr_grant_wrapper(&bp, ctx, local_ip, gi.remote_ip) != XDP_TX) {
+        return XDP_GEN_RETURN_DROP(int_out->last_grant);
+    }
+
+
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    // Ethernet header
+    struct ethhdr *eth = (struct ethhdr *)data;
+    if (unlikely(eth + 1 > data_end))
+    {
+        return XDP_GEN_RETURN_DROP(int_out->last_grant);
+    }
+
+    // IP header
+    struct iphdr *iph = (struct iphdr *)(eth + 1);
+    if (unlikely(iph + 1 > data_end))
+    {
+        return XDP_GEN_RETURN_DROP(int_out->last_grant);
+    }
+
+reset:
+    if (int_out->last_grant)
+    {
+        granting_idx[cpu] = 0;
+        nr_grant_candidate[cpu] = 0;
+        finish_grant_choose[cpu] = 0;
+#ifdef HELP_PACER
+        help_pacer();
+#endif
+        // bpf_printk("reset granting_idx");
+    }
+
+    if (no_work)
+    {
+        // bpf_printk("no_work: last_grant: %d\n", last_grant);
+        return XDP_GEN_RETURN_DROP(int_out->last_grant);
+    }
+
+    int err = fib_lookup(ctx, eth, iph);
+    if (unlikely(err))
+    {
+        bpf_printk("ERROR: bpf_fib_lookup failed in XDP_GEN, check routing table in kernel,"
+                   "last_grant = %d, need_grant_fifo[cpu] = %d\n",
+                   int_out->last_grant, need_grant_fifo[cpu]);
+        return XDP_GEN_RETURN_DROP(int_out->last_grant);
+    }
+
+    // flush the FIFO queue
+    if (int_out->send_fifo_rpc)
+        need_grant_fifo[cpu] = 0;
+
+    return XDP_TX;
 }
 
 
