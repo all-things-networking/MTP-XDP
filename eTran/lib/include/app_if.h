@@ -129,6 +129,16 @@ struct eTran_cfg
     unsigned int nr_app_threads;
 };
 
+struct mtp_value {
+    bool following_packets;
+    unsigned int expected_seq;
+    unsigned int ooo_start;
+    unsigned int ooo_len;
+    unsigned int last_offset;
+    unsigned int rx_next_pos;
+    unsigned int rx_buf_size;
+};
+
 struct app_ctx_per_thread {
     uint32_t tid;
     
@@ -183,13 +193,8 @@ struct app_ctx_per_thread {
     std::list<std::pair<struct eTrantcp_connection *, uint32_t> > retransmission_conns;
 
     /* Values added in MTP */
-    bool following_packets;
-    unsigned int expected_seq;
-    unsigned int ooo_start;
-    unsigned int ooo_len;
-    unsigned int last_offset;
-    unsigned int rx_next_pos;
-    unsigned int rx_buf_size;
+
+    std::unordered_map<struct eTran_tcp_flow_tuple, struct mtp_value, eTran_tcp_flow_tuple_hash, eTran_tcp_flow_tuple_equal> mtp_values;
 };
 
 // application context in application
