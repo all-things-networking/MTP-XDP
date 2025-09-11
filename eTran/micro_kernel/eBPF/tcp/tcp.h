@@ -387,10 +387,10 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
     if(ev->type == APP_EVENT) {
         if(data_meta->tx.tx_pending > 0) { // First packet of batch
             send_ep(ev, c, &int_out, data_meta, cc, tcph, iph, data_end, bp);
-            bpf_printk("send");
+            //bpf_printk("send");
         } else {
             following_pkts(bp, c, data_meta, cc, tcph, iph, ev->timestamp, data_end);
-            bpf_printk("following");
+            //bpf_printk("following");
         }
     } else if(ev->type == TIMER_EVENT) {
         int xdp_op = ack_timeout_xdp_ep(ev, c, &int_out, data_meta, cc);
