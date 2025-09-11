@@ -209,6 +209,10 @@ int xdp_egress_prog(struct xdp_md *ctx)
         goto err_pkt;
     }
 
+    struct TCPBP *bp = NULL;
+    if(!get_pkt_bp_mtp(&key, &bp) || !bp)
+        return XDP_DROP;
+
     // // qid check
     // if (unlikely(c->qid != ctx->rx_queue_index)) {
     //     xdp_egress_log_err("ctx->rx_queue_index(%u) != c->qid(%u)", ctx->rx_queue_index, c->qid);
@@ -239,7 +243,7 @@ int xdp_egress_prog(struct xdp_md *ctx)
     }
     #endif
 
-    ret = tcp_tx_process(iph, tcph, c, data_meta, data_end, &ev);
+    ret = tcp_tx_process(iph, tcph, c, data_meta, data_end, &ev, bp);
 
     if (ret == XDP_DROP) {
         if (data_meta->tx.flag) {

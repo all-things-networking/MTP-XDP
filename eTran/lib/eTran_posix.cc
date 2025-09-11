@@ -913,6 +913,11 @@ void tcp_flow_tx_segmentation_zc(struct app_ctx_per_thread *tctx, struct eTrantc
                 tcp_txmeta_pending(umem_area, addr, len);
                 first_pkt = false;
             }
+            #if MTP_ON
+            else {
+                tcp_txmeta_pending(umem_area, addr, 0);
+            }
+            #endif
 
             dma(pkt, (uint8_t *)buf + copy_offset, plen);
 

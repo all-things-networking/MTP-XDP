@@ -38,17 +38,19 @@ static __always_inline void mtp_fill_tcp_hdr(struct tcphdr *tcph, struct bpf_tcp
     tcph->check = 0;
 }
 
-static __always_inline void mtp_pkt_gen_wrapper(bool seg_unseg, struct TCPBP bp, struct bpf_tcp_conn *c,
+static __always_inline void mtp_pkt_gen_wrapper(bool seg_unseg, struct TCPBP *bp, struct bpf_tcp_conn *c,
     struct tcphdr *tcph, struct iphdr *iph, void *data_end, __u32 data_size, __u32 seq_num,
     __u8 ev_type, struct meta_info *data_meta) {
 
     if(seg_unseg == SEG_DATA || (c->buf_curr_seq < seq_num)) {
-        c->buf_curr_seq += data_size;
-        c->tx_next_pos += data_size;
+        c->buf_curr_seq += min(data_size, TCP_MSS_W_TS);
+        c->tx_next_pos += min(data_size, TCP_MSS_W_TS);
         if (c->tx_next_pos >= c->tx_buf_size)
             c->tx_next_pos -= c->tx_buf_size;
-        mtp_fill_tcp_hdr(tcph, c, data_end, 0, &bp);
-        fill_ip_hdr(iph, data_size, c->ecn_enable);
+        mtp_fill_tcp_hdr(tcph, c, data_end, 0, bp);
+        fill_ip_hdr(iph, min(data_size, TCP_MSS_W_TS), c->ecn_enable);
+
+        bp->seq_num += min(data_size, TCP_MSS_W_TS);
 
     } else {
         __u32 go_back_bytes = c->buf_curr_seq - seq_num;
@@ -137,7 +139,8 @@ static __always_inline void mtp_add_data_seg_wrapper(__u32 data_len, __u32 offse
 static __always_inline struct app_timer_event parse_req_to_app_event(struct meta_info *data_meta) {
     struct app_timer_event ev;
     ev.type = APP_EVENT;
-    ev.data_size = data_meta->tx.plen;
+    //ev.data_size = data_meta->tx.plen;
+    ev.data_size = data_meta->tx.tx_pending;
     return ev;
 }
 
@@ -161,25 +164,24 @@ static __always_inline void parse_pkt_to_event(struct net_event *ev, struct tcph
 
 static __always_inline void send_ep (struct app_timer_event *ev, struct bpf_tcp_conn *c,
     struct interm_out *int_out, struct meta_info *data_meta, struct bpf_cc *cc, struct tcphdr *tcph,
-    struct iphdr *iph, void *data_end) {
+    struct iphdr *iph, void *data_end, struct TCPBP *bp) {
 
     c->data_end += ev->data_size;
 
-    struct TCPBP bp;
-    bp.src_port = c->local_port;
-    bp.dest_port = c->remote_port;
-    bp.seq_num = c->tx_next_seq;
-    bp.is_ack = false;
+    bp->src_port = c->local_port;
+    bp->dest_port = c->remote_port;
+    bp->seq_num = c->tx_next_seq;
+    bp->is_ack = false;
 
     // TODO: add other values to BP and add default values
-    bp.ack_seq = c->rx_next_seq;
-    bp.rwnd_size = c->rx_avail;
+    bp->ack_seq = c->rx_next_seq;
+    bp->rwnd_size = c->rx_avail;
 
     __u64 ns_delta = (__u64)1000000000 * ev->data_size / cc->rate;
     __u64 desired_tx_ts = cc->prev_desired_tx_ts + ns_delta;
     desired_tx_ts = max(ev->timestamp, desired_tx_ts);
     cc->prev_desired_tx_ts = desired_tx_ts;
-    bp.ts_opt.desired_tx_ts = desired_tx_ts;
+    bp->ts_opt.desired_tx_ts = desired_tx_ts;
 
     // Note: I am abstracting the seg_data and pkt_gen_instr in this function.
     // The 5th argument is the second argument of seg_data (the length)
@@ -191,6 +193,29 @@ static __always_inline void send_ep (struct app_timer_event *ev, struct bpf_tcp_
 
     // TODO: add functions to initialize timers
 }
+
+static __always_inline void following_pkts (struct TCPBP *bp, struct bpf_tcp_conn *c, struct meta_info *data_meta,
+    struct bpf_cc *cc, struct tcphdr *tcph, struct iphdr *iph, __u32 ref_ts, void *data_end) {
+    
+    __u64 ns_delta = (__u64)1000000000 * data_meta->tx.plen / cc->rate;
+    __u64 desired_tx_ts = cc->prev_desired_tx_ts + ns_delta;
+    desired_tx_ts = max(ref_ts, desired_tx_ts);
+    cc->prev_desired_tx_ts = desired_tx_ts;
+    bp->ts_opt.desired_tx_ts = desired_tx_ts;
+
+    c->buf_curr_seq += data_meta->tx.plen;
+    c->tx_next_pos += data_meta->tx.plen;
+    if (c->tx_next_pos >= c->tx_buf_size)
+        c->tx_next_pos -= c->tx_buf_size;
+
+    mtp_fill_tcp_hdr(tcph, c, data_end, 0, bp);
+    fill_ip_hdr(iph, data_meta->tx.plen, c->ecn_enable);
+
+    bp->seq_num += data_meta->tx.plen;
+
+    cc->txp = c->tx_next_seq != c->send_una;
+}
+
 
 static __always_inline int ack_timeout_xdp_ep (struct app_timer_event *ev, struct bpf_tcp_conn *c,
     struct interm_out *int_out, struct meta_info *data_meta, struct bpf_cc *cc) {
@@ -246,7 +271,7 @@ static __always_inline int ack_timeout_xdp_ep (struct app_timer_event *ev, struc
     // But would the compiler be able to know it is for a retransmission?
     // A: have a single wrapper and use buf_cur_seq for the decision and see if it is alligned
     struct TCPBP bp = {0};
-    mtp_pkt_gen_wrapper(UNSEG_DATA, bp, c, NULL, NULL, NULL, 0, c->send_una, TIMER_EVENT, data_meta);
+    mtp_pkt_gen_wrapper(UNSEG_DATA, &bp, c, NULL, NULL, NULL, 0, c->send_una, TIMER_EVENT, data_meta);
     return XDP_PASS; // redirect to userspace
 }
 
@@ -328,7 +353,7 @@ static __always_inline void ack_net_ep(struct net_event *ev, struct bpf_tcp_conn
         // Similar to the problem before, here we also specify the go_back_pos,
         // but in MTP we give send_una
         struct TCPBP bp = {0};
-        mtp_pkt_gen_wrapper(UNSEG_DATA, bp, c, NULL, NULL, NULL, 0, c->send_una, NET_EVENT, data_meta);
+        mtp_pkt_gen_wrapper(UNSEG_DATA, &bp, c, NULL, NULL, NULL, 0, c->send_una, NET_EVENT, data_meta);
 
         return;
     }
