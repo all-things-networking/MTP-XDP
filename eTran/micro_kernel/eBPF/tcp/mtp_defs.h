@@ -68,13 +68,13 @@ struct net_event {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, struct ebpf_flow_tuple);
+    __type(key, struct ebpf_flow_tuple_per_stream);
     __type(value, struct TCPBP);
     __uint(max_entries, MAX_TCP_FLOWS);
 } bpf_pkt_bp_map SEC(".maps");
 
 static __always_inline
-int get_pkt_bp_mtp(struct ebpf_flow_tuple *key, struct TCPBP **bp) {
+int get_pkt_bp_mtp(struct ebpf_flow_tuple_per_stream *key, struct TCPBP **bp) {
 
     *bp = bpf_map_lookup_elem(&bpf_pkt_bp_map, key);
     if(!(*bp)) {

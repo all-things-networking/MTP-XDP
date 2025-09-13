@@ -40,29 +40,29 @@ static __always_inline void mtp_fill_tcp_hdr(struct tcphdr *tcph, struct bpf_tcp
 
 static __always_inline void mtp_pkt_gen_wrapper(bool seg_unseg, struct TCPBP *bp, struct bpf_tcp_conn *c,
     struct tcphdr *tcph, struct iphdr *iph, void *data_end, __u32 data_size, __u32 seq_num,
-    __u8 ev_type, struct meta_info *data_meta) {
+    __u8 ev_type, struct meta_info *data_meta, struct bpf_tcp_conn_per_stream *stream_c) {
 
-    if(seg_unseg == SEG_DATA || (c->buf_curr_seq < seq_num)) {
-        c->buf_curr_seq += min(data_size, TCP_MSS_W_TS);
-        c->tx_next_pos += min(data_size, TCP_MSS_W_TS);
-        if (c->tx_next_pos >= c->tx_buf_size)
-            c->tx_next_pos -= c->tx_buf_size;
+    if(seg_unseg == SEG_DATA || (stream_c->buf_curr_seq < seq_num)) {
+        stream_c->buf_curr_seq += min(data_size, TCP_MSS_W_TS);
+        stream_c->tx_next_pos += min(data_size, TCP_MSS_W_TS);
+        if (stream_c->tx_next_pos >= stream_c->tx_buf_size)
+            stream_c->tx_next_pos -= stream_c->tx_buf_size;
         mtp_fill_tcp_hdr(tcph, c, data_end, 0, bp);
         fill_ip_hdr(iph, min(data_size, TCP_MSS_W_TS), c->ecn_enable);
 
         bp->seq_num += min(data_size, TCP_MSS_W_TS);
 
     } else {
-        __u32 go_back_bytes = c->buf_curr_seq - seq_num;
-        c->buf_curr_seq -= go_back_bytes;
-        if (c->tx_next_pos >= go_back_bytes) {
-            c->tx_next_pos -= go_back_bytes;
+        __u32 go_back_bytes = stream_c->buf_curr_seq - seq_num;
+        stream_c->buf_curr_seq -= go_back_bytes;
+        if (stream_c->tx_next_pos >= go_back_bytes) {
+            stream_c->tx_next_pos -= go_back_bytes;
         } else {
-            c->tx_next_pos = c->tx_buf_size - (go_back_bytes - c->tx_next_pos);
+            stream_c->tx_next_pos = stream_c->tx_buf_size - (go_back_bytes - stream_c->tx_next_pos);
         }
     
-        data_meta->rx.go_back_pos = c->tx_next_pos;
-        data_meta->rx.xsk_budget_avail = xsk_budget_avail(c);
+        data_meta->rx.go_back_pos = stream_c->tx_next_pos;
+        data_meta->rx.xsk_budget_avail = xsk_budget_avail(stream_c);
         data_meta->rx.rx_pos = POISON_32;
         data_meta->rx.poff = POISON_16;
         data_meta->rx.plen = POISON_16;
@@ -110,11 +110,11 @@ static __always_inline void mtp_pkt_gen_for_xdp_gen(struct TCPBP *bp, struct bpf
 }
 
 static __always_inline void mtp_tx_data_flush(struct bpf_tcp_conn *c, struct interm_out *int_out,
-    __u32 rmlen, struct meta_info *data_meta) {
-    if(rmlen > 0 || xsk_budget_avail(c)) {
+    __u32 rmlen, struct meta_info *data_meta, struct bpf_tcp_conn_per_stream *stream_c) {
+    if(rmlen > 0 || xsk_budget_avail(stream_c)) {
         int_out->drop = 0;
         data_meta->rx.ack_bytes = rmlen;
-        data_meta->rx.xsk_budget_avail = xsk_budget_avail(c);
+        data_meta->rx.xsk_budget_avail = xsk_budget_avail(stream_c);
         data_meta->rx.rx_pos = POISON_32;
         data_meta->rx.poff = POISON_16;
         data_meta->rx.plen = POISON_16;
@@ -122,11 +122,12 @@ static __always_inline void mtp_tx_data_flush(struct bpf_tcp_conn *c, struct int
 }
 
 static __always_inline void mtp_add_data_seg_wrapper(__u32 data_len, __u32 offset,
-    struct bpf_tcp_conn *c, struct interm_out *int_out, struct meta_info *data_meta) {
-    if(data_len || xsk_budget_avail(c)) {
+    struct bpf_tcp_conn *c, struct interm_out *int_out, struct meta_info *data_meta,
+    struct bpf_tcp_conn_per_stream *stream_c) {
+    if(data_len || xsk_budget_avail(stream_c)) {
         int_out->drop = 0;
         data_meta->rx.rx_pos = offset;
-        data_meta->rx.xsk_budget_avail = xsk_budget_avail(c);
+        data_meta->rx.xsk_budget_avail = xsk_budget_avail(stream_c);
         if (!data_len) {
             data_meta->rx.rx_pos = POISON_32;
             data_meta->rx.poff = POISON_16;
@@ -164,18 +165,19 @@ static __always_inline void parse_pkt_to_event(struct net_event *ev, struct tcph
 
 static __always_inline void send_ep (struct app_timer_event *ev, struct bpf_tcp_conn *c,
     struct interm_out *int_out, struct meta_info *data_meta, struct bpf_cc *cc, struct tcphdr *tcph,
-    struct iphdr *iph, void *data_end, struct TCPBP *bp) {
+    struct iphdr *iph, void *data_end, struct TCPBP *bp, struct bpf_tcp_conn_per_stream *stream_c) {
 
-    c->data_end += ev->data_size;
+    bpf_printk("SEND_EP");
+    stream_c->data_end += ev->data_size;
 
     bp->src_port = c->local_port;
     bp->dest_port = c->remote_port;
-    bp->seq_num = c->tx_next_seq;
+    bp->seq_num = stream_c->tx_next_seq;
     bp->is_ack = false;
 
     // TODO: add other values to BP and add default values
-    bp->ack_seq = c->rx_next_seq;
-    bp->rwnd_size = c->rx_avail;
+    bp->ack_seq = stream_c->rx_next_seq;
+    bp->rwnd_size = stream_c->rx_avail;
 
     __u64 ns_delta = (__u64)1000000000 * ev->data_size / cc->rate;
     __u64 desired_tx_ts = cc->prev_desired_tx_ts + ns_delta;
@@ -185,17 +187,17 @@ static __always_inline void send_ep (struct app_timer_event *ev, struct bpf_tcp_
 
     // Note: I am abstracting the seg_data and pkt_gen_instr in this function.
     // The 5th argument is the second argument of seg_data (the length)
-    mtp_pkt_gen_wrapper(SEG_DATA, bp, c, tcph, iph, data_end, ev->data_size, 0, 0, data_meta);
+    mtp_pkt_gen_wrapper(SEG_DATA, bp, c, tcph, iph, data_end, ev->data_size, 0, 0, data_meta, stream_c);
 
-    c->tx_next_seq += ev->data_size;
+    stream_c->tx_next_seq += ev->data_size;
 
-    cc->txp = c->tx_next_seq != c->send_una;
+    cc->txp = stream_c->tx_next_seq != stream_c->send_una;
 
     // TODO: add functions to initialize timers
 }
 
 static __always_inline void following_pkts (struct TCPBP *bp, struct bpf_tcp_conn *c, struct meta_info *data_meta,
-    struct bpf_cc *cc, struct tcphdr *tcph, struct iphdr *iph, __u32 ref_ts, void *data_end) {
+    struct bpf_cc *cc, struct tcphdr *tcph, struct iphdr *iph, __u32 ref_ts, void *data_end, struct bpf_tcp_conn_per_stream *stream_c) {
     
     __u64 ns_delta = (__u64)1000000000 * data_meta->tx.plen / cc->rate;
     __u64 desired_tx_ts = cc->prev_desired_tx_ts + ns_delta;
@@ -203,40 +205,40 @@ static __always_inline void following_pkts (struct TCPBP *bp, struct bpf_tcp_con
     cc->prev_desired_tx_ts = desired_tx_ts;
     bp->ts_opt.desired_tx_ts = desired_tx_ts;
 
-    c->buf_curr_seq += data_meta->tx.plen;
-    c->tx_next_pos += data_meta->tx.plen;
-    if (c->tx_next_pos >= c->tx_buf_size)
-        c->tx_next_pos -= c->tx_buf_size;
+    stream_c->buf_curr_seq += data_meta->tx.plen;
+    stream_c->tx_next_pos += data_meta->tx.plen;
+    if (stream_c->tx_next_pos >= stream_c->tx_buf_size)
+        stream_c->tx_next_pos -= stream_c->tx_buf_size;
 
     mtp_fill_tcp_hdr(tcph, c, data_end, 0, bp);
     fill_ip_hdr(iph, data_meta->tx.plen, c->ecn_enable);
 
     bp->seq_num += data_meta->tx.plen;
 
-    cc->txp = c->tx_next_seq != c->send_una;
+    cc->txp = stream_c->tx_next_seq != stream_c->send_una;
 }
 
 
 static __always_inline int ack_timeout_xdp_ep (struct app_timer_event *ev, struct bpf_tcp_conn *c,
-    struct interm_out *int_out, struct meta_info *data_meta, struct bpf_cc *cc) {
+    struct interm_out *int_out, struct meta_info *data_meta, struct bpf_cc *cc, struct bpf_tcp_conn_per_stream *stream_c) {
 
-    if (c->tx_next_seq == c->send_una) {
+    if (stream_c->tx_next_seq == stream_c->send_una) {
         return XDP_DROP;
     }
 
-    __u32 go_back_bytes = c->tx_next_seq - c->send_una;
+    __u32 go_back_bytes = stream_c->tx_next_seq - stream_c->send_una;
 
     /* reset flow state as if we never transmitted those segments */
-    c->rx_dupack_cnt = 0;
+    stream_c->rx_dupack_cnt = 0;
 
-    c->tx_next_seq -= go_back_bytes;
+    stream_c->tx_next_seq -= go_back_bytes;
 
     //c->tx_pending = 0;
-    c->rx_remote_avail += go_back_bytes;
+    stream_c->rx_remote_avail += go_back_bytes;
 
     cc->txp = 0;
 
-    c->data_end -= go_back_bytes;
+    stream_c->data_end -= go_back_bytes;
 
     /* cut rate by half if first drop in control interval */
     if (cc->cnt_tx_drops == 0) {
@@ -271,17 +273,17 @@ static __always_inline int ack_timeout_xdp_ep (struct app_timer_event *ev, struc
     // But would the compiler be able to know it is for a retransmission?
     // A: have a single wrapper and use buf_cur_seq for the decision and see if it is alligned
     struct TCPBP bp = {0};
-    mtp_pkt_gen_wrapper(UNSEG_DATA, &bp, c, NULL, NULL, NULL, 0, c->send_una, TIMER_EVENT, data_meta);
+    mtp_pkt_gen_wrapper(UNSEG_DATA, &bp, c, NULL, NULL, NULL, 0, stream_c->send_una, TIMER_EVENT, data_meta, stream_c);
     return XDP_PASS; // redirect to userspace
 }
 
 static __always_inline void fast_retr_rec_ep(struct net_event *ev, struct bpf_tcp_conn *c, struct interm_out *int_out, struct meta_info *data_meta,
-    __u32 cpu, struct bpf_cc *cc) {
+    __u32 cpu, struct bpf_cc *cc, struct bpf_tcp_conn_per_stream *stream_c) {
 
     int_out->drop = 1;
 
-    __u32 exp_ack_first = c->send_una;
-    __u32 exp_ack_last = c->tx_next_seq;
+    __u32 exp_ack_first = stream_c->send_una;
+    __u32 exp_ack_last = stream_c->tx_next_seq;
 
     // allow receving ack that we haven't sent yet, this is probably caused by retransmission
     //exp_ack_last += c->tx_pending;
@@ -305,28 +307,28 @@ static __always_inline void fast_retr_rec_ep(struct net_event *ev, struct bpf_tc
     if(ev->ecn_mark)
         cc->cnt_rx_ecn_bytes += int_out->num_acked_bytes;
 
-    cc->txp = c->tx_next_seq != c->send_una;
+    cc->txp = stream_c->tx_next_seq != stream_c->send_una;
 
     int_out->change_cwnd = 1;
 
     __u32 go_back_bytes = 0;
     if(int_out->num_acked_bytes) {
-        c->rx_dupack_cnt = 0;
+        stream_c->rx_dupack_cnt = 0;
     }
-    else if((c->rx_remote_avail == (ev->rwnd_size << TCP_WND_SCALE)) && ++c->rx_dupack_cnt == 3) {
+    else if((stream_c->rx_remote_avail == (ev->rwnd_size << TCP_WND_SCALE)) && ++stream_c->rx_dupack_cnt == 3) {
         int_out->change_cwnd = 0;
 
-        go_back_bytes = c->tx_next_seq - c->send_una;
+        go_back_bytes = stream_c->tx_next_seq - stream_c->send_una;
 
-        c->tx_next_seq -= go_back_bytes;
+        stream_c->tx_next_seq -= go_back_bytes;
 
         // Question: this section of code isn't covered in MTP (is used by the other parts of the code)
         // If everything works out by adding our EPs, we can remove this part safely
         //c->tx_pending = 0;
-        c->rx_remote_avail += go_back_bytes;
+        stream_c->rx_remote_avail += go_back_bytes;
         cc->txp = 0;
 
-        c->data_end -= go_back_bytes;
+        stream_c->data_end -= go_back_bytes;
 
         if(cc->cnt_tx_drops == 0) {
             cc->rate >>= 1;
@@ -343,24 +345,24 @@ static __always_inline void fast_retr_rec_ep(struct net_event *ev, struct bpf_tc
 }
 
 static __always_inline void ack_net_ep(struct net_event *ev, struct bpf_tcp_conn *c, struct interm_out *int_out, struct meta_info *data_meta,
-    __u32 cpu, struct bpf_cc *cc) {
+    __u32 cpu, struct bpf_cc *cc, struct bpf_tcp_conn_per_stream *stream_c) {
 
-    if(c->rx_dupack_cnt == 3) {
+    if(stream_c->rx_dupack_cnt == 3) {
         int_out->drop = 0;
-        c->rx_dupack_cnt = 0;
+        stream_c->rx_dupack_cnt = 0;
 
         // Question IMPORTANT:
         // Similar to the problem before, here we also specify the go_back_pos,
         // but in MTP we give send_una
         struct TCPBP bp = {0};
-        mtp_pkt_gen_wrapper(UNSEG_DATA, &bp, c, NULL, NULL, NULL, 0, c->send_una, NET_EVENT, data_meta);
+        mtp_pkt_gen_wrapper(UNSEG_DATA, &bp, c, NULL, NULL, NULL, 0, stream_c->send_una, NET_EVENT, data_meta, stream_c);
 
         return;
     }
 
     if(!int_out->drop) {
-        if(int_out->num_acked_bytes || c->rx_remote_avail < (ev->rwnd_size << TCP_WND_SCALE))
-            c->rx_remote_avail = ev->rwnd_size << TCP_WND_SCALE;
+        if(int_out->num_acked_bytes || stream_c->rx_remote_avail < (ev->rwnd_size << TCP_WND_SCALE))
+            stream_c->rx_remote_avail = ev->rwnd_size << TCP_WND_SCALE;
         
         if(ev->ts_ecr && int_out->num_acked_bytes) {
             __u32 now = bpf_ktime_get_ns();
@@ -385,18 +387,18 @@ static __always_inline void ack_net_ep(struct net_event *ev, struct bpf_tcp_conn
 
     __u32 rmlen = int_out->num_acked_bytes;
     if(rmlen > 0) {
-        c->send_una = ev->ack_seq;
+        stream_c->send_una = ev->ack_seq;
     }
     // Question IMPORTANT:
     // Is it okay to assume that tx_data_flush can be converted
     // into the code that notifies ACKs to the app?
-    // The problem is that eTran also does that in case xsk_budget_avail(c)
-    mtp_tx_data_flush(c, int_out, rmlen, data_meta);
+    // The problem is that eTran also does that in case xsk_budget_avail(c, ev->stream_id)
+    mtp_tx_data_flush(c, int_out, rmlen, data_meta, stream_c);
 
 }
 
 static __always_inline void verify_trim_data_ep(struct net_event *ev, struct bpf_tcp_conn *c, struct interm_out *int_out, struct meta_info *data_meta,
-    __u32 cpu, struct bpf_cc *cc) {
+    __u32 cpu, struct bpf_cc *cc, struct bpf_tcp_conn_per_stream *stream_c) {
     int_out->skip_data_eps = false;
     int_out->drop = true;
     int_out->trigger_ack = true;
@@ -404,8 +406,8 @@ static __always_inline void verify_trim_data_ep(struct net_event *ev, struct bpf
     __u32 trim_start = 0;
     __u32 trim_end = 0;
 
-    __u32 exp_seq_first = c->rx_next_seq;
-    __u32 exp_seq_last = c->rx_next_seq + c->rx_avail;
+    __u32 exp_seq_first = stream_c->rx_next_seq;
+    __u32 exp_seq_last = stream_c->rx_next_seq + stream_c->rx_avail;
     __u32 pkt_seq_first = ev->seq_num;
     __u32 pkt_seq_last = ev->seq_num + ev->data_len;
 
@@ -456,25 +458,25 @@ static __always_inline void verify_trim_data_ep(struct net_event *ev, struct bpf
 }
 
 static __always_inline void detect_ooo_data_ep(struct net_event *ev, struct bpf_tcp_conn *c, struct interm_out *int_out, struct meta_info *data_meta,
-    __u32 cpu, struct bpf_cc *cc) {
+    __u32 cpu, struct bpf_cc *cc, struct bpf_tcp_conn_per_stream *stream_c) {
     
     if(int_out->skip_data_eps) {
         return;
     }
 
-    if ((ev->seq_num != c->rx_next_seq)) {
+    if ((ev->seq_num != stream_c->rx_next_seq)) {
         if (!ev->data_len) {
             int_out->skip_data_eps = true;
             return;
         }
-        if (c->rx_ooo_len == 0) {
-            c->rx_ooo_start = ev->seq_num;
-            c->rx_ooo_len = ev->data_len;
-        } else if (ev->seq_num + ev->data_len == c->rx_ooo_start) {
-            c->rx_ooo_start = ev->seq_num;
-            c->rx_ooo_len += ev->data_len;
-        } else if (c->rx_ooo_start + c->rx_ooo_len == ev->seq_num) {
-            c->rx_ooo_len += ev->data_len;
+        if (stream_c->rx_ooo_len == 0) {
+            stream_c->rx_ooo_start = ev->seq_num;
+            stream_c->rx_ooo_len = ev->data_len;
+        } else if (ev->seq_num + ev->data_len == stream_c->rx_ooo_start) {
+            stream_c->rx_ooo_start = ev->seq_num;
+            stream_c->rx_ooo_len += ev->data_len;
+        } else if (stream_c->rx_ooo_start + stream_c->rx_ooo_len == ev->seq_num) {
+            stream_c->rx_ooo_len += ev->data_len;
         } else {
             // unfortunately, we can't accept this payload
             ev->data_len = 0;
@@ -494,7 +496,7 @@ static __always_inline void detect_ooo_data_ep(struct net_event *ev, struct bpf_
 
 
 static __always_inline void flush_ooo_data_ep(struct net_event *ev, struct bpf_tcp_conn *c, struct interm_out *int_out, struct meta_info *data_meta,
-    __u32 cpu, struct bpf_cc *cc) {
+    __u32 cpu, struct bpf_cc *cc, struct bpf_tcp_conn_per_stream *stream_c) {
     
     // Question: this check is problematic in the client side
     /*if(int_out->skip_data_eps) {
@@ -503,9 +505,9 @@ static __always_inline void flush_ooo_data_ep(struct net_event *ev, struct bpf_t
     __u32 trim_start = 0;
     __u32 trim_end = 0;
 
-    if ((c->rx_remote_avail < ev->rwnd_size << TCP_WND_SCALE)) {
+    if ((stream_c->rx_remote_avail < ev->rwnd_size << TCP_WND_SCALE)) {
         /* update TCP receive window */
-        c->rx_remote_avail = ev->rwnd_size << TCP_WND_SCALE;
+        stream_c->rx_remote_avail = ev->rwnd_size << TCP_WND_SCALE;
     }
     /* update RTT estimate */
     if (ev->data_len && !c->tx_next_ts)
@@ -513,16 +515,16 @@ static __always_inline void flush_ooo_data_ep(struct net_event *ev, struct bpf_t
 
     /* update TCP state if we have payload */
     if (ev->data_len) {
-        c->rx_avail -= ev->data_len;
-        c->rx_next_seq += ev->data_len;
+        stream_c->rx_avail -= ev->data_len;
+        stream_c->rx_next_seq += ev->data_len;
 
         /* handle existing out-of-order segments */
-        if (c->rx_ooo_len) {
+        if (stream_c->rx_ooo_len) {
 
-            __u32 exp_seq_first = c->rx_next_seq;
-            __u32 exp_seq_last = c->rx_next_seq + c->rx_avail;
-            __u32 pkt_seq_first = c->rx_ooo_start;
-            __u32 pkt_seq_last = c->rx_ooo_start + c->rx_ooo_len;
+            __u32 exp_seq_first = stream_c->rx_next_seq;
+            __u32 exp_seq_last = stream_c->rx_next_seq + stream_c->rx_avail;
+            __u32 pkt_seq_first = stream_c->rx_ooo_start;
+            __u32 pkt_seq_last = stream_c->rx_ooo_start + stream_c->rx_ooo_len;
         
             bool valid = seq_in_range(pkt_seq_first, exp_seq_first, exp_seq_last, false) ||
                             seq_in_range(pkt_seq_last, exp_seq_first, exp_seq_last, true) ||
@@ -545,14 +547,14 @@ static __always_inline void flush_ooo_data_ep(struct net_event *ev, struct bpf_t
                     trim_end = pkt_seq_last - exp_seq_last;
                 }
 
-                c->rx_ooo_start += trim_start;
-                c->rx_ooo_len -= trim_start + trim_end;
+                stream_c->rx_ooo_start += trim_start;
+                stream_c->rx_ooo_len -= trim_start + trim_end;
 
                 // accept out-of-order segments
-                if (c->rx_ooo_len && c->rx_ooo_start == c->rx_next_seq) {
-                    c->rx_avail -= c->rx_ooo_len;
-                    c->rx_next_seq += c->rx_ooo_len;
-                    c->rx_ooo_len = 0;
+                if (stream_c->rx_ooo_len && stream_c->rx_ooo_start == stream_c->rx_next_seq) {
+                    stream_c->rx_avail -= stream_c->rx_ooo_len;
+                    stream_c->rx_next_seq += stream_c->rx_ooo_len;
+                    stream_c->rx_ooo_len = 0;
                     // out-of-order segment is processed
                     //data_meta->rx.ooo_bump = OOO_FIN_MASK;
                 }
@@ -566,14 +568,14 @@ static __always_inline void flush_ooo_data_ep(struct net_event *ev, struct bpf_t
 }
 
 static __always_inline void data_net_ep(struct net_event *ev, struct bpf_tcp_conn *c, struct interm_out *int_out, struct meta_info *data_meta,
-    __u32 cpu, struct bpf_cc *cc) {
+    __u32 cpu, struct bpf_cc *cc, struct bpf_tcp_conn_per_stream *stream_c) {
     
-    mtp_add_data_seg_wrapper(ev->data_len, (ev->seq_num - c->recv_init_seq), c, int_out, data_meta);
+    mtp_add_data_seg_wrapper(ev->data_len, (ev->seq_num - stream_c->recv_init_seq), c, int_out, data_meta, stream_c);
 
 }
 
 static __always_inline void send_ack(struct net_event *ev, struct bpf_tcp_conn *c, struct interm_out *int_out, struct meta_info *data_meta,
-    __u32 cpu, struct bpf_cc *cc) {
+    __u32 cpu, struct bpf_cc *cc, struct bpf_tcp_conn_per_stream *stream_c) {
     if(!int_out->trigger_ack) {
         return;
     }
@@ -581,11 +583,11 @@ static __always_inline void send_ack(struct net_event *ev, struct bpf_tcp_conn *
     struct TCPBP bp;
     bp.src_port = c->local_port;
     bp.dest_port = c->remote_port;
-    bp.seq_num = c->tx_next_seq;
+    bp.seq_num = stream_c->tx_next_seq;
     bp.is_ack = 1;
     // TODO: maybe change to rx_next_seq, depending on how we implement the 
-    bp.ack_seq = c->rx_next_seq;
-    bp.rwnd_size = c->rx_avail;
+    bp.ack_seq = stream_c->rx_next_seq;
+    bp.rwnd_size = stream_c->rx_avail;
     bp.ts_opt.desired_tx_ts = ev->timestamp;
 
     // Note: this function will be equivalent to pkt_gen_instruction when the pkt_bp

@@ -69,9 +69,9 @@ static __always_inline void set_tcp_flag(struct tcphdr *tcph, __u16 len, __u16 f
     tcph->cwr = (flags & TCP_FLAG_CWR) ? 1 : 0;
 }
 
-static __always_inline __u32 xsk_budget_avail(const struct bpf_tcp_conn *c)
+static __always_inline __u32 xsk_budget_avail(const struct bpf_tcp_conn_per_stream *stream_c)
 {
-    return c->rx_remote_avail;
+    return stream_c->rx_remote_avail;
 }
 
 /**
@@ -92,10 +92,11 @@ static __always_inline bool seq_in_range(__u32 seq, __u32 start, __u32 end, bool
  *        as long as the pkt seq range has overlap with the receive buffer range,
  *        we consider it as a valid pkt
  */
-static __always_inline int tcp_valid_rxseq_ooo(struct bpf_tcp_conn *c, __u32 seq, __u32 payload_len, __u32 *trim_start, __u32 *trim_end)
+static __always_inline int tcp_valid_rxseq_ooo(struct bpf_tcp_conn *c, __u32 seq, __u32 payload_len, __u32 *trim_start, __u32 *trim_end,
+struct bpf_tcp_conn_per_stream *stream_c)
 {
-    __u32 exp_seq_first = c->rx_next_seq;
-    __u32 exp_seq_last = c->rx_next_seq + c->rx_avail;
+    __u32 exp_seq_first = stream_c->rx_next_seq;
+    __u32 exp_seq_last = stream_c->rx_next_seq + stream_c->rx_avail;
 
     __u32 pkt_seq_first = seq;
     __u32 pkt_seq_last = seq + payload_len;

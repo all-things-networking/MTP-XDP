@@ -898,6 +898,11 @@ void tcp_flow_tx_segmentation_zc(struct app_ctx_per_thread *tctx, struct eTrantc
             struct tcphdr *tcph = reinterpret_cast<struct tcphdr *>(pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
             tcph->source = htons(conn->local_port);
             tcph->dest = htons(conn->remote_port);
+
+            // Stream specification
+            //tcph->urg_ptr = i % 2;
+            //tcph->urg_ptr = 0;
+
             // DMA payload
             pkt += sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + TS_OPT_SIZE;
             uint32_t plen = std::min((uint32_t)TCP_MSS_W_TS, remaining_bytes);

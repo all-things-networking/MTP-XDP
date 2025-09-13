@@ -141,6 +141,42 @@ struct bpf_cc_map_user {
     struct bpf_cc entry[MAX_TCP_FLOWS];
 };
 
+struct bpf_tcp_conn_per_stream {
+
+    struct bpf_spin_lock lock;
+
+    __u32 rx_buf_size;
+    __u32 tx_buf_size;
+
+    /** Bytes available in remote end for received segments */
+    __u32 rx_remote_avail;
+
+    /** Offset in buffer for next segment to be sent */
+    __u32 tx_next_pos;
+
+    // Entries used for sliding window
+    /** Next sequence number expected */
+    __u32 rx_next_seq;          // MTP -> returned by first_unset()
+    /* Start of interval of out-of-order received data */
+    __u32 rx_ooo_start;
+    /* Length of interval of out-of-order received data */
+    __u32 rx_ooo_len;
+
+    // eTran entries used in MTP
+    /** Duplicate ack count */
+    __u16 rx_dupack_cnt;        // MTP -> duplicate_acks
+    /** Sequence number of next segment to be sent */
+    __u32 tx_next_seq;          // MTP -> send_next
+    /** Bytes available for received segments at next position */
+    __u32 rx_avail;             // MTP -> rwnd_size
+
+    // MTP-only entries
+    __u32 send_una;
+    __u32 data_end;
+    __u32 buf_curr_seq;
+    __u32 recv_init_seq;
+} __attribute__((packed, aligned(64)));
+
 // TCP fast path state
 struct bpf_tcp_conn {
 
@@ -160,11 +196,6 @@ struct bpf_tcp_conn {
     __u16 local_port;
     __u16 remote_port;
 
-    __u32 rx_buf_size;
-    __u32 tx_buf_size;
-
-    /** Bytes available in remote end for received segments */
-    __u32 rx_remote_avail;
     /** Offset in buffer to place next segment */
     __u32 rx_next_pos;
 
@@ -173,42 +204,12 @@ struct bpf_tcp_conn {
     /** Number of bytes up to next pos in the buffer that were sent but not
      * acknowledged yet. */
     __u32 tx_sent;
-    /** Offset in buffer for next segment to be sent */
-    __u32 tx_next_pos;
+
     /** Timestamp to echo in next packet */
     __u32 tx_next_ts;
 
     __u32 cc_idx;
     __u8 ecn_enable;
-
-    // Entries used for sliding window
-    /** Next sequence number expected */
-    __u32 rx_next_seq;          // MTP -> returned by first_unset()
-    /* Start of interval of out-of-order received data */
-    __u32 rx_ooo_start;
-    /* Length of interval of out-of-order received data */
-    __u32 rx_ooo_len;
-
-    // eTran entries used in MTP
-    /** Duplicate ack count */
-    __u16 rx_dupack_cnt;        // MTP -> duplicate_acks
-    /** Sequence number of next segment to be sent */
-    __u32 tx_next_seq;          // MTP -> send_next
-    /** Bytes available for received segments at next position */
-    __u32 rx_avail;             // MTP -> rwnd_size
-
-    // MTP-only entries
-    __u8 first_rto;
-    __u32 RTO;
-    __s64 SRTT;
-    __u32 RTTVAR;
-    __u32 last_ack;
-    __u32 rate;
-    __u32 send_una;
-    __u32 data_end;
-    __u32 recv_next;
-    __u32 buf_curr_seq;
-    __u32 recv_init_seq;
 
     // used by XDP_REDIRECT
     // this value is updated when application calls open() or accept()
@@ -221,6 +222,14 @@ struct ebpf_flow_tuple {
     __u32 remote_ip;
     __u16 local_port;
     __u16 remote_port;
+};
+
+struct ebpf_flow_tuple_per_stream {
+    __u32 local_ip;
+    __u32 remote_ip;
+    __u16 local_port;
+    __u16 remote_port;
+    __u8 stream_id;
 };
 
 // 1460 - 12 (Timestamp option)

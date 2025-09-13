@@ -209,6 +209,13 @@ static inline size_t roundup_page(size_t sz)
 
 int eTranTCP::init_ebpf_maps(void)
 {
+    _quic_connection_map_fd = bpf_map__fd(bpf_object__find_map_by_name(xdp_program__bpf_obj(_ebpf.xdp_prog), "bpf_tcp_conn_per_stream_map"));
+    if (_quic_connection_map_fd < 0)
+    {
+        fprintf(stderr, "ERROR: bpf_map__fd failed for quic_connection_map_fd\n");
+        return -1;
+    }
+
     _tcp_connection_map_fd = bpf_map__fd(bpf_object__find_map_by_name(xdp_program__bpf_obj(_ebpf.xdp_prog), "bpf_tcp_conn_map"));
     if (_tcp_connection_map_fd < 0)
     {

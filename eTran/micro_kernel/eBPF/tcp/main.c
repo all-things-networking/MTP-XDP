@@ -157,6 +157,8 @@ int xdp_egress_prog(struct xdp_md *ctx)
     struct tcphdr *tcph;
     struct bpf_tcp_conn *c;
     struct ebpf_flow_tuple key;
+    struct bpf_tcp_conn_per_stream *stream_c;
+    struct ebpf_flow_tuple_per_stream stream_key;
     struct meta_info *data_meta;
 
     if (unlikely(ret = bpf_xdp_adjust_meta(ctx, -(int)sizeof(*data_meta)))) {
@@ -209,8 +211,24 @@ int xdp_egress_prog(struct xdp_md *ctx)
         goto err_pkt;
     }
 
+    stream_key.local_ip = bpf_ntohl(iph->saddr);
+    stream_key.remote_ip = bpf_ntohl(iph->daddr);
+    stream_key.local_port = bpf_ntohs(tcph->source);
+    stream_key.remote_port = bpf_ntohs(tcph->dest);
+    stream_key.stream_id = 0;
+
+    stream_c = bpf_map_lookup_elem(&bpf_tcp_conn_per_stream_map, &stream_key);
+    if (unlikely(!stream_c)) {
+        bpf_printk("stream_c not found XDP egress");
+        bpf_printk("%u %u %u %u %u", stream_key.local_ip, stream_key.remote_ip, stream_key.local_port, stream_key.remote_port, stream_key.stream_id);
+        goto err_pkt;
+    } else {
+        bpf_printk("SUCCESSFUL");
+        bpf_printk("%u %u %u %u %u", stream_key.local_ip, stream_key.remote_ip, stream_key.local_port, stream_key.remote_port, stream_key.stream_id);
+    }
+
     struct TCPBP *bp = NULL;
-    if(!get_pkt_bp_mtp(&key, &bp) || !bp)
+    if(!get_pkt_bp_mtp(&stream_key, &bp) || !bp)
         return XDP_DROP;
 
     // // qid check
@@ -243,7 +261,7 @@ int xdp_egress_prog(struct xdp_md *ctx)
     }
     #endif
 
-    ret = tcp_tx_process(iph, tcph, c, data_meta, data_end, &ev, bp);
+    ret = tcp_tx_process(iph, tcph, c, data_meta, data_end, &ev, bp, stream_c);
 
     if (ret == XDP_DROP) {
         if (data_meta->tx.flag) {
@@ -301,6 +319,9 @@ int xdp_sock_prog(struct xdp_md *ctx)
     struct slow_path_info *sp;
     struct bpf_tcp_conn *c;
     struct ebpf_flow_tuple key;
+
+    struct bpf_tcp_conn_per_stream *stream_c;
+    struct ebpf_flow_tuple_per_stream stream_key;
     
     __u32 qid = ctx->rx_queue_index;
     __u32 pkt_len = ctx->data_end - ctx->data;
@@ -386,6 +407,19 @@ int xdp_sock_prog(struct xdp_md *ctx)
         return XDP_DROP;
     }
 
+    stream_key.local_ip = bpf_ntohl(iph->daddr);
+    stream_key.remote_ip = bpf_ntohl(iph->saddr);
+    stream_key.local_port = bpf_ntohs(tcph->dest);
+    stream_key.remote_port = bpf_ntohs(tcph->source);
+    //stream_key.stream_id = tcph->urg_ptr;
+    stream_key.stream_id = 0;
+
+    stream_c = bpf_map_lookup_elem(&bpf_tcp_conn_per_stream_map, &stream_key);
+    if (unlikely(!stream_c)) {
+        bpf_printk("stream_c not found regular XDP");
+        return XDP_DROP;
+    }
+
     if (prev_conn[cpu] != NULL_CONN && prev_conn[cpu] != c->cc_idx) {
         if (enqueue_prev_ack(cpu)) {
             xdp_log_panic("enqueue_prev_ack failed");
@@ -395,7 +429,7 @@ int xdp_sock_prog(struct xdp_md *ctx)
 
     data_meta->rx.conn = c->opaque_connection;
 
-    ret = tcp_rx_process(tcph, c, pkt_len, data_meta, (iph->tos & IPTOS_ECN_CE) == IPTOS_ECN_CE, cpu, &ev);
+    ret = tcp_rx_process(tcph, c, pkt_len, data_meta, (iph->tos & IPTOS_ECN_CE) == IPTOS_ECN_CE, cpu, &ev, stream_c);
 
     //net_ev_dispatcher(&ev, c, data_meta, cpu);
     

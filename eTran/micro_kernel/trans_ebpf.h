@@ -211,6 +211,8 @@ public:
     static constexpr unsigned int TCP_XDP_EGRESS_IDX = 2;
     static constexpr unsigned int TCP_XDP_GEN_IDX = 3;
 
+    /* per stream connection map */
+    int _quic_connection_map_fd;
     /* connection map */
     int _tcp_connection_map_fd;
     /* congestion control map */

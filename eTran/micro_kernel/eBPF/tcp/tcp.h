@@ -39,6 +39,7 @@ __u16 prev_conn_lp[MAX_CPU];
 __u32 prev_conn_ri[MAX_CPU];
 __u16 prev_conn_rp[MAX_CPU];
 __u8 prev_conn_ece[MAX_CPU];
+__u8 prev_conn_stream_id[MAX_CPU];
 
 /**
  * default value in linux kernel:
@@ -53,6 +54,13 @@ __u8 prev_conn_ece[MAX_CPU];
 #define TCP_OPT_NO_OP 1
 #define TCP_OPT_MSS 2
 #define TCP_OPT_TIMESTAMP 8
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct ebpf_flow_tuple_per_stream);
+    __type(value, struct bpf_tcp_conn_per_stream);
+    __uint(max_entries, MAX_TCP_FLOWS * 2);
+} bpf_tcp_conn_per_stream_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -116,6 +124,7 @@ static __always_inline struct bpf_tcp_ack *dequeue_ack(void)
 static __always_inline int enqueue_prev_ack(__u32 cpu)
 {
     struct ebpf_flow_tuple key;
+    struct ebpf_flow_tuple_per_stream stream_key;
     int ece = 0;
 
     __u32 prod = ack_prod[cpu];
@@ -151,16 +160,30 @@ static __always_inline int enqueue_prev_ack(__u32 cpu)
     ack->local_port = c->local_port;
     ack->remote_port = c->remote_port;
 
-    ack->seq = c->tx_next_seq;
-    ack->ack = c->rx_next_seq;
 
-    ack->rxwnd = min(c->rx_avail >> TCP_WND_SCALE, 0xFFFF);
+    stream_key.local_ip = prev_conn_li[cpu];
+    stream_key.remote_ip = prev_conn_ri[cpu];
+    stream_key.local_port = prev_conn_lp[cpu];
+    stream_key.remote_port = prev_conn_rp[cpu];
+    stream_key.stream_id = prev_conn_stream_id[cpu];
+
+    struct bpf_tcp_conn_per_stream *stream_c = bpf_map_lookup_elem(&bpf_tcp_conn_per_stream_map, &stream_key);
+    if (!stream_c) {
+        return -1;
+    }
+    TCP_LOCK(stream_c);
+
+    ack->seq = stream_c->tx_next_seq;
+    ack->ack = stream_c->rx_next_seq;
+
+    ack->rxwnd = min(stream_c->rx_avail >> TCP_WND_SCALE, 0xFFFF);
     
     ack->ts_val = now;
     ack->ts_ecr = c->tx_next_ts;
     c->tx_next_ts = 0;
 
     TCP_UNLOCK(c);
+    TCP_UNLOCK(stream_c);
 
     ack->ecn_flags = ece ? 1 : 0;
 
@@ -169,17 +192,17 @@ static __always_inline int enqueue_prev_ack(__u32 cpu)
     return 0;
 }
 
-static __always_inline int enqueue_ack(struct bpf_tcp_conn *c, struct bpf_tcp_ack *ack, __u32 cpu, __u32 now, bool ece)
+static __always_inline int enqueue_ack(struct bpf_tcp_conn *c, struct bpf_tcp_ack *ack, __u32 cpu, __u32 now, bool ece, struct bpf_tcp_conn_per_stream *stream_c)
 {
     ack->local_ip = c->local_ip;
     ack->remote_ip = c->remote_ip;
     ack->local_port = c->local_port;
     ack->remote_port = c->remote_port;
 
-    ack->seq = c->tx_next_seq;
-    ack->ack = c->rx_next_seq;
+    ack->seq = stream_c->tx_next_seq;
+    ack->ack = stream_c->rx_next_seq;
 
-    ack->rxwnd = min(c->rx_avail >> TCP_WND_SCALE, 0xFFFF);
+    ack->rxwnd = min(stream_c->rx_avail >> TCP_WND_SCALE, 0xFFFF);
     
     ack->ts_val = now;
     ack->ts_ecr = c->tx_next_ts;
@@ -199,11 +222,12 @@ static __always_inline int enqueue_ack(struct bpf_tcp_conn *c, struct bpf_tcp_ac
 }*/
 
 // Fill TCP header excpet for ports
-static __always_inline void fill_tcp_hdr(struct iphdr *iph, struct tcphdr *tcph, struct bpf_tcp_conn *c, __u32 tgt_ts, void *data_end, __u16 flags)
+static __always_inline void fill_tcp_hdr(struct iphdr *iph, struct tcphdr *tcph, struct bpf_tcp_conn *c, __u32 tgt_ts, void *data_end,
+    __u16 flags, struct bpf_tcp_conn_per_stream *stream_c)
 {
-    __u32 tx_seq = c->tx_next_seq;
-    __u32 rx_wnd = c->rx_avail;
-    __u32 ack_seq = c->rx_next_seq;
+    __u32 tx_seq = stream_c->tx_next_seq;
+    __u32 rx_wnd = stream_c->rx_avail;
+    __u32 ack_seq = stream_c->rx_next_seq;
     __u32 ts_ecr = c->tx_next_ts;
     struct tcp_timestamp_opt *ts_opt = (struct tcp_timestamp_opt *)(tcph + 1);
     if (ts_opt + 1 > data_end) {
@@ -249,24 +273,24 @@ static __always_inline __u64 cc_get_desired_tx_ts(struct bpf_cc *cc, __u64 ref_t
     return desired_tx_ts;
 } 
 
-static __always_inline __u32 fast_retransmit(struct bpf_tcp_conn *c, struct bpf_cc *cc)
+static __always_inline __u32 fast_retransmit(struct bpf_tcp_conn *c, struct bpf_cc *cc, struct bpf_tcp_conn_per_stream *stream_c)
 {
     __u32 go_back_bytes = c->tx_sent;
     __u32 x;
 
     /* reset flow state as if we never transmitted those segments */
-    c->rx_dupack_cnt = 0;
+    stream_c->rx_dupack_cnt = 0;
 
-    c->tx_next_seq -= go_back_bytes;
-    if (c->tx_next_pos >= go_back_bytes) {
-        c->tx_next_pos -= go_back_bytes;
+    stream_c->tx_next_seq -= go_back_bytes;
+    if (stream_c->tx_next_pos >= go_back_bytes) {
+        stream_c->tx_next_pos -= go_back_bytes;
     } else {
-        x = go_back_bytes - c->tx_next_pos;
-        c->tx_next_pos = c->tx_buf_size - x;
+        x = go_back_bytes - stream_c->tx_next_pos;
+        stream_c->tx_next_pos = stream_c->tx_buf_size - x;
     }
 
     c->tx_pending = 0;
-    c->rx_remote_avail += go_back_bytes;
+    stream_c->rx_remote_avail += go_back_bytes;
 
     c->tx_sent = 0;
     cc->txp = 0;
@@ -278,12 +302,12 @@ static __always_inline __u32 fast_retransmit(struct bpf_tcp_conn *c, struct bpf_
 
     cc->cnt_tx_drops++;
 
-    return c->tx_next_pos;
+    return stream_c->tx_next_pos;
 }
 
 // Caller must hold bpf_spin_lock
 static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph, struct bpf_tcp_conn *c, struct meta_info *data_meta, void *data_end,
-    struct app_timer_event *ev, struct TCPBP *bp)
+    struct app_timer_event *ev, struct TCPBP *bp, struct bpf_tcp_conn_per_stream *stream_c)
 {
     __u32 cpu = bpf_get_smp_processor_id();
     if (unlikely(cpu >= MAX_CPU))
@@ -311,26 +335,29 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
     }
 
     TCP_LOCK(c);
+    TCP_LOCK(stream_c);
 
     #ifndef MTP_ON
     /* Timeout packet from slowpath, process it first */
     if (unlikely(data_meta->tx.flag & FLAG_TO)) {
         if (!c->tx_sent) {
             TCP_UNLOCK(c);
+            TCP_UNLOCK(stream_c);
             xdp_egress_log("Timeout but no data to retransmit");
             return XDP_DROP;
         }
-        data_meta->rx.go_back_pos = fast_retransmit(c, cc);
+        data_meta->rx.go_back_pos = fast_retransmit(c, cc, ev->stream_id);
         // prepare to redirect to userspace
         data_meta->rx.qid = POISON_32;
         data_meta->rx.conn = c->opaque_connection;
         data_meta->rx.rx_pos = POISON_32;
         data_meta->rx.poff = POISON_16;
         data_meta->rx.plen = POISON_16;
-        data_meta->rx.xsk_budget_avail = xsk_budget_avail(c);
+        data_meta->rx.xsk_budget_avail = xsk_budget_avail(c, ev->stream_id);
         data_meta->rx.go_back_pos |= RECOVERY_MASK;
         data_meta->rx.ooo_bump = POISON_32;
         TCP_UNLOCK(c);
+        TCP_UNLOCK(stream_c);
         // bpf_printk("Timeout triggers fast retransmission");
         return XDP_PASS; // redirect to userspace
     }
@@ -341,8 +368,8 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
         // if ((c->rx_avail >> TCP_WND_SCALE) == 0 && c->tx_avail == 0)
         if (c->tx_pending == 0)
             wnd_upd = true;
-        c->rx_avail += rx_bump;
-        xdp_egress_log("Rxwnd is updated from %u to %u", min((c->rx_avail - rx_bump) >> TCP_WND_SCALE, 0xFFFF), c->rx_avail);
+        stream_c->rx_avail += rx_bump;
+        xdp_egress_log("Rxwnd is updated from %u to %u", min((stream_c->rx_avail - rx_bump) >> TCP_WND_SCALE, 0xFFFF), stream_c->rx_avail);
     }
 
     /* Pure sync packet from userspace, drop or send a extra window update */
@@ -351,21 +378,24 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
         if (wnd_upd) {
             /* receive buffer freed up from empty, need to send out a window update, if
              * we're not sending anyways. */
-            fill_tcp_hdr(iph, tcph, c, ref_ts, data_end, TCP_FLAG_ACK);
+            fill_tcp_hdr(iph, tcph, c, ref_ts, data_end, TCP_FLAG_ACK, stream_c);
             fill_ip_hdr(iph, 0, false);
             TCP_UNLOCK(c);
+            TCP_UNLOCK(stream_c);
             xdp_egress_log("Rxwnd is updated from empty to %u, send extra ack", min(c->rx_avail >> TCP_WND_SCALE, 0xFFFF));
             return XDP_TX;
         }
         TCP_UNLOCK(c);
+        TCP_UNLOCK(stream_c);
         return XDP_DROP;
     }
 
     // this is probably caused by fast retransmission as we reset the c->tx_next_pos
     // but there are pending packets in the queue, simply drop them
-    if (unlikely(tx_pos != c->tx_next_pos)) {
+    if (unlikely(tx_pos != stream_c->tx_next_pos)) {
         TCP_UNLOCK(c);
-        bpf_printk("tx_pos(%u) != c->tx_next_pos(%u)", tx_pos, c->tx_next_pos);
+        TCP_UNLOCK(stream_c);
+        bpf_printk("tx_pos(%u) != c->tx_next_pos(%u)", tx_pos, stream_c->tx_next_pos);
         // bpf_printk("tx_pos(%u) != c->tx_next_pos(%u)", tx_pos, c->tx_next_pos);
         return XDP_DROP;
     }
@@ -386,15 +416,16 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
     ev->timestamp = ref_ts;
     if(ev->type == APP_EVENT) {
         if(data_meta->tx.tx_pending > 0) { // First packet of batch
-            send_ep(ev, c, &int_out, data_meta, cc, tcph, iph, data_end, bp);
+            send_ep(ev, c, &int_out, data_meta, cc, tcph, iph, data_end, bp, stream_c);
             //bpf_printk("send");
         } else {
-            following_pkts(bp, c, data_meta, cc, tcph, iph, ev->timestamp, data_end);
+            following_pkts(bp, c, data_meta, cc, tcph, iph, ev->timestamp, data_end, stream_c);
             //bpf_printk("following");
         }
     } else if(ev->type == TIMER_EVENT) {
-        int xdp_op = ack_timeout_xdp_ep(ev, c, &int_out, data_meta, cc);
+        int xdp_op = ack_timeout_xdp_ep(ev, c, &int_out, data_meta, cc, stream_c);
         TCP_UNLOCK(c);
+        TCP_UNLOCK(stream_c);
         return xdp_op;
     }
     #else
@@ -414,6 +445,7 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
 
     // /*** NO CC ***/
     // TCP_UNLOCK(c);
+    // TCP_UNLOCK(stream_c);
     // // xdp_egress_log("Always bypass rate limiter");
     // return XDP_TX;
     
@@ -426,7 +458,7 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
 
     #ifdef BYPASS_RL
     #ifdef MTP_ON
-    if ((!nr_pkts_in_tw[cpu] || c->tx_next_seq - c->send_una == payload_len) && desired_tx_ts <= ref_ts) {
+    if ((!nr_pkts_in_tw[cpu] || stream_c->tx_next_seq - stream_c->send_una == payload_len) && desired_tx_ts <= ref_ts) {
         goto bypass_rl;
     }
     #else
@@ -437,6 +469,7 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
     #endif
 
     TCP_UNLOCK(c);
+    TCP_UNLOCK(stream_c);
 
     // bpf_printk("cc->rate(%lu)", cc->rate);
 
@@ -459,6 +492,7 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
 #ifdef BYPASS_RL
 bypass_rl:
     TCP_UNLOCK(c);
+    TCP_UNLOCK(stream_c);
     xdp_egress_log("bypass rate limiter");
     return XDP_TX;
 #endif
@@ -467,10 +501,11 @@ bypass_rl:
 /**
  * @brief Check if the received ACK is valid
  */
-static __always_inline int tcp_valid_rxack(struct bpf_tcp_conn *c, __u32 ack_seq, __u32 *bump)
+static __always_inline int tcp_valid_rxack(struct bpf_tcp_conn *c, __u32 ack_seq, __u32 *bump,
+struct bpf_tcp_conn_per_stream *stream_c)
 {
-    __u32 exp_ack_first = c->tx_next_seq - c->tx_sent;
-    __u32 exp_ack_last = c->tx_next_seq;
+    __u32 exp_ack_first = stream_c->tx_next_seq - c->tx_sent;
+    __u32 exp_ack_last = stream_c->tx_next_seq;
 
     // allow receving ack that we haven't sent yet, this is probably caused by retransmission
     exp_ack_last += c->tx_pending;
@@ -497,10 +532,11 @@ static __always_inline int tcp_valid_rxack(struct bpf_tcp_conn *c, __u32 ack_seq
 /**
  * @brief Check if the received SEQ is valid
  */
-static __always_inline int tcp_valid_rxseq(struct bpf_tcp_conn *c, __u32 seq, __u32 payload_len, __u32 *trim_start, __u32 *trim_end)
+static __always_inline int tcp_valid_rxseq(struct bpf_tcp_conn *c, __u32 seq, __u32 payload_len, __u32 *trim_start, __u32 *trim_end,
+    struct bpf_tcp_conn_per_stream *stream_c)
 {
-    __u32 exp_seq_first = c->rx_next_seq;
-    __u32 exp_seq_last = c->rx_next_seq + c->rx_avail;
+    __u32 exp_seq_first = stream_c->rx_next_seq;
+    __u32 exp_seq_last = stream_c->rx_next_seq + stream_c->rx_avail;
 
     __u32 pkt_seq_first = seq;
     __u32 pkt_seq_last = seq + payload_len;
@@ -556,7 +592,7 @@ static __always_inline int tcp_valid_rxseq(struct bpf_tcp_conn *c, __u32 seq, __
 }
 
 static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_conn *c, __u32 pkt_len, struct meta_info *data_meta, bool ece, __u32 cpu,
-    struct net_event *ev)
+    struct net_event *ev, struct bpf_tcp_conn_per_stream *stream_c)
 {
     bool drop = true;
     #ifndef MTP_ON
@@ -614,25 +650,28 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
     }
 
     TCP_LOCK(c);
+    TCP_LOCK(stream_c);
     
     #ifdef MTP_ON
     struct interm_out int_out;
     ev->timestamp = now;
     if(ev->minor_type == NET_EVENT_ACK) {
         cc->cnt_rx_acks++;
-        fast_retr_rec_ep(ev, c, &int_out, data_meta, cpu, cc);
-        ack_net_ep(ev, c, &int_out, data_meta, cpu, cc);
+        fast_retr_rec_ep(ev, c, &int_out, data_meta, cpu, cc, stream_c);
+        ack_net_ep(ev, c, &int_out, data_meta, cpu, cc, stream_c);
 
         TCP_UNLOCK(c);
+        TCP_UNLOCK(stream_c);
         return int_out.drop ? XDP_DROP : XDP_REDIRECT;
     } else if (ev->minor_type == NET_EVENT_DATA) {
-        verify_trim_data_ep(ev, c, &int_out, data_meta, cpu, cc);
-        detect_ooo_data_ep(ev, c, &int_out, data_meta, cpu, cc);
-        flush_ooo_data_ep(ev, c, &int_out, data_meta, cpu, cc);
-        data_net_ep(ev, c, &int_out, data_meta, cpu, cc);
-        send_ack(ev, c, &int_out, data_meta, cpu, cc);
+        verify_trim_data_ep(ev, c, &int_out, data_meta, cpu, cc, stream_c);
+        detect_ooo_data_ep(ev, c, &int_out, data_meta, cpu, cc, stream_c);
+        flush_ooo_data_ep(ev, c, &int_out, data_meta, cpu, cc, stream_c);
+        data_net_ep(ev, c, &int_out, data_meta, cpu, cc, stream_c);
+        send_ack(ev, c, &int_out, data_meta, cpu, cc, stream_c);
         
         TCP_UNLOCK(c);
+        TCP_UNLOCK(stream_c);
         return int_out.drop ? XDP_DROP : XDP_REDIRECT;
         //goto out;
     }
@@ -641,7 +680,7 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
     if (tcph->ack == 1) {
         // update CC
         cc->cnt_rx_acks++;
-        if (likely(tcp_valid_rxack(c, ack_seq, &tx_bump)) == 0) {
+        if (likely(tcp_valid_rxack(c, ack_seq, &tx_bump, ev->stream_id)) == 0) {
             if (unlikely(tx_bump > c->tx_sent)) {
                 tx_bump = 0;
                 /* this is probably caused by retransmission */
@@ -683,7 +722,7 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
     #ifndef MTP_ON
     #ifdef OOO_RECV
     __u32 trim_start, trim_end;
-    if (unlikely(tcp_valid_rxseq_ooo(c, seq, payload_len, &trim_start, &trim_end))) {
+    if (unlikely(tcp_valid_rxseq_ooo(c, seq, payload_len, &trim_start, &trim_end, stream_c))) {
         trigger_ack = false;
         xdp_log_err("Bad seq");
         goto unlock;
@@ -729,7 +768,7 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
 
     #else
         __u32 trim_start, trim_end;
-        if (unlikely(tcp_valid_rxseq(c, seq, payload_len, &trim_start, &trim_end))) {
+        if (unlikely(tcp_valid_rxseq(c, seq, payload_len, &trim_start, &trim_end, stream_c))) {
             trigger_ack = false;
             xdp_log_err("Bad seq");
             goto unlock;
@@ -787,7 +826,7 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
         
         /* handle existing out-of-order segments */
         if (unlikely(c->rx_ooo_len)) {
-            if (tcp_valid_rxseq_ooo(c, c->rx_ooo_start, c->rx_ooo_len, &trim_start, &trim_end)) {
+            if (tcp_valid_rxseq_ooo(c, c->rx_ooo_start, c->rx_ooo_len, &trim_start, &trim_end, stream_c)) {
                 /* completely superfluous: drop out of order interval */
                 c->rx_ooo_len = 0;
                 data_meta->rx.ooo_bump = OOO_CLEAR_MASK;
@@ -827,10 +866,10 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
 unlock:
 
     /* redirect this packet to userspace */
-    if (likely(rx_bump || tx_bump || go_back_pos || xsk_budget_avail(c)) || clear_ooo) {
+    if (likely(rx_bump || tx_bump || go_back_pos || xsk_budget_avail(c, ev->stream_id)) || clear_ooo) {
         drop = false;
         
-        data_meta->rx.xsk_budget_avail = xsk_budget_avail(c);
+        data_meta->rx.xsk_budget_avail = xsk_budget_avail(c, ev->stream_id);
         xdp_log("xsk_budget_avail(%u)", data_meta->rx.xsk_budget_avail);
         if (tx_bump)
             data_meta->rx.ack_bytes = tx_bump;
@@ -869,14 +908,16 @@ out:
             prev_conn_ri[cpu] = c->remote_ip;
             prev_conn_rp[cpu] = c->remote_port;
             prev_conn_ece[cpu] |= ece;
+            prev_conn_stream_id[cpu] = ev->stream_id;
         }
         #else
         if (likely(cpu < MAX_CPU && ack)) {
-            enqueue_ack(c, ack, cpu, now, ece);
+            enqueue_ack(c, ack, cpu, now, ece, stream_c);
         }
         #endif
     }
     TCP_UNLOCK(c);
+    TCP_UNLOCK(stream_c);
 
     return drop ? XDP_DROP : XDP_REDIRECT;
     //return int_out.drop ? XDP_DROP : XDP_REDIRECT;
