@@ -167,7 +167,6 @@ static __always_inline void send_ep (struct app_timer_event *ev, struct bpf_tcp_
     struct interm_out *int_out, struct meta_info *data_meta, struct bpf_cc *cc, struct tcphdr *tcph,
     struct iphdr *iph, void *data_end, struct TCPBP *bp, struct bpf_tcp_conn_per_stream *stream_c) {
 
-    bpf_printk("SEND_EP");
     stream_c->data_end += ev->data_size;
 
     bp->src_port = c->local_port;

@@ -215,16 +215,13 @@ int xdp_egress_prog(struct xdp_md *ctx)
     stream_key.remote_ip = bpf_ntohl(iph->daddr);
     stream_key.local_port = bpf_ntohs(tcph->source);
     stream_key.remote_port = bpf_ntohs(tcph->dest);
-    stream_key.stream_id = 0;
+    stream_key.stream_id = tcph->urg_ptr;
 
     stream_c = bpf_map_lookup_elem(&bpf_tcp_conn_per_stream_map, &stream_key);
     if (unlikely(!stream_c)) {
         bpf_printk("stream_c not found XDP egress");
         bpf_printk("%u %u %u %u %u", stream_key.local_ip, stream_key.remote_ip, stream_key.local_port, stream_key.remote_port, stream_key.stream_id);
         goto err_pkt;
-    } else {
-        bpf_printk("SUCCESSFUL");
-        bpf_printk("%u %u %u %u %u", stream_key.local_ip, stream_key.remote_ip, stream_key.local_port, stream_key.remote_port, stream_key.stream_id);
     }
 
     struct TCPBP *bp = NULL;

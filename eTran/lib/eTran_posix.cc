@@ -901,7 +901,7 @@ void tcp_flow_tx_segmentation_zc(struct app_ctx_per_thread *tctx, struct eTrantc
 
             // Stream specification
             //tcph->urg_ptr = i % 2;
-            //tcph->urg_ptr = 0;
+            tcph->urg_ptr = 0;
 
             // DMA payload
             pkt += sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + TS_OPT_SIZE;

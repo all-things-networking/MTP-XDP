@@ -229,7 +229,7 @@ struct ebpf_flow_tuple_per_stream {
     __u32 remote_ip;
     __u16 local_port;
     __u16 remote_port;
-    __u8 stream_id;
+    __u32 stream_id;
 };
 
 // 1460 - 12 (Timestamp option)
