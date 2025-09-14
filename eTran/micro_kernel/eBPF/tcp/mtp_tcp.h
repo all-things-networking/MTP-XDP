@@ -8,7 +8,7 @@
 
 // Fill TCP header excpet for ports
 static __always_inline void mtp_fill_tcp_hdr(struct tcphdr *tcph, struct bpf_tcp_conn *c, void *data_end, __u16 flags,
-    struct TCPBP *bp)
+    struct TCPBP *bp, struct bpf_tcp_conn_per_stream *stream_c)
 {
     __u32 tx_seq = bp->seq_num;
     __u32 rx_wnd = bp->rwnd_size;
@@ -32,7 +32,8 @@ static __always_inline void mtp_fill_tcp_hdr(struct tcphdr *tcph, struct bpf_tcp
     ts_opt->ts_ecr = bpf_htonl(ts_ecr);
     
     tcph->window = bpf_htons(rx_wnd) >> TCP_WND_SCALE;
-    tcph->urg_ptr = 0;
+
+    tcph->urg_ptr = (__u16)stream_c->id;
 
     // Newer kernel has supported XDP_TXMD_FLAGS_CHECKSUM, ignore the overhead
     tcph->check = 0;
@@ -47,7 +48,7 @@ static __always_inline void mtp_pkt_gen_wrapper(bool seg_unseg, struct TCPBP *bp
         stream_c->tx_next_pos += min(data_size, TCP_MSS_W_TS);
         if (stream_c->tx_next_pos >= stream_c->tx_buf_size)
             stream_c->tx_next_pos -= stream_c->tx_buf_size;
-        mtp_fill_tcp_hdr(tcph, c, data_end, 0, bp);
+        mtp_fill_tcp_hdr(tcph, c, data_end, 0, bp, stream_c);
         fill_ip_hdr(iph, min(data_size, TCP_MSS_W_TS), c->ecn_enable);
 
         bp->seq_num += min(data_size, TCP_MSS_W_TS);
@@ -78,7 +79,7 @@ static __always_inline void mtp_pkt_gen_wrapper(bool seg_unseg, struct TCPBP *bp
     }
 }
 
-static __always_inline void mtp_pkt_gen_for_xdp_gen(struct TCPBP *bp, struct bpf_tcp_conn *c,  __u32 cpu) {
+static __always_inline void mtp_pkt_gen_for_xdp_gen(struct TCPBP *bp, struct bpf_tcp_conn *c,  __u32 cpu, struct bpf_tcp_conn_per_stream *stream_c) {
     struct bpf_tcp_ack *ack = NULL;
     __u32 prod = ack_prod[cpu];
     __u32 cons = ack_cons[cpu];
@@ -105,6 +106,7 @@ static __always_inline void mtp_pkt_gen_for_xdp_gen(struct TCPBP *bp, struct bpf
     ack->ts_val = bp->ts_opt.desired_tx_ts;
     ack->ts_ecr = c->tx_next_ts;
     c->tx_next_ts = 0;
+    ack->stream_id = stream_c->id;
 
     ack_prod[cpu] = (ack_prod[cpu] + 1) & (NAPI_BATCH_SIZE - 1);
 }
@@ -209,7 +211,7 @@ static __always_inline void following_pkts (struct TCPBP *bp, struct bpf_tcp_con
     if (stream_c->tx_next_pos >= stream_c->tx_buf_size)
         stream_c->tx_next_pos -= stream_c->tx_buf_size;
 
-    mtp_fill_tcp_hdr(tcph, c, data_end, 0, bp);
+    mtp_fill_tcp_hdr(tcph, c, data_end, 0, bp, stream_c);
     fill_ip_hdr(iph, data_meta->tx.plen, c->ecn_enable);
 
     bp->seq_num += data_meta->tx.plen;
@@ -591,5 +593,5 @@ static __always_inline void send_ack(struct net_event *ev, struct bpf_tcp_conn *
 
     // Note: this function will be equivalent to pkt_gen_instruction when the pkt_bp
     // doesn't have data (goes to XDP_GEN)
-    mtp_pkt_gen_for_xdp_gen(&bp, c, cpu);
+    mtp_pkt_gen_for_xdp_gen(&bp, c, cpu, stream_c);
 }

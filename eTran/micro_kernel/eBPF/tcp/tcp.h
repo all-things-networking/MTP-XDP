@@ -246,7 +246,7 @@ static __always_inline void fill_tcp_hdr(struct iphdr *iph, struct tcphdr *tcph,
     ts_opt->ts_ecr = bpf_htonl(ts_ecr);
     
     tcph->window = bpf_htons(rx_wnd) >> TCP_WND_SCALE;
-    tcph->urg_ptr = 0;
+    tcph->urg_ptr = stream_c->id;
 
     // Newer kernel has supported XDP_TXMD_FLAGS_CHECKSUM, ignore the overhead
     tcph->check = 0;

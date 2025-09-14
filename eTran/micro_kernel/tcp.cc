@@ -538,6 +538,14 @@ static int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen)
         return -1;
     }
 
+    struct ebpf_flow_tuple_per_stream key_stream = {0};
+    key_stream.local_ip = c->local_ip;
+    key_stream.remote_ip = c->remote_ip;
+    key_stream.local_port = c->local_port;
+    key_stream.remote_port = c->remote_port;
+    key_stream.stream_id = 0;
+
+    ebpf_c_stream.id = key_stream.stream_id;
     ebpf_c_stream.rx_buf_size = etran_tcp->_trans_params.tcp.rx_buf_size;
     ebpf_c_stream.tx_buf_size = etran_tcp->_trans_params.tcp.tx_buf_size;
     ebpf_c_stream.rx_avail = std::min(etran_tcp->_trans_params.tcp.rx_buf_size, (unsigned int)(0xffff << TCP_WND_SCALE));
@@ -554,13 +562,6 @@ static int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen)
     ebpf_c_stream.buf_curr_seq = listen ? c->local_seq + 1 : c->local_seq;
     ebpf_c_stream.recv_init_seq = c->remote_seq;
 
-    struct ebpf_flow_tuple_per_stream key_stream = {0};
-    key_stream.local_ip = c->local_ip;
-    key_stream.remote_ip = c->remote_ip;
-    key_stream.local_port = c->local_port;
-    key_stream.remote_port = c->remote_port;
-    key_stream.stream_id = 0;
-
     if (bpf_map_update_elem(etran_tcp->_quic_connection_map_fd, &key_stream, &ebpf_c_stream, BPF_ANY))
     {
         fprintf(stderr, "reg_tcp_conn_per_stream_0_ebpf: failed to update ebpf map\n");
@@ -575,7 +576,7 @@ static int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen)
     key_stream2.remote_port = c->remote_port;
     key_stream2.stream_id = 1;
 
-
+    ebpf_c_stream.id = key_stream2.stream_id;
     ebpf_c_stream2.rx_buf_size = etran_tcp->_trans_params.tcp.rx_buf_size;
     ebpf_c_stream2.tx_buf_size = etran_tcp->_trans_params.tcp.tx_buf_size;
     ebpf_c_stream2.rx_avail = std::min(etran_tcp->_trans_params.tcp.rx_buf_size, (unsigned int)(0xffff << TCP_WND_SCALE));

@@ -145,6 +145,8 @@ struct bpf_tcp_conn_per_stream {
 
     struct bpf_spin_lock lock;
 
+    __u32 id;
+
     __u32 rx_buf_size;
     __u32 tx_buf_size;
 

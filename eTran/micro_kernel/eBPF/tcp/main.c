@@ -135,7 +135,7 @@ int xdp_gen_prog(struct xdp_md *ctx)
     tcph->ece = ack->ecn_flags;
     tcph->cwr = 0;
     tcph->window = bpf_htons(ack->rxwnd);
-    tcph->urg_ptr = 0;
+    tcph->urg_ptr = (__u16) ack->stream_id;
     tcph->check = 0;
 
     iph->saddr = bpf_htonl(ack->local_ip);
@@ -409,7 +409,7 @@ int xdp_sock_prog(struct xdp_md *ctx)
     stream_key.local_port = bpf_ntohs(tcph->dest);
     stream_key.remote_port = bpf_ntohs(tcph->source);
     //stream_key.stream_id = tcph->urg_ptr;
-    stream_key.stream_id = 0;
+    stream_key.stream_id = tcph->urg_ptr;
 
     stream_c = bpf_map_lookup_elem(&bpf_tcp_conn_per_stream_map, &stream_key);
     if (unlikely(!stream_c)) {
