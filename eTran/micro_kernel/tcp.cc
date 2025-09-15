@@ -576,7 +576,7 @@ static int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen)
     key_stream2.remote_port = c->remote_port;
     key_stream2.stream_id = 1;
 
-    ebpf_c_stream.id = key_stream2.stream_id;
+    ebpf_c_stream2.id = key_stream2.stream_id;
     ebpf_c_stream2.rx_buf_size = etran_tcp->_trans_params.tcp.rx_buf_size;
     ebpf_c_stream2.tx_buf_size = etran_tcp->_trans_params.tcp.tx_buf_size;
     ebpf_c_stream2.rx_avail = std::min(etran_tcp->_trans_params.tcp.rx_buf_size, (unsigned int)(0xffff << TCP_WND_SCALE));

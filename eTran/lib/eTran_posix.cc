@@ -37,6 +37,8 @@
 #define CQ_LOCK_TRY(qidx) spin_lock_try(tctx->actx->uring[qidx].cq_lock)
 #define CQ_UNLOCK(qidx) spin_unlock(tctx->actx->uring[qidx].cq_lock)
 
+#define NUM_STREAMS 2
+
 // interpose.cc
 extern int (*libc_epoll_create1)(int flags);
 extern int (*libc_epoll_ctl)(int epfd, int op, int fd,
@@ -1004,59 +1006,63 @@ static void tcp_ebpf_sync(struct app_ctx_per_thread *tctx)
 
     while (it != tctx->rx_bump_pending_conns.end())
     {
-        conn = *it;
-        bc = &tctx->iobuffer;
-        // TODO: choose a reasonable queue to avoid HOL blocking
-        qidx = tctx->actx->qid2idx[conn->qid];
-        umem_area = tctx->txrx_xsk_info[qidx]->umem_area;
-        tx = &tctx->txrx_xsk_info[qidx]->tx;
+        for(int i = 0; i < NUM_STREAMS; i++) {
+            conn = *it;
+            bc = &tctx->iobuffer;
+            // TODO: choose a reasonable queue to avoid HOL blocking
+            qidx = tctx->actx->qid2idx[conn->qid];
+            umem_area = tctx->txrx_xsk_info[qidx]->umem_area;
+            tx = &tctx->txrx_xsk_info[qidx]->tx;
 
-        if (xsk_ring_prod__reserve(tx, 1, &idx_tx) < 1)
-        {
-            fprintf(stdout, "#%u(idx:%u) Tx Ring is busy\n", conn->qid, qidx);
-            break;
+            if (xsk_ring_prod__reserve(tx, 1, &idx_tx) < 1)
+            {
+                fprintf(stdout, "#%u(idx:%u) Tx Ring is busy\n", conn->qid, qidx);
+                break;
+            }
+
+            desc = xsk_ring_prod__tx_desc(tx, idx_tx);
+
+            assert(thread_bcache_check(bc, 1) == 1);
+            buffer_addr = thread_bcache_cons(bc);
+            buffer_addr = add_offset_tx_frame(buffer_addr);
+
+            pkt = reinterpret_cast<char *>(xsk_umem__get_data(umem_area, buffer_addr));
+            iph = reinterpret_cast<struct iphdr *>(pkt + sizeof(struct ethhdr));
+            tcph = reinterpret_cast<struct tcphdr *>(pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
+
+            iph->saddr = htonl(conn->local_ip);
+            iph->daddr = htonl(conn->remote_ip);
+            iph->protocol = IPPROTO_TCP;
+
+            tcph->source = htons(conn->local_port);
+            tcph->dest = htons(conn->remote_port);
+
+            tcph->urg_ptr = i;
+
+            // set metadata
+            tcp_txmeta_clear_all(umem_area, buffer_addr);
+            tcp_txmeta_flag(umem_area, buffer_addr, FLAG_SYNC);
+            tcp_txmeta_rxbump(umem_area, buffer_addr, conn->rxb_bump);
+
+            desc->addr = buffer_addr;
+            desc->len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + TS_OPT_SIZE;
+            desc->options = 0;
+
+            xsk_ring_prod__submit(tx, 1);
+            tctx->txrx_xsk_info[qidx]->outstanding++;
+            // ADD_CQ_WORK(qidx, 1);
+
+    #ifdef DEBUG
+            printf("Connection(%p): sync rxb_bump(%u) with ebpf\n", conn, conn->rxb_bump);
+    #endif
+            kick_tx(tctx->txrx_xsk_fd[qidx], tx);
+
         }
-
-        desc = xsk_ring_prod__tx_desc(tx, idx_tx);
-
-        assert(thread_bcache_check(bc, 1) == 1);
-        buffer_addr = thread_bcache_cons(bc);
-        buffer_addr = add_offset_tx_frame(buffer_addr);
-
-        pkt = reinterpret_cast<char *>(xsk_umem__get_data(umem_area, buffer_addr));
-        iph = reinterpret_cast<struct iphdr *>(pkt + sizeof(struct ethhdr));
-        tcph = reinterpret_cast<struct tcphdr *>(pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
-
-        iph->saddr = htonl(conn->local_ip);
-        iph->daddr = htonl(conn->remote_ip);
-        iph->protocol = IPPROTO_TCP;
-
-        tcph->source = htons(conn->local_port);
-        tcph->dest = htons(conn->remote_port);
-
-        // set metadata
-        tcp_txmeta_clear_all(umem_area, buffer_addr);
-        tcp_txmeta_flag(umem_area, buffer_addr, FLAG_SYNC);
-        tcp_txmeta_rxbump(umem_area, buffer_addr, conn->rxb_bump);
-
-        desc->addr = buffer_addr;
-        desc->len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + TS_OPT_SIZE;
-        desc->options = 0;
-
-        xsk_ring_prod__submit(tx, 1);
-        tctx->txrx_xsk_info[qidx]->outstanding++;
-        // ADD_CQ_WORK(qidx, 1);
-
-#ifdef DEBUG
-        printf("Connection(%p): sync rxb_bump(%u) with ebpf\n", conn, conn->rxb_bump);
-#endif
-        kick_tx(tctx->txrx_xsk_fd[qidx], tx);
-
         conn->rxb_bump = 0;
 
-        it = tctx->rx_bump_pending_conns.erase(it);
+            it = tctx->rx_bump_pending_conns.erase(it);
 
-        conn->in_rx_bump_pending = false;
+            conn->in_rx_bump_pending = false;
     }
 }
 

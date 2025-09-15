@@ -215,6 +215,7 @@ int xdp_egress_prog(struct xdp_md *ctx)
     stream_key.remote_ip = bpf_ntohl(iph->daddr);
     stream_key.local_port = bpf_ntohs(tcph->source);
     stream_key.remote_port = bpf_ntohs(tcph->dest);
+    //bpf_printk("XDP egress %u", (__u16) tcph->urg_ptr);
     stream_key.stream_id = tcph->urg_ptr;
 
     stream_c = bpf_map_lookup_elem(&bpf_tcp_conn_per_stream_map, &stream_key);
@@ -408,7 +409,7 @@ int xdp_sock_prog(struct xdp_md *ctx)
     stream_key.remote_ip = bpf_ntohl(iph->saddr);
     stream_key.local_port = bpf_ntohs(tcph->dest);
     stream_key.remote_port = bpf_ntohs(tcph->source);
-    //stream_key.stream_id = tcph->urg_ptr;
+    //bpf_printk("Regular XDP %u", tcph->urg_ptr);
     stream_key.stream_id = tcph->urg_ptr;
 
     stream_c = bpf_map_lookup_elem(&bpf_tcp_conn_per_stream_map, &stream_key);

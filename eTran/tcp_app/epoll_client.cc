@@ -229,13 +229,15 @@ void thread_func(unsigned int tid)
 
         if (nfds) avg_nr_events.store((avg_nr_events.load() + nfds) / 2);
         for (int i = 0; i < nfds; i++) {
+            stream_id = 0;
             if(events[i].events & 1u << 27) {
                 //printf("STREAM ID 0");
-                stream_id = 0;
+                stream_id |= 1u << 0;
                 events[i].events &= ~(1u << 27);
-            } else if(events[i].events & 1u << 26){
+            }
+            if(events[i].events & 1u << 26) {
                 //printf("STREAM ID 1");
-                stream_id = 1;
+                stream_id |= 1u << 1;
                 events[i].events &= ~(1u << 26);
             }
 
