@@ -21,8 +21,8 @@ extern int eTran_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen
 extern int eTran_listen(int sockfd, int backlog);
 extern int eTran_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 extern int eTran_close(int sockfd);
-extern ssize_t eTran_read(int fd, void *buf, size_t count);
-extern ssize_t eTran_write(int fd, const void *buf, size_t count);
+extern ssize_t eTran_read(int fd, void *buf, size_t count, uint32_t stream_id);
+extern ssize_t eTran_write(int fd, const void *buf, size_t count, uint32_t stream_id);
 extern int eTran_setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen);
 extern int eTran_getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen);
 extern int eTran_fcntl(int fd, int cmd, int flags);

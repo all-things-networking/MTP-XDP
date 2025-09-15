@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 #include <assert.h>
 #include <mutex>
+#include <ctime>
 
 #include <iostream>
 #include <thread>
@@ -21,6 +22,7 @@
 
 #define DATA_BLOCK_SIZE 65536
 #define SHORT_RESPONSE_SIZE 100
+#define TIMESTAMP_BYTES 1000
 
 unsigned int max_buf_size = 4096;
 int wait_seconds = 0;
@@ -31,6 +33,9 @@ unsigned int max_outstanding = 1;
 unsigned int nr_flows = 1;
 unsigned int nr_threads = 1;
 unsigned int nr_queues = 1;
+// TODO: change it back to 8000 later
+unsigned int message_bytes_short = 100000; //8000;
+unsigned int message_bytes_long = 1000000;
 unsigned int message_bytes = 100;
 std::string server_ip_str = "192.168.6.2";
 uint16_t server_port = 50000;
@@ -54,42 +59,90 @@ static std::atomic<uint32_t> avg_nr_events(0);
 struct connection {
     int fd;
     unsigned int recv_len;
-    unsigned int pending_bytes;
-    unsigned int total_bytes;
+    unsigned int pending_bytes1;
+    unsigned int pending_bytes2;
+    unsigned int total_bytes1;
+    unsigned int total_bytes2;
+    unsigned int message_bytes1;
+    unsigned int message_bytes2;
+
+    unsigned int arrival_count;
+
+    unsigned int waiting_to_transfer_bytes;
+    unsigned int arrival_bytes;
     //unsigned int message_bytes;
     struct app_event event;
     unsigned int max_outstanding;
-    char *buf;
+    char *buf1;
+    char *buf2;
     bool no_epoll_out;
+    unsigned short curr_buffer_send;
+    unsigned short curr_buffer_receive;
+
+    float start_time;
+    float end_time;
     
-    connection(int fd, unsigned int message_bytes, unsigned int max_outstanding) : fd(fd), /*message_bytes(message_bytes), */max_outstanding(max_outstanding) {
+    connection(int fd, unsigned int message_bytes_long, unsigned int message_bytes_short, unsigned int max_outstanding) : fd(fd), /*message_bytes(message_bytes), */max_outstanding(max_outstanding) {
         no_epoll_out = false;
         recv_len = 0;
-        event.data_size = message_bytes;
-        total_bytes = message_bytes * max_outstanding;
-        pending_bytes = total_bytes;
-        buf = (char *)calloc(1, total_bytes);
+        //event.data_size = message_bytes;
+        message_bytes1 = message_bytes_short;
+        message_bytes2 = message_bytes_long;
+        total_bytes1 = message_bytes_short * max_outstanding;
+        total_bytes2 = message_bytes_long * max_outstanding;
+        pending_bytes1 = total_bytes1;
+        pending_bytes2 = total_bytes2;
+        buf1 = (char *)calloc(1, total_bytes1);
+        buf2 = (char *)calloc(1, total_bytes2);
+        curr_buffer_send = 1;
+        curr_buffer_receive = 1;
+        arrival_count = 0;
+        waiting_to_transfer_bytes = message_bytes_short;
     }
 };
 
 static inline int connection_send(unsigned int tid, struct connection *c)
 {
-    int teste = 0;
     ssize_t ret;
     uint32_t target_bytes;
+    uint32_t write_bytes_with_stream_id;
     int need_epoll_out = 0;
+    /*if(c->pending_bytes1 == c->total_bytes1){
+        c->start_time = time(NULL);
+    }*/
     // Transmit messages as much as possible through this connection until we reach max_outstanding or no buffer space
-    while (c->pending_bytes) {
-        //printf("Send %d %d\n", teste, target_bytes);
-        target_bytes = std::min(c->pending_bytes, c->event.data_size);
-        ret = write(c->fd, c->buf + (c->total_bytes - c->pending_bytes), std::min(target_bytes, (unsigned int)DATA_BLOCK_SIZE));
+    while (c->pending_bytes1/* || c->pending_bytes2*/) {
+        /*if(c->curr_buffer_send == 1){
+            target_bytes = std::min(c->pending_bytes1, c->message_bytes1);
+            ret = write(c->fd, c->buf1 + (c->total_bytes1 - c->pending_bytes1), std::min(target_bytes, (unsigned int)DATA_BLOCK_SIZE));
+        }else{
+            target_bytes = std::min(c->pending_bytes2, c->message_bytes2);
+            ret = write(c->fd, c->buf2 + (c->total_bytes2 - c->pending_bytes2), std::min(target_bytes, (unsigned int)DATA_BLOCK_SIZE));
+        }*/
+        target_bytes = std::min(c->pending_bytes1, c->message_bytes1);
+        write_bytes_with_stream_id = std::min(target_bytes, (unsigned int)DATA_BLOCK_SIZE);
+        write_bytes_with_stream_id |= 1u << 31;
 
-        // Question: I tried making it more general by passing the app_event instead of the data_size,
-        // but the compiler announced an error that write from unistd.h had to receive size_t.
-        // Would this be okay here?
-        //ret = write(c->fd, c->buf + (c->total_bytes - c->pending_bytes), c->event.data_size);
+        ret = write(c->fd, c->buf1 + (c->total_bytes1 - c->pending_bytes1), write_bytes_with_stream_id);
+
         if (ret > 0) {
-            c->pending_bytes -= ret;
+            /*if(c->curr_buffer_send == 1){
+                c->pending_bytes1 -= ret;
+                c->waiting_to_transfer_bytes -= ret;
+                if(c->waiting_to_transfer_bytes <=0){
+                    c->waiting_to_transfer_bytes += c->message_bytes2;//switch to long message
+                    c->curr_buffer_send = 2;
+                }
+            }else{
+                c->pending_bytes2 -= ret;
+                c->waiting_to_transfer_bytes -= ret;
+                if(c->waiting_to_transfer_bytes <=0){
+                    c->waiting_to_transfer_bytes += c->message_bytes1;//switch to short message
+                    c->curr_buffer_send = 1;
+                }
+            }*/
+            c->pending_bytes1 -= ret;
+
             total_req_bytes[tid].fetch_add(ret);
         }
         else {
@@ -97,7 +150,6 @@ static inline int connection_send(unsigned int tid, struct connection *c)
             need_epoll_out = 1;
             break;
         }
-        teste++;
     }
     return need_epoll_out;
 }
@@ -106,12 +158,27 @@ static inline void connection_recv(unsigned int tid, struct connection *c, uint3
 {
     //printf("Receive\n");
     ssize_t ret;
-    bool wait_response = c->pending_bytes + c->event.data_size <= c->total_bytes;
+    bool wait_response = c->pending_bytes1 + c->message_bytes1 <= c->total_bytes1;
+
+    uint32_t target_bytes_with_stream_id;
+
     //printf("%u\n", stream_id);
+
     // Receive messages as much as possible through this connection if there are outstanding messages
     while (wait_response) {
-        uint32_t target_bytes = short_response ? SHORT_RESPONSE_SIZE : message_bytes;
-        ret = read(c->fd, c->buf + c->recv_len, target_bytes);
+        uint32_t target_bytes = short_response ? SHORT_RESPONSE_SIZE : c->message_bytes1;
+
+        target_bytes_with_stream_id = target_bytes;
+        if(stream_id & 1u << 0) {
+            //printf("STREAM 0\n");
+            target_bytes_with_stream_id = target_bytes | 1u << 31;
+        }
+        if(stream_id & 1u << 1) {
+            //printf("STREAM 1\n");
+            target_bytes_with_stream_id = target_bytes | 1u << 30;
+        }        
+
+        ret = read(c->fd, c->buf1 + c->recv_len, target_bytes_with_stream_id);
         if (ret > 0) {
             c->recv_len += ret;
             total_resp_bytes[tid].fetch_add(ret);
@@ -121,7 +188,8 @@ static inline void connection_recv(unsigned int tid, struct connection *c, uint3
         }
         if (c->recv_len >= target_bytes) {
             c->recv_len -= target_bytes;
-            c->pending_bytes += message_bytes;
+            //printf("%u\n", message_bytes);
+            c->pending_bytes1 += c->message_bytes1;
         }
     }
 }
@@ -197,7 +265,7 @@ void thread_func(unsigned int tid)
         }
 
         ev.events = EPOLLIN | EPOLLOUT | EPOLLERR;
-        ev.data.ptr = new connection(fd, message_bytes, max_outstanding);
+        ev.data.ptr = new connection(fd, message_bytes_long, message_bytes_short, max_outstanding);
 
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
             fprintf(stderr, "Failed to add fd to epoll\n");
@@ -368,7 +436,7 @@ int main(int argc, char *argv[])
             total_in += _in;
 
             printf("Throughput In/Out(%.2f/%.2f Gbps)(%.2f Kops) conn#(%lu), avg_nr_events(%u), total_out(%luB), total_in(%luB)\n", 
-                _out * 8.0 / 1e9, _in * 8.0 / 1e9, _out / message_bytes / 1e3,
+                _out * 8.0 / 1e9, _in * 8.0 / 1e9, _out / message_bytes_short / 1e3,
                 conn_fds.size(), avg_nr_events.load(), total_out, total_in);
         }
     }).detach();

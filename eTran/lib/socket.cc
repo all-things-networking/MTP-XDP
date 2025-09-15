@@ -1177,7 +1177,7 @@ out:
     return ret;
 }
 
-ssize_t eTran_read(int fd, void *buf, size_t count)
+ssize_t eTran_read(int fd, void *buf, size_t count, uint32_t stream_id)
 {
     struct eTran_socket_t *s;
     ssize_t ret;
@@ -1234,7 +1234,7 @@ ssize_t eTran_read(int fd, void *buf, size_t count)
     return ret;
 }
 
-ssize_t eTran_write(int fd, const void *buf, size_t count)
+ssize_t eTran_write(int fd, const void *buf, size_t count, uint32_t stream_id)
 {
     struct eTran_socket_t *s;
     ssize_t ret;
