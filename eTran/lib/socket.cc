@@ -9,6 +9,8 @@
 #include <eTran_posix.h>
 #include <eTran_socket.h>
 
+#include "include/mtp_only.h"
+
 extern int (*libc_socket)(int, int, int);
 extern int (*libc_close)(int sockfd);
 extern int (*libc_bind)(int sockfd, const struct sockaddr *addr,
@@ -38,6 +40,7 @@ static __thread struct eTrantcp_event events[256] = {};
 static __thread struct eTranhoma_event homa_events[256] = {};
 
 extern struct app_ctx_per_thread *eTran_get_tctx(void);
+
 
 static inline struct eTran_epoll *lookup_epoll_with_fd(int fd)
 {
@@ -108,7 +111,7 @@ static inline void clear_epoll_events(struct eTran_socket_t *s, uint32_t events)
     socket_unlock(s);
 }
 
-static inline void set_epoll_events(struct eTran_socket_t *s, uint32_t events)
+static inline void set_epoll_events(struct eTran_socket_t *s, uint32_t events, uint32_t stream_id)
 {
     struct eTran_epoll_item *item;
     struct eTran_epoll *ep;
@@ -127,6 +130,8 @@ static inline void set_epoll_events(struct eTran_socket_t *s, uint32_t events)
     for (auto it = s->epoll_items->begin(); it != s->epoll_items->end(); it++)
     {
         item = it->second;
+        if(events == EPOLLIN && stream_id != 666)
+            item->stream_id = stream_id;
         assert(item);
         if (item->interest_events & new_events)
         {
@@ -262,7 +267,7 @@ static int socket_tcp_poll(struct app_ctx_per_thread *tctx, int budget, int time
                    events[i].type == ETRANTCP_EV_CONN_SENDBUF))
         {
             s = events[i].type == ETRANTCP_EV_CONN_RECVED ? events[i].ev.recv.conn->s : events[i].ev.send.conn->s;
-            set_epoll_events(s, events[i].type == ETRANTCP_EV_CONN_RECVED ? EPOLLIN : EPOLLOUT);
+            set_epoll_events(s, events[i].type == ETRANTCP_EV_CONN_RECVED ? EPOLLIN : EPOLLOUT, events[i].ev.recv.stream_id);
             continue;
         }
         /* control path events */
@@ -356,7 +361,7 @@ static int socket_tcp_poll(struct app_ctx_per_thread *tctx, int budget, int time
             }
             // fprintf(stdout,"socket_info:New connection arrives\n");
             socket_unlock(s);
-            set_epoll_events(s, EPOLLIN);
+            set_epoll_events(s, EPOLLIN, 666);
             break;
         case ETRANTCP_EV_LISTEN_ACCEPT:
             fd = events[i].ev.accept.fd;
@@ -408,7 +413,7 @@ static int socket_tcp_poll(struct app_ctx_per_thread *tctx, int budget, int time
             {
                 fprintf(stdout, "socket_info:Connection closed\n");
             }
-            set_epoll_events(s, EPOLLERR | EPOLLHUP);
+            set_epoll_events(s, EPOLLERR | EPOLLHUP, 666);
             break;
         default:
             fprintf(stderr, "socket_info:Unknown event type %d\n", events[i].type);
@@ -1615,6 +1620,9 @@ int eTran_epoll_wait(int epfd, struct epoll_event *events,
             {
                 events[nr_event].data = item->data;
                 events[nr_event].events = item->interest_events & s->epoll_events;
+                events[nr_event].events |= item->stream_id;
+                //events[nr_event].data.u32 = item->stream_id;
+                //printf("Stream id: %u %d\n", stream_id_bitmap[nr_event], nr_event);
                 nr_event++;
             }
             else

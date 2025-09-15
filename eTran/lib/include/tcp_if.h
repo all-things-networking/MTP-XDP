@@ -195,6 +195,7 @@ struct eTrantcp_event {
         struct {
             struct eTrantcp_connection *conn;
             int fd;
+            uint32_t stream_id;
         } recv;
 
         struct {

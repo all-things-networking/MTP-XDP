@@ -102,11 +102,12 @@ static inline int connection_send(unsigned int tid, struct connection *c)
     return need_epoll_out;
 }
 
-static inline void connection_recv(unsigned int tid, struct connection *c)
+static inline void connection_recv(unsigned int tid, struct connection *c, uint32_t stream_id)
 {
     //printf("Receive\n");
     ssize_t ret;
     bool wait_response = c->pending_bytes + c->event.data_size <= c->total_bytes;
+    //printf("%u\n", stream_id);
     // Receive messages as much as possible through this connection if there are outstanding messages
     while (wait_response) {
         uint32_t target_bytes = short_response ? SHORT_RESPONSE_SIZE : message_bytes;
@@ -125,10 +126,10 @@ static inline void connection_recv(unsigned int tid, struct connection *c)
     }
 }
 
-static inline int connection_events(unsigned int tid, struct connection *c, uint32_t events)
+static inline int connection_events(unsigned int tid, struct connection *c, uint32_t events, uint32_t stream_id)
 {   
     if (events & EPOLLIN) {
-        connection_recv(tid, c);
+        connection_recv(tid, c, stream_id);
     }
 
     return connection_send(tid, c);
@@ -221,11 +222,23 @@ void thread_func(unsigned int tid)
 
     sleep(wait_seconds);
 
+    int stream_id = 0;
     while (1) {
 
         int nfds = epoll_wait(epfd, events, 128, -1);
+
         if (nfds) avg_nr_events.store((avg_nr_events.load() + nfds) / 2);
         for (int i = 0; i < nfds; i++) {
+            if(events[i].events & 1u << 27) {
+                //printf("STREAM ID 0");
+                stream_id = 0;
+                events[i].events &= ~(1u << 27);
+            } else if(events[i].events & 1u << 26){
+                //printf("STREAM ID 1");
+                stream_id = 1;
+                events[i].events &= ~(1u << 26);
+            }
+
             c = (connection *)events[i].data.ptr;
             
             if (events[i].events & EPOLLERR || events[i].events & EPOLLHUP) {
@@ -236,8 +249,8 @@ void thread_func(unsigned int tid)
                 close(c->fd);
                 continue;
             }
-            
-            int ret = connection_events(tid, c, events[i].events);
+
+            int ret = connection_events(tid, c, events[i].events, stream_id);
             if (ret == 0 && !c->no_epoll_out) {
                 ev.events = EPOLLIN | EPOLLERR;
                 ev.data.ptr = c;

@@ -62,6 +62,18 @@ static inline void lazy_update_prev_conn_txev(struct eTrantcp_connection *cached
     ret_events[*nr_event].ev.send.conn = cached_conn;
     (*nr_event)++;
 }
+
+static inline uint32_t set_stream_id(uint32_t num, uint32_t stream_id) {
+    uint32_t mask = 0;
+    if(stream_id == 0) {
+        mask = 1u << 27;
+    } else if(stream_id == 1) {
+        mask = 1u << 26;
+    }
+    num |= mask;    // set to 1
+    return num;
+}
+
 /**
  * @brief The basic idea is to reduce the number of events by lazy updating previous connection
  * @param cached_conn cached connection
@@ -70,7 +82,7 @@ static inline void lazy_update_prev_conn_txev(struct eTrantcp_connection *cached
  * @param nr_event number of events
  */
 static inline void lazy_update_prev_conn_rxev(struct eTrantcp_connection *cached_conn, size_t cached_rx_bump,
-                                              struct eTrantcp_event *ret_events, int *nr_event)
+                                              struct eTrantcp_event *ret_events, int *nr_event, uint32_t stream_id)
 {
     if (!cached_rx_bump)
         return;
@@ -192,7 +204,7 @@ static inline bool sync_state(struct app_ctx_per_thread *tctx, struct eTrantcp_c
 }
 
 static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_connection **cached_conn_ptr, size_t *cached_rx_bump, bool *cached_sendbuf_event,
-    struct eTrantcp_event *ret_events, int *nr_event, uint64_t addr, char *pkt, bool last)
+    struct eTrantcp_event *ret_events, int *nr_event, uint64_t addr, char *pkt, bool last, uint32_t *cached_stream_id)
 {
     struct thread_bcache *bc = &tctx->iobuffer;
     struct eTrantcp_connection *cached_conn = *cached_conn_ptr;
@@ -205,6 +217,9 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
     uint32_t rx_pos;
     #endif
 
+    struct tcphdr *tcp = (struct tcphdr *) (pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
+    uint16_t stream_id = tcp->urg_ptr;
+
     if (unlikely((uint64_t)conn == POISON_64 || conn == NULL))
     {
         thread_bcache_prod(bc, addr);
@@ -214,20 +229,27 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
     // it's likely that we are processing the same connection
     if (unlikely(cached_conn != NULL && conn != cached_conn))
     {
-        lazy_update_prev_conn_rxev(cached_conn, *cached_rx_bump, ret_events, nr_event);
+        lazy_update_prev_conn_rxev(cached_conn, *cached_rx_bump, ret_events, nr_event, *cached_stream_id);
         if (*cached_sendbuf_event)
             lazy_update_prev_conn_txev(cached_conn, ret_events, nr_event);
         *cached_conn_ptr = conn;
         cached_conn = conn;
         *cached_rx_bump = 0;
         *cached_sendbuf_event = false;
+        *cached_stream_id = stream_id;
+        ret_events[*nr_event].ev.recv.stream_id = 0;
     }
     else if (unlikely(cached_conn == NULL))
     {
         *cached_conn_ptr = conn;
         cached_conn = conn;
         *cached_rx_bump = 0;
+        ret_events[*nr_event].ev.recv.stream_id = 0;
+
+        *cached_stream_id = stream_id;
     }
+
+    ret_events[*nr_event].ev.recv.stream_id = set_stream_id(ret_events[*nr_event].ev.recv.stream_id, stream_id);
 
     qid = rxmeta_qid(pkt);
     if (unlikely(qid == POISON_32))
@@ -270,6 +292,8 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
         goto out;
     }
 
+    tcp = (struct tcphdr *) (pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
+    stream_id = tcp->urg_ptr;
     #ifdef MTP_ON
     rx_pos = rxmeta_pos(pkt);
     uint32_t start_seq, end_seq;
@@ -311,7 +335,7 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
 out:
     if (unlikely(last)) {
         if (likely(cached_conn && *cached_rx_bump))
-            lazy_update_prev_conn_rxev(cached_conn, *cached_rx_bump, ret_events, nr_event);
+            lazy_update_prev_conn_rxev(cached_conn, *cached_rx_bump, ret_events, nr_event, *cached_stream_id);
 
         if (*cached_sendbuf_event)
             lazy_update_prev_conn_txev(cached_conn, ret_events, nr_event);
@@ -401,6 +425,8 @@ int tcp_nic_poll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *ret_eve
 
     tctx->next_rcv_qidx = (tctx->next_rcv_qidx + 1) % nr_nic_queues;
 
+    uint32_t cached_stream_id = 0;
+
     for (i = 0; i < total_rcvd; i++)
     {
         if (i + 2 < total_rcvd)
@@ -408,7 +434,7 @@ int tcp_nic_poll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *ret_eve
         uint64_t addr = addrs[i];
         char *pkt = pkts[i];
 
-        handle_rx(tctx, &cached_conn, &cached_rx_bump, &cached_sendbuf_event, ret_events, &nr_event, addr, pkt, i == total_rcvd - 1);
+        handle_rx(tctx, &cached_conn, &cached_rx_bump, &cached_sendbuf_event, ret_events, &nr_event, addr, pkt, i == total_rcvd - 1, &cached_stream_id);
     }
 
     while (tctx->cached_fqidx.pop(&qidx) == 0)
@@ -672,6 +698,8 @@ int tcp_nic_poll_epoll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *r
 
     quantum = budget / nfds;
 
+    uint32_t cached_stream_id;
+
     for (j = 0; j < nfds; j++)
     {
         if (unlikely(events[j].data.fd == tctx->evfd))
@@ -707,6 +735,8 @@ int tcp_nic_poll_epoll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *r
         cached_conn = NULL;
         cached_rx_bump = 0;
         cached_sendbuf_event = false;
+
+        cached_stream_id = 0;
         for (i = 0; i < rcvd; i++)
         {
             if (i + 2 < rcvd)
@@ -714,7 +744,7 @@ int tcp_nic_poll_epoll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *r
             uint64_t addr = addrs[i];
             char *pkt = pkts[i];
 
-            handle_rx(tctx, &cached_conn, &cached_rx_bump, &cached_sendbuf_event, ret_events, &nr_event, addr, pkt, i == rcvd - 1); 
+            handle_rx(tctx, &cached_conn, &cached_rx_bump, &cached_sendbuf_event, ret_events, &nr_event, addr, pkt, i == rcvd - 1, &cached_stream_id); 
         }
 
         if (xsk_rxring_empty(rx))

@@ -117,6 +117,8 @@ struct eTran_epoll_item {
 
     epoll_data_t data;
 
+    uint32_t stream_id;
+
     eTran_epoll_item(struct eTran_epoll *epoll, struct eTran_socket_t *socket, epoll_data_t data, uint32_t events) {
         this->epoll = epoll;
         this->socket = socket;
