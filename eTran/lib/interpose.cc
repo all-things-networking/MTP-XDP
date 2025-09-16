@@ -150,13 +150,13 @@ ssize_t read(int fd, void *buf, size_t count)
 {
     uint32_t stream_id = 0;
     if(count & 1u << 31) {
-        //printf("READ STREAM ID 1\n");
+        printf("READ STREAM ID 1\n");
         //stream_id |= 1u << 0;
         stream_id |= (1u << 0);
         count &= ~(1u << 31);
     }
     if(count & 1u << 30) {
-        //printf("STREAM ID 2\n");
+        printf("READ STREAM ID 2\n");
         //stream_id |= 1u << 1;
         stream_id |= (1u << 1);
         count &= ~(1u << 30);
@@ -181,12 +181,12 @@ ssize_t write(int fd, const void *buf, size_t count)
 {
     uint32_t stream_id = 0;
     if(count & 1u << 31) {
-        //printf("WRITE STREAM ID 1\n");
+        printf("WRITE STREAM ID 1\n");
         //stream_id |= 1u << 0;
         stream_id = 1;
         count &= ~(1u << 31);
     } else if(count & 1u << 30) {
-        printf("STREAM ID 2\n");
+        printf("WRITE STREAM ID 2\n");
         //stream_id |= 1u << 1;
         stream_id = 2;
         count &= ~(1u << 30);
@@ -256,10 +256,22 @@ int epoll_create1(int flags)
 
 int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
 {
+    uint32_t stream_id = 0;
+    if(op & 1u << 31) {
+        //printf("EPOLL CTL ID 1\n");
+        //stream_id |= 1u << 0;
+        stream_id = 1;
+        op &= ~(1u << 31);
+    } else if(op & 1u << 30) {
+        //printf("EPOLL CTL ID 2\n");
+        //stream_id |= 1u << 1;
+        stream_id = 2;
+        op &= ~(1u << 30);
+    }
     ensure_init();
     if (unlikely(epfd < 0))
         return -EINVAL;
-    if (eTran_epoll_ctl(epfd, op, fd, event))
+    if (eTran_epoll_ctl(epfd, op, fd, event, stream_id))
         return libc_epoll_ctl(epfd, op, fd, event);
     return 0;
 }

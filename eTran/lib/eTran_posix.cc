@@ -287,7 +287,6 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
         // Timeout packet from slowpath, don't update need_fill!!!
         thread_bcache_prod(bc, addr);
 
-        printf("AQUI\n");
         goto out;
     }
 
@@ -320,7 +319,7 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
         thread_bcache_prod(bc, addr);
         goto out;
     }
-    
+
     stream_id = tcp->urg_ptr;
     #ifdef MTP_ON
     rx_pos = rxmeta_pos(pkt);
@@ -1138,20 +1137,22 @@ static inline void tcp_retransmission(struct app_ctx_per_thread *tctx, uint32_t 
     }
 }
 
-static inline void tcp_free_buffers(struct app_ctx_per_thread *tctx, uint32_t stream_id)
+static inline void tcp_free_buffers(struct app_ctx_per_thread *tctx)
 {
     struct thread_bcache *bc = &tctx->iobuffer;
 
     while (!tctx->free_pending_conns.empty()) {
         auto it = tctx->free_pending_conns.begin();
         struct eTrantcp_connection *conn = *it;
-        tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
-        //printf("TCP_FREE_BUFFERS %u %u\n", stream_id, info->pending_free_bytes);
-        while (info->pending_free_bytes) {
-            auto [addr, plen] = info->unack_tx_addrs.front();
-            info->unack_tx_addrs.pop_front();
-            thread_bcache_prod(bc, addr);
-            info->pending_free_bytes -= plen;
+        for(int stream_id = 1; stream_id < 3; stream_id++) {
+            tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
+            //printf("TCP_FREE_BUFFERS %u %u\n", stream_id, info->pending_free_bytes);
+            while (info->pending_free_bytes) {
+                auto [addr, plen] = info->unack_tx_addrs.front();
+                info->unack_tx_addrs.pop_front();
+                thread_bcache_prod(bc, addr);
+                info->pending_free_bytes -= plen;
+            }
         }
         tctx->free_pending_conns.erase(it);
     }
@@ -1192,9 +1193,10 @@ int eTran_tcp_poll_events(struct app_ctx_per_thread *tctx, struct eTrantcp_event
     /* Note: this function must be called before tcp_retransmission() 
      * since it manipulates conn->unack_tx_addrs
      */
+    
+    tcp_free_buffers(tctx);
+
     for(int i = 1; i < 3; i++) {
-        tcp_free_buffers(tctx, i);
-        
         tcp_retransmission(tctx, i);
     }
 

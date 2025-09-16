@@ -28,7 +28,7 @@ extern int eTran_getsockopt(int sockfd, int level, int optname, void *optval, so
 extern int eTran_fcntl(int fd, int cmd, int flags);
 extern int eTran_epoll_create1(int flags);
 extern int eTran_epoll_ctl(int epfd, int op, int fd,
-    struct epoll_event *event);
+    struct epoll_event *event, uint32_t stream_id);
 extern int eTran_epoll_wait(int epfd, struct epoll_event *events,
     int maxevents, int timeout);
 extern int eTran_select(int nfds, fd_set *readfds, fd_set *writefds,

@@ -31,6 +31,9 @@ unsigned int message_bytes = 100;
 std::string server_ip_str = "192.168.6.2"; // FXIME: this is not used in this test
 uint16_t server_port = 50000;
 
+unsigned int message_bytes_short = 8000; //8000;
+unsigned int message_bytes_long = 1000000;
+
 std::list<std::thread> threads;
 
 uint64_t total_in = 0;
@@ -43,21 +46,37 @@ static std::atomic<uint32_t> avg_nr_events(0);
 
 struct connection {
     int fd;
-    unsigned int pending_bytes;
-    unsigned int message_bytes;
-    unsigned int unsent_bytes;
-    unsigned int response_bytes;
-    uint32_t recv_len;
-    bool has_epoll_out;
-    char *buf;
 
-    connection(int fd, unsigned int message_bytes, bool short_response) : fd(fd), message_bytes(message_bytes) {
+    unsigned int pending_bytes1;
+    unsigned int message_bytes1;
+    unsigned int unsent_bytes1;
+    unsigned int response_bytes1;
+    uint32_t recv_len1;
+    bool has_epoll_out;
+    char *buf1;
+
+    unsigned int pending_bytes2;
+    unsigned int message_bytes2;
+    unsigned int unsent_bytes2;
+    unsigned int response_bytes2;
+    uint32_t recv_len2;
+    char *buf2;
+
+    connection(int fd, unsigned int message_bytes_short, unsigned int message_bytes_long, bool short_response) : fd(fd) {
+        message_bytes1 = message_bytes_short;
         has_epoll_out = 0;
-        pending_bytes = 0;
-        recv_len = 0;
-        unsent_bytes = 0;
-        response_bytes = short_response ? SHORT_RESPONSE_SIZE : message_bytes;
-        buf = (char *)calloc(1, max_buf_size);
+        pending_bytes1 = 0;
+        recv_len1 = 0;
+        unsent_bytes1 = 0;
+        response_bytes1 = short_response ? SHORT_RESPONSE_SIZE : message_bytes;
+        buf1 = (char *)calloc(1, max_buf_size);
+
+        message_bytes2 = message_bytes_long;
+        pending_bytes2 = 0;
+        recv_len2 = 0;
+        unsent_bytes2 = 0;
+        response_bytes2 = short_response ? SHORT_RESPONSE_SIZE : message_bytes;
+        buf2 = (char *)calloc(1, max_buf_size);
     }
 };
 
@@ -82,7 +101,7 @@ static inline int listen_socket(int fd, int epfd, uint32_t events)
                 return 0;
             }
             ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
-            ev.data.ptr = new connection(newfd, message_bytes, short_response);
+            ev.data.ptr = new connection(newfd, message_bytes_short, message_bytes_long, short_response);
             if (epoll_ctl(epfd, EPOLL_CTL_ADD, newfd, &ev)) {
                 fprintf(stderr, "Failed to add newfd to epoll\n");
                 return 0;
@@ -95,25 +114,51 @@ static inline int listen_socket(int fd, int epfd, uint32_t events)
 static inline int connection_send(unsigned int tid, struct connection *c)
 {
     int need_epoll_out = 0;
-    ssize_t ret;
-    uint32_t target_bytes;
+    ssize_t ret1 = 0;
+    ssize_t ret2 = 0;
+    uint32_t target_bytes1 = 0;
+    uint32_t target_bytes2 = 0;
 
-    uint32_t write_bytes_with_stream_id;
+    uint32_t write_bytes_with_stream_id1 = 0;
+    uint32_t write_bytes_with_stream_id2 = 0;
 
-    while (c->pending_bytes) {
-        target_bytes = std::min(c->pending_bytes, c->response_bytes + c->unsent_bytes);
+    bool skip1 = false;
+    bool skip2 = false;
 
-        write_bytes_with_stream_id = std::min(target_bytes, (unsigned int)DATA_BLOCK_SIZE);
-        write_bytes_with_stream_id |= 1u << 31;
+    while (c->pending_bytes1 || c->pending_bytes2) {
 
-        
-        ret = write(c->fd, c->buf, write_bytes_with_stream_id);
-        if (ret > 0) {
-            c->pending_bytes -= ret;
-            total_resp_bytes[tid].fetch_add(ret);
+        if(!skip1) {
+            target_bytes1 = std::min(c->pending_bytes1, c->response_bytes1 + c->unsent_bytes1);
+            write_bytes_with_stream_id1 = std::min(target_bytes1, (unsigned int)DATA_BLOCK_SIZE);
+            write_bytes_with_stream_id1 |= 1u << 31;
+
+            ret1 = write(c->fd, c->buf1, write_bytes_with_stream_id1);
+            if(ret1 == 0)
+                skip1 = true;
+        }
+        if(!skip2) {
+            target_bytes2 = std::min(c->pending_bytes2, c->response_bytes2 + c->unsent_bytes2);
+            write_bytes_with_stream_id2 = std::min(target_bytes2, (unsigned int)DATA_BLOCK_SIZE);
+            write_bytes_with_stream_id2 |= 1u << 30;
+
+            ret2 = write(c->fd, c->buf2, write_bytes_with_stream_id2);
+            if(ret2 == 0)
+                skip2 = true;
+        }
+
+        if (ret1 > 0) {
+            c->pending_bytes1 -= ret1;
+            total_resp_bytes[tid].fetch_add(ret1);
             // accumulate unsent_bytes
-            c->unsent_bytes += target_bytes - ret;
-        } else {
+            c->unsent_bytes1 += target_bytes1 - ret1;
+        }
+        if (ret2 > 0) {
+            c->pending_bytes2 -= ret2;
+            total_resp_bytes[tid].fetch_add(ret2);
+            // accumulate unsent_bytes
+            c->unsent_bytes2 += target_bytes2 - ret2;
+        }
+        if(ret1 == 0 && ret2 == 0) {
             need_epoll_out = 1;
             break;
         }
@@ -123,33 +168,50 @@ static inline int connection_send(unsigned int tid, struct connection *c)
 
 static inline void connection_recv(unsigned int tid, struct connection *c, uint32_t stream_id)
 {
-    ssize_t ret;
-    uint32_t target_bytes_with_stream_id = 0;
+    ssize_t ret1 = 0;
+    uint32_t target_bytes_with_stream_id1 = 0;
 
+    ssize_t ret2 = 0;
+    uint32_t target_bytes_with_stream_id2 = 0;
+
+    uint32_t target_bytes1 = 0;
+    uint32_t target_bytes2 = 0;
     while (1) {
-        uint32_t target_bytes = c->message_bytes - c->recv_len;
-
-        target_bytes_with_stream_id = target_bytes;
         if(stream_id & 1u << 0) {
+            target_bytes1 = c->message_bytes1 - c->recv_len1;
+            target_bytes_with_stream_id1 = target_bytes1;
             //printf("STREAM 1\n");
-            target_bytes_with_stream_id = target_bytes | 1u << 31;
+            target_bytes_with_stream_id1 = target_bytes1 | 1u << 31;
+            ret1 = read(c->fd, c->buf1 + c->recv_len1, target_bytes_with_stream_id1);
         }
         if(stream_id & 1u << 1) {
-            //printf("STREAM 2\n");
-            target_bytes_with_stream_id = target_bytes_with_stream_id | 1u << 30;
+            target_bytes2 = c->message_bytes2 - c->recv_len2;
+            target_bytes_with_stream_id2 = target_bytes2;
+            //printf("STREAM 1\n");
+            target_bytes_with_stream_id2 = target_bytes2 | 1u << 30;
+            ret1 = read(c->fd, c->buf2 + c->recv_len2, target_bytes_with_stream_id2);
         }
-        ret = read(c->fd, c->buf + c->recv_len, target_bytes_with_stream_id);
 
         //printf("Read %lu bytes\n", ret);
-        if (ret > 0) {
-            c->recv_len += ret;
-            total_recv_bytes[tid].fetch_add(ret);
-        } else {
+        if (ret1 > 0) {
+            c->recv_len1 += ret1;
+            total_recv_bytes[tid].fetch_add(ret1);
+        }
+        if (ret2 > 0) {
+            c->recv_len2 += ret2;
+            total_recv_bytes[tid].fetch_add(ret2);
+        }
+        
+        if(ret1 == 0 && ret2 == 0) {     
             break;
         }
-        if (c->recv_len == c->message_bytes) {
-            c->recv_len = 0;
-            c->pending_bytes += c->response_bytes;
+        if (c->recv_len1 == c->message_bytes1) {
+            c->recv_len1 = 0;
+            c->pending_bytes1 += c->response_bytes1;
+        }
+        if (c->recv_len2 == c->message_bytes2) {
+            c->recv_len2 = 0;
+            c->pending_bytes2 += c->response_bytes2;
         }
     }
 }

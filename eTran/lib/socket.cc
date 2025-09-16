@@ -1271,7 +1271,11 @@ ssize_t eTran_write(int fd, const void *buf, size_t count, uint32_t stream_id)
         return -EINVAL;
     }
 
+    printf("HERE 1\n");
+    fflush(stdout);
     ret = conn_send(tctx, s->conn, buf, count, stream_id);
+    printf("HERE 2\n");
+    fflush(stdout);
 
     while (ret == 0 && !(s->flags & SOF_NONBLOCK) && s->status == S_CONN_CONNECTED)
     {
@@ -1279,12 +1283,20 @@ ssize_t eTran_write(int fd, const void *buf, size_t count, uint32_t stream_id)
         ret = conn_send(tctx, s->conn, buf, count, stream_id);
         polled = true;
     }
+    printf("HERE 3\n");
+    fflush(stdout);
 
     if (txb_bytes_avail(s->conn, stream_id) == 0)
         clear_epoll_events(s, EPOLLOUT);
 
+    printf("HERE 4\n");
+    fflush(stdout);
+
     if (!polled)
         socket_tcp_poll(tctx, 64, 0);
+
+    printf("HERE 5\n");
+    fflush(stdout);
 
     return ret;
 }
@@ -1406,7 +1418,7 @@ int eTran_epoll_create1(int flags)
     return epfd;
 }
 
-int eTran_epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
+int eTran_epoll_ctl(int epfd, int op, int fd, struct epoll_event *event, uint32_t stream_id)
 {
     struct eTran_epoll_item *item;
     struct eTran_epoll *ep;
@@ -1525,6 +1537,14 @@ int eTran_epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
 
         // update interest events
         item->interest_events = event->events;
+
+        if(stream_id == 1) {
+            //printf("HERE STREAM_ID 1\n");
+            item->stream_id = 1u << 27;
+        } else if(stream_id == 2) {
+            //printf("HERE STREAM_ID 2\n");
+            item->stream_id = 1u << 26;
+        }
 
         epoll_lock(ep);
         // check if this socket already has the events
