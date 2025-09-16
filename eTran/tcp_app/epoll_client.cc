@@ -110,6 +110,8 @@ static inline int connection_send(unsigned int tid, struct connection *c)
     /*if(c->pending_bytes1 == c->total_bytes1){
         c->start_time = time(NULL);
     }*/
+
+    printf("START SEND\n");
     // Transmit messages as much as possible through this connection until we reach max_outstanding or no buffer space
     while (c->pending_bytes1/* || c->pending_bytes2*/) {
         /*if(c->curr_buffer_send == 1){
@@ -124,6 +126,8 @@ static inline int connection_send(unsigned int tid, struct connection *c)
         write_bytes_with_stream_id |= 1u << 31;
 
         ret = write(c->fd, c->buf1 + (c->total_bytes1 - c->pending_bytes1), write_bytes_with_stream_id);
+
+        printf("SEND %lu %u\n", ret, c->pending_bytes1);
 
         if (ret > 0) {
             /*if(c->curr_buffer_send == 1){
@@ -151,18 +155,18 @@ static inline int connection_send(unsigned int tid, struct connection *c)
             break;
         }
     }
+    printf("END SEND\n\n");
     return need_epoll_out;
 }
 
 static inline void connection_recv(unsigned int tid, struct connection *c, uint32_t stream_id)
 {
-    //printf("Receive\n");
     ssize_t ret;
     bool wait_response = c->pending_bytes1 + c->message_bytes1 <= c->total_bytes1;
 
     uint32_t target_bytes_with_stream_id;
 
-    //printf("%u\n", stream_id);
+    printf("START RECV\n");
 
     // Receive messages as much as possible through this connection if there are outstanding messages
     while (wait_response) {
@@ -175,10 +179,13 @@ static inline void connection_recv(unsigned int tid, struct connection *c, uint3
         }
         if(stream_id & 1u << 1) {
             //printf("STREAM 1\n");
-            target_bytes_with_stream_id = target_bytes | 1u << 30;
-        }        
+            target_bytes_with_stream_id = target_bytes_with_stream_id | 1u << 30;
+        }
+        //target_bytes_with_stream_id = target_bytes | 1u << 31;
 
         ret = read(c->fd, c->buf1 + c->recv_len, target_bytes_with_stream_id);
+
+        printf("RECEIVED %lu %u %u\n", ret, c->pending_bytes1, c->recv_len);
         if (ret > 0) {
             c->recv_len += ret;
             total_resp_bytes[tid].fetch_add(ret);
@@ -188,10 +195,10 @@ static inline void connection_recv(unsigned int tid, struct connection *c, uint3
         }
         if (c->recv_len >= target_bytes) {
             c->recv_len -= target_bytes;
-            //printf("%u\n", message_bytes);
             c->pending_bytes1 += c->message_bytes1;
         }
     }
+    printf("END RECV\n\n");
 }
 
 static inline int connection_events(unsigned int tid, struct connection *c, uint32_t events, uint32_t stream_id)

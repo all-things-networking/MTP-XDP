@@ -150,20 +150,27 @@ ssize_t read(int fd, void *buf, size_t count)
 {
     uint32_t stream_id = 0;
     if(count & 1u << 31) {
-        //printf("READ STREAM ID 0\n");
-        stream_id |= 1u << 0;
+        //printf("READ STREAM ID 1\n");
+        //stream_id |= 1u << 0;
+        stream_id |= (1u << 0);
         count &= ~(1u << 31);
     }
     if(count & 1u << 30) {
-        //printf("STREAM ID 1\n");
-        stream_id |= 1u << 1;
+        //printf("STREAM ID 2\n");
+        //stream_id |= 1u << 1;
+        stream_id |= (1u << 1);
         count &= ~(1u << 30);
     }
     ensure_init();
     ssize_t ret;
     if (unlikely(fd < 0))
         return -EINVAL;
-    ret = eTran_read(fd, buf, count, stream_id);
+    if(stream_id == 3) {
+        ret = eTran_read(fd, buf, count, 1);
+        ret += eTran_read(fd, buf, count, 2);
+    } else {
+        ret = eTran_read(fd, buf, count, stream_id);
+    }
     if (ret < 0) {
         return libc_read(fd, buf, count);
     }
@@ -174,13 +181,14 @@ ssize_t write(int fd, const void *buf, size_t count)
 {
     uint32_t stream_id = 0;
     if(count & 1u << 31) {
-        //printf("WRITE STREAM ID 0\n");
-        stream_id |= 1u << 0;
+        //printf("WRITE STREAM ID 1\n");
+        //stream_id |= 1u << 0;
+        stream_id = 1;
         count &= ~(1u << 31);
-    }
-    if(count & 1u << 30) {
-        //printf("STREAM ID 1\n");
-        stream_id |= 1u << 1;
+    } else if(count & 1u << 30) {
+        printf("STREAM ID 2\n");
+        //stream_id |= 1u << 1;
+        stream_id = 2;
         count &= ~(1u << 30);
     }
 

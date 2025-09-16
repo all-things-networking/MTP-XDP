@@ -67,9 +67,9 @@ static inline void lazy_update_prev_conn_txev(struct eTrantcp_connection *cached
 
 static inline uint32_t set_stream_id(uint32_t num, uint32_t stream_id) {
     uint32_t mask = 0;
-    if(stream_id == 0) {
+    if(stream_id == 1) {
         mask = 1u << 27;
-    } else if(stream_id == 1) {
+    } else if(stream_id == 2) {
         mask = 1u << 26;
     }
     num |= mask;    // set to 1
@@ -86,24 +86,33 @@ static inline uint32_t set_stream_id(uint32_t num, uint32_t stream_id) {
 static inline void lazy_update_prev_conn_rxev(struct eTrantcp_connection *cached_conn, size_t cached_rx_bump,
                                               struct eTrantcp_event *ret_events, int *nr_event, uint32_t stream_id)
 {
+    printf("Stream id %u\n", stream_id);
+    tcp_rxtx_info* info = stream_id == 1? &cached_conn->rxtx1 : &cached_conn->rxtx2;
     if (!cached_rx_bump)
         return;
     ret_events[*nr_event].type = ETRANTCP_EV_CONN_RECVED;
     ret_events[*nr_event].ev.recv.conn = cached_conn;
     (*nr_event)++;
 
+    printf("Updating rxb_used stream %u: %lu\n", stream_id, cached_rx_bump);
+
     // update connection receive buffer
-    cached_conn->rxb_used += cached_rx_bump;
+
+    // TODO: the problem might be here, because we might want to update rxb_used for each
+    // stream, not the cached one
+    info->rxb_used += cached_rx_bump;
 }
 
-static inline void in_order_receive(struct eTrantcp_connection *conn, uint64_t addr, char *pkt)
+static inline void in_order_receive(struct eTrantcp_connection *conn, uint64_t addr, char *pkt, uint32_t stream_id)
 {
-    conn->rx_addrs.push_back({addr, pkt});
+    tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
+    info->rx_addrs.push_back({addr, pkt});
 }
 
-static inline void out_of_order_receive(struct eTrantcp_connection *conn, uint64_t addr, char *pkt)
+static inline void out_of_order_receive(struct eTrantcp_connection *conn, uint64_t addr, char *pkt, uint32_t stream_id)
 {
-    conn->ooo_rx_addrs.push_back({addr, pkt});
+    tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
+    info->ooo_rx_addrs.push_back({addr, pkt});
 }
 
 /**
@@ -118,14 +127,15 @@ static inline void out_of_order_receive(struct eTrantcp_connection *conn, uint64
  * @param to signal from slowpath
  * @return true if we should generate a send event
  */
-static inline bool sync_state(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, char *pkt, bool to)
+static inline bool sync_state(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, char *pkt, bool to, uint32_t stream_id)
 {
     // bool can_continue_send = false;
-    bool send_event = txb_bytes_avail(conn) == 0;
+    tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
+    bool send_event = txb_bytes_avail(conn, stream_id) == 0;
     uint32_t xsk_budget_avail = rxmeta_xskbudget(pkt);
     uint32_t ack_bytes = rxmeta_ackbytes(pkt);
     uint32_t go_back_pos = rxmeta_go_back_pos(pkt);
-    uint32_t old_txb_sent = conn->txb_sent;
+    uint32_t old_txb_sent = info->txb_sent;
     uint32_t go_back_bytes;
 
     if (to)
@@ -135,23 +145,23 @@ static inline bool sync_state(struct app_ctx_per_thread *tctx, struct eTrantcp_c
     }
 
     // Retransmission
-    // reset conn->txb_head and conn->txb_sent
+    // reset info->txb_head and info->txb_sent
     if (unlikely(go_back_pos != POISON_32 && go_back_pos & RECOVERY_MASK))
     {
         go_back_pos &= ~RECOVERY_MASK;
-        if (likely(go_back_pos != conn->txb_head))
+        if (likely(go_back_pos != info->txb_head))
         {
-            if (conn->txb_head > go_back_pos)
+            if (info->txb_head > go_back_pos)
             {
-                go_back_bytes = conn->txb_head - go_back_pos;
+                go_back_bytes = info->txb_head - go_back_pos;
             }
             else
             {
-                go_back_bytes = conn->tx_buf_size - (go_back_pos - conn->txb_head);
+                go_back_bytes = conn->tx_buf_size - (go_back_pos - info->txb_head);
             }
-            conn->txb_head = go_back_pos;
-            conn->txb_allocated += go_back_bytes;
-            conn->txb_sent -= go_back_bytes;
+            info->txb_head = go_back_pos;
+            info->txb_allocated += go_back_bytes;
+            info->txb_sent -= go_back_bytes;
 #ifdef DEBUG
             printf("sync_state: go_back_bytes = %u\n", go_back_bytes);
 #endif
@@ -178,7 +188,7 @@ static inline bool sync_state(struct app_ctx_per_thread *tctx, struct eTrantcp_c
         // can_continue_send |= txb_bytes_avail(conn) >= (TCP_MSS_W_TS << 2);
     }
 
-    if (unlikely(old_txb_sent != conn->txb_sent))
+    if (unlikely(old_txb_sent != info->txb_sent))
     {
         // retransmission happens, it's impossible to ack bytes
         return send_event;
@@ -187,7 +197,7 @@ static inline bool sync_state(struct app_ctx_per_thread *tctx, struct eTrantcp_c
     // ack bytes
     if (ack_bytes != POISON_32 && ack_bytes)
     {
-        conn->txb_sent -= ack_bytes;
+        info->txb_sent -= ack_bytes;
 #ifdef DEBUG
         printf("sync_state: ack_bytes = %u\n", ack_bytes);
 #endif
@@ -197,9 +207,10 @@ static inline bool sync_state(struct app_ctx_per_thread *tctx, struct eTrantcp_c
         // this can help to reduce the number of events
         // can_continue_send |= txb_bytes_avail(conn) >= (TCP_MSS_W_TS << 2);
 
-        if (!conn->pending_free_bytes)
+        if (!info->pending_free_bytes)
             tctx->free_pending_conns.push_back(conn);
-        conn->pending_free_bytes += ack_bytes;
+        info->pending_free_bytes += ack_bytes;
+        //printf("%u %u\n", stream_id,  info->pending_free_bytes);
     }
 
     return send_event;
@@ -219,8 +230,12 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
     uint32_t rx_pos;
     #endif
 
+    tcp_rxtx_info* info;
+
     struct tcphdr *tcp = (struct tcphdr *) (pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
-    uint16_t stream_id = tcp->urg_ptr;
+    uint16_t stream_id = tcp->urg_ptr + 1;
+
+
 
     if (unlikely((uint64_t)conn == POISON_64 || conn == NULL))
     {
@@ -234,6 +249,7 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
         lazy_update_prev_conn_rxev(cached_conn, *cached_rx_bump, ret_events, nr_event, *cached_stream_id);
         if (*cached_sendbuf_event)
             lazy_update_prev_conn_txev(cached_conn, ret_events, nr_event);
+        //ret_events[*nr_event].ev.recv.stream_id = set_stream_id(ret_events[*nr_event].ev.recv.stream_id, *cached_stream_id);
         *cached_conn_ptr = conn;
         cached_conn = conn;
         *cached_rx_bump = 0;
@@ -251,13 +267,20 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
         *cached_stream_id = stream_id;
     }
 
+    info = *cached_stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
+
+    // Which one is correct?
+    printf("%u\n", ret_events[*nr_event].ev.recv.stream_id);
     ret_events[*nr_event].ev.recv.stream_id = set_stream_id(ret_events[*nr_event].ev.recv.stream_id, stream_id);
+    //ret_events[*nr_event].ev.recv.stream_id = set_stream_id(ret_events[*nr_event].ev.recv.stream_id, *cached_stream_id);
+    
+    //printf("%u\n", ret_events[*nr_event].ev.recv.stream_id);
 
     qid = rxmeta_qid(pkt);
     if (unlikely(qid == POISON_32))
     {
         // printf("Receive TO signal from slowpath\n");
-        if (sync_state(tctx, conn, pkt, true))
+        if (sync_state(tctx, conn, pkt, true, *cached_stream_id))
         {
             *cached_sendbuf_event = true;
         }
@@ -268,14 +291,14 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
 
     if (unlikely(qid & FORCE_RX_BUMP_MASK))
     {
-        conn->force_rx_bump = true;
+        info->force_rx_bump = true;
         qid &= ~FORCE_RX_BUMP_MASK;
     }
 
     if (!(tctx->txrx_xsk_info[tctx->actx->qid2idx[qid]]->cached_needfill++))
         tctx->cached_fqidx.push(tctx->actx->qid2idx[qid]);
 
-    if (sync_state(tctx, conn, pkt, false))
+    if (sync_state(tctx, conn, pkt, false, *cached_stream_id))
     {
         *cached_sendbuf_event = true;
     }
@@ -287,7 +310,7 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
     {
         if (unlikely(ooo_bump & OOO_CLEAR_MASK)) {
             /* clear out-of-order segments */
-            conn->ooo_rx_addrs.clear();
+            info->ooo_rx_addrs.clear();
         }
 
         thread_bcache_prod(bc, addr);
@@ -300,7 +323,7 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
     rx_pos = rxmeta_pos(pkt);
     uint32_t start_seq, end_seq;
     parse_packet(pkt, &start_seq, &end_seq, py_len);
-    mtp_add_data_seg_wrapper(tctx, pkt, start_seq, end_seq, py_len, conn, addr, cached_rx_bump, rx_pos);
+    mtp_add_data_seg_wrapper(tctx, pkt, start_seq, end_seq, py_len, conn, addr, cached_rx_bump, rx_pos, *cached_stream_id);
     #else
 
     if (ooo_bump != POISON_32)
@@ -313,8 +336,8 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
             ooo_bump &= ~OOO_FIN_MASK;
             *cached_rx_bump += ooo_bump; // ooo_bump has already included py_len
             /* append ooo_rx_addrs to the tail of rx_addrs */
-            conn->rx_addrs.insert(conn->rx_addrs.end(), conn->ooo_rx_addrs.begin(), conn->ooo_rx_addrs.end());
-            conn->ooo_rx_addrs.clear();
+            info->rx_addrs.insert(info->rx_addrs.end(), info->ooo_rx_addrs.begin(), info->ooo_rx_addrs.end());
+            info->ooo_rx_addrs.clear();
             in_order_receive(conn, addr, pkt);
             // printf("out_of_order_receive fin: rx_bump = %ld\n", *cached_rx_bump);
         }
@@ -336,8 +359,10 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
 
 out:
     if (unlikely(last)) {
-        if (likely(cached_conn && *cached_rx_bump))
+        if (likely(cached_conn && *cached_rx_bump)) {
             lazy_update_prev_conn_rxev(cached_conn, *cached_rx_bump, ret_events, nr_event, *cached_stream_id);
+            //ret_events[*nr_event].ev.recv.stream_id = set_stream_id(ret_events[*nr_event].ev.recv.stream_id, *cached_stream_id);
+        }
 
         if (*cached_sendbuf_event)
             lazy_update_prev_conn_txev(cached_conn, ret_events, nr_event);
@@ -469,14 +494,24 @@ int tcp_nic_poll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *ret_eve
 static inline int connection_prepare_buffer(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *c)
 {
     /* initialize rx buffer pointers */
-    c->rxb_head = 0;
-    c->rxb_used = 0;
-    c->rxb_bump = 0;
+    c->rxtx1.rxb_head = 0;
+    c->rxtx1.rxb_used = 0;
+    c->rxtx1.rxb_bump = 0;
 
     /* initialize tx buffer pointers */
-    c->txb_head = 0;
-    c->txb_sent = 0;
-    c->txb_allocated = 0;
+    c->rxtx1.txb_head = 0;
+    c->rxtx1.txb_sent = 0;
+    c->rxtx1.txb_allocated = 0;
+
+    /* initialize rx buffer pointers */
+    c->rxtx2.rxb_head = 0;
+    c->rxtx2.rxb_used = 0;
+    c->rxtx2.rxb_bump = 0;
+
+    /* initialize tx buffer pointers */
+    c->rxtx2.txb_head = 0;
+    c->rxtx2.txb_sent = 0;
+    c->rxtx2.txb_allocated = 0;
 
     c->xsk_budget = 0xFFFF << TCP_WND_SCALE;
 
@@ -778,12 +813,15 @@ int tcp_nic_poll_epoll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *r
     return nr_event;
 }
 
-size_t tcp_flow_tx_segmentation_zc_retransmission(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, size_t len)
+size_t tcp_flow_tx_segmentation_zc_retransmission(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, size_t len,
+uint32_t stream_id)
 {
     unsigned int qidx;
     struct xsk_ring_prod *tx;
     unsigned int idx_tx = 0;
     size_t actual_len = len;
+
+    tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
 
 #ifdef CONN_AFFINITY
     qidx = tctx->actx->qid2idx[conn->qid];
@@ -800,7 +838,7 @@ size_t tcp_flow_tx_segmentation_zc_retransmission(struct app_ctx_per_thread *tct
     tx = &tctx->txrx_xsk_info[qidx]->tx;
 
     unsigned int total_submit_pkts = 0;
-    auto it = conn->unack_tx_addrs.begin();
+    auto it = info->unack_tx_addrs.begin();
     uint64_t first_pkt_addr = POISON_64;
 
     uint32_t skip_len = 0;
@@ -809,13 +847,13 @@ size_t tcp_flow_tx_segmentation_zc_retransmission(struct app_ctx_per_thread *tct
     {
         if (total_submit_pkts)
             it++;
-        if (it == conn->unack_tx_addrs.end())
+        if (it == info->unack_tx_addrs.end())
             break;
         uint64_t addr = it->first;
         uint32_t plen = it->second;
 
         skip_len += plen;
-        if (skip_len < conn->txb_sent) {
+        if (skip_len < info->txb_sent) {
             it++;
             continue;
         }
@@ -825,8 +863,12 @@ size_t tcp_flow_tx_segmentation_zc_retransmission(struct app_ctx_per_thread *tct
             kick_tx(tctx->txrx_xsk_fd[qidx], tx);
         }
 
+        char *pkt = reinterpret_cast<char *>(xsk_umem__get_data(umem_area, addr));
+        struct tcphdr *tcph = reinterpret_cast<struct tcphdr *>(pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
+        tcph->urg_ptr = stream_id - 1;
+
         tcp_txmeta_clear_all(umem_area, addr);
-        tcp_txmeta_pos(umem_area, addr, conn->txb_head);
+        tcp_txmeta_pos(umem_area, addr, info->txb_head);
         tcp_txmeta_plen(umem_area, addr, plen);
 
         if (unlikely(first_pkt_addr == POISON_64))
@@ -837,10 +879,10 @@ size_t tcp_flow_tx_segmentation_zc_retransmission(struct app_ctx_per_thread *tct
         desc->len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + TS_OPT_SIZE + plen;
         desc->options = 0;
 
-        conn->txb_head += plen;
-        if (conn->txb_head >= conn->tx_buf_size)
+        info->txb_head += plen;
+        if (info->txb_head >= conn->tx_buf_size)
         {
-            conn->txb_head -= conn->tx_buf_size;
+            info->txb_head -= conn->tx_buf_size;
         }
 
         if (len > plen)
@@ -870,8 +912,10 @@ size_t tcp_flow_tx_segmentation_zc_retransmission(struct app_ctx_per_thread *tct
  * @param len the length of data to be transmitted
  * conn->txb_head is updated in this function
  */
-void tcp_flow_tx_segmentation_zc(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, const void *buf, size_t len)
+void tcp_flow_tx_segmentation_zc(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, const void *buf, size_t len,
+    uint32_t stream_id)
 {
+    tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
     unsigned int qidx;
     char *umem_area;
     struct xsk_ring_prod *tx;
@@ -932,8 +976,7 @@ void tcp_flow_tx_segmentation_zc(struct app_ctx_per_thread *tctx, struct eTrantc
             tcph->dest = htons(conn->remote_port);
 
             // Stream specification
-            //tcph->urg_ptr = i % 2;
-            tcph->urg_ptr = 0;
+            tcph->urg_ptr = stream_id - 1;
 
             // DMA payload
             pkt += sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + TS_OPT_SIZE;
@@ -941,7 +984,7 @@ void tcp_flow_tx_segmentation_zc(struct app_ctx_per_thread *tctx, struct eTrantc
 
             // set metadata
             tcp_txmeta_clear_all(umem_area, addr);
-            tcp_txmeta_pos(umem_area, addr, conn->txb_head);
+            tcp_txmeta_pos(umem_area, addr, info->txb_head);
             tcp_txmeta_plen(umem_area, addr, plen);
 
             if (unlikely(first_pkt))
@@ -958,7 +1001,7 @@ void tcp_flow_tx_segmentation_zc(struct app_ctx_per_thread *tctx, struct eTrantc
 
             dma(pkt, (uint8_t *)buf + copy_offset, plen);
 
-            conn->unack_tx_addrs.push_back({addr, plen});
+            info->unack_tx_addrs.push_back({addr, plen});
 
             desc->addr = addr;
             desc->len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + TS_OPT_SIZE + plen;
@@ -968,10 +1011,10 @@ void tcp_flow_tx_segmentation_zc(struct app_ctx_per_thread *tctx, struct eTrantc
 
             copy_offset += plen;
             
-            conn->txb_head += plen;
-            if (conn->txb_head >= conn->tx_buf_size)
+            info->txb_head += plen;
+            if (info->txb_head >= conn->tx_buf_size)
             {
-                conn->txb_head -= conn->tx_buf_size;
+                info->txb_head -= conn->tx_buf_size;
             }
         }
         xsk_ring_prod__submit(tx, batch_nr_buffers);
@@ -1006,8 +1049,9 @@ static void tcp_ebpf_sync(struct app_ctx_per_thread *tctx)
 
     while (it != tctx->rx_bump_pending_conns.end())
     {
+        conn = *it;
         for(int i = 0; i < NUM_STREAMS; i++) {
-            conn = *it;
+            tcp_rxtx_info* info = i + 1 == 1? &conn->rxtx1 : &conn->rxtx2;
             bc = &tctx->iobuffer;
             // TODO: choose a reasonable queue to avoid HOL blocking
             qidx = tctx->actx->qid2idx[conn->qid];
@@ -1042,7 +1086,7 @@ static void tcp_ebpf_sync(struct app_ctx_per_thread *tctx)
             // set metadata
             tcp_txmeta_clear_all(umem_area, buffer_addr);
             tcp_txmeta_flag(umem_area, buffer_addr, FLAG_SYNC);
-            tcp_txmeta_rxbump(umem_area, buffer_addr, conn->rxb_bump);
+            tcp_txmeta_rxbump(umem_area, buffer_addr, info->rxb_bump);
 
             desc->addr = buffer_addr;
             desc->len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + TS_OPT_SIZE;
@@ -1053,16 +1097,16 @@ static void tcp_ebpf_sync(struct app_ctx_per_thread *tctx)
             // ADD_CQ_WORK(qidx, 1);
 
     #ifdef DEBUG
-            printf("Connection(%p): sync rxb_bump(%u) with ebpf\n", conn, conn->rxb_bump);
+            printf("Connection(%p): sync rxb_bump(%u) with ebpf\n", conn, info->rxb_bump);
     #endif
             kick_tx(tctx->txrx_xsk_fd[qidx], tx);
 
+            info->rxb_bump = 0;
+
+            info->in_rx_bump_pending = false;
+
         }
-        conn->rxb_bump = 0;
-
-            it = tctx->rx_bump_pending_conns.erase(it);
-
-            conn->in_rx_bump_pending = false;
+        it = tctx->rx_bump_pending_conns.erase(it);
     }
 }
 
@@ -1070,7 +1114,7 @@ static void tcp_ebpf_sync(struct app_ctx_per_thread *tctx)
  * @brief call eTran_tcp_tx_submit_retransmission() for connections in retransmission_conns
  * @param tctx the per-thread context
  */
-static inline void tcp_retransmission(struct app_ctx_per_thread *tctx)
+static inline void tcp_retransmission(struct app_ctx_per_thread *tctx, uint32_t stream_id)
 {
     if (tctx->retransmission_conns.empty())
         return;
@@ -1079,10 +1123,11 @@ static inline void tcp_retransmission(struct app_ctx_per_thread *tctx)
     while (it != tctx->retransmission_conns.end())
     {
         struct eTrantcp_connection *conn = it->first;
+        tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
         uint32_t len = it->second;
 
-        if (!conn->unack_tx_addrs.empty()) 
-            eTran_tcp_tx_submit_zc_retransmission(tctx, conn, len);
+        if (!info->unack_tx_addrs.empty()) 
+            eTran_tcp_tx_submit_zc_retransmission(tctx, conn, len, stream_id);
 
         // printf("Retransmitting %u bytes for conn (%p)\n", len, conn);
 
@@ -1090,18 +1135,20 @@ static inline void tcp_retransmission(struct app_ctx_per_thread *tctx)
     }
 }
 
-static inline void tcp_free_buffers(struct app_ctx_per_thread *tctx)
+static inline void tcp_free_buffers(struct app_ctx_per_thread *tctx, uint32_t stream_id)
 {
     struct thread_bcache *bc = &tctx->iobuffer;
 
     while (!tctx->free_pending_conns.empty()) {
         auto it = tctx->free_pending_conns.begin();
         struct eTrantcp_connection *conn = *it;
-        while (conn->pending_free_bytes) {
-            auto [addr, plen] = conn->unack_tx_addrs.front();
-            conn->unack_tx_addrs.pop_front();
+        tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
+        //printf("TCP_FREE_BUFFERS %u %u\n", stream_id, info->pending_free_bytes);
+        while (info->pending_free_bytes) {
+            auto [addr, plen] = info->unack_tx_addrs.front();
+            info->unack_tx_addrs.pop_front();
             thread_bcache_prod(bc, addr);
-            conn->pending_free_bytes -= plen;
+            info->pending_free_bytes -= plen;
         }
         tctx->free_pending_conns.erase(it);
     }
@@ -1142,9 +1189,11 @@ int eTran_tcp_poll_events(struct app_ctx_per_thread *tctx, struct eTrantcp_event
     /* Note: this function must be called before tcp_retransmission() 
      * since it manipulates conn->unack_tx_addrs
      */
-    tcp_free_buffers(tctx);
-    
-    tcp_retransmission(tctx);
+    for(int i = 1; i < 3; i++) {
+        tcp_free_buffers(tctx, i);
+        
+        tcp_retransmission(tctx, i);
+    }
 
     return nr_event;
 }

@@ -47,8 +47,8 @@ int eTran_homa_poll_events(struct app_ctx_per_thread *tctx, struct eTranhoma_eve
 int eTran_homa_bind(struct app_ctx_per_thread *tctx, struct eTranhoma_socket *socket, int fd, uint32_t local_ip, uint32_t local_port);
 int eTran_homa_close(struct app_ctx_per_thread *tctx, struct eTranhoma_socket *socket, int fd);
 
-void tcp_flow_tx_segmentation_zc(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, const void *buf, size_t len);
-size_t tcp_flow_tx_segmentation_zc_retransmission(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, size_t len);
+void tcp_flow_tx_segmentation_zc(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, const void *buf, size_t len, uint32_t stream_id);
+size_t tcp_flow_tx_segmentation_zc_retransmission(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, size_t len, uint32_t stream_id);
 
 static inline void dma(void *dst, void *src, size_t len)
 {
@@ -58,17 +58,21 @@ static inline void dma(void *dst, void *src, size_t len)
 /**
  * @brief return how many bytes can be submitted to AF_XDP
  */
-static inline unsigned int xsk_bytes_avail(struct eTrantcp_connection *conn)
+static inline unsigned int xsk_bytes_avail(struct eTrantcp_connection *conn, uint32_t stream_id)
 {
-    return conn->xsk_budget > conn->txb_sent ? conn->xsk_budget - conn->txb_sent : 0;
+    tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
+
+    return conn->xsk_budget > info->txb_sent ? conn->xsk_budget - info->txb_sent : 0;
 }
 
 /**
  * @brief return how many available bytes in the transmit buffer
  */
-static inline size_t txb_bytes_avail(struct eTrantcp_connection *conn)
+static inline size_t txb_bytes_avail(struct eTrantcp_connection *conn, uint32_t stream_id)
 {
-    return std::min(conn->tx_buf_size - conn->txb_sent - conn->txb_allocated, xsk_bytes_avail(conn));
+    tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
+    
+    return std::min(conn->tx_buf_size - info->txb_sent - info->txb_allocated, xsk_bytes_avail(conn, stream_id));
 }
 
 /**
@@ -79,63 +83,75 @@ static inline size_t txb_bytes_avail(struct eTrantcp_connection *conn)
  * @param len the length of data to be submitted
  * @return 0 on success, -EINVAL on failure
  */
-static inline int eTran_tcp_tx_submit_zc(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, const void *buf, size_t len)
+static inline int eTran_tcp_tx_submit_zc(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, const void *buf,
+    size_t len, uint32_t stream_id)
 {
+    tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
+
     if (unlikely(conn->status != CONN_OPEN))
     {
         fprintf(stderr, "eTran_tcp_tx_submit_zc(): conn->status != CONN_OPEN\n");
         return -EINVAL;
     }
 
-    if (unlikely(conn->txb_allocated < len))
+    if (unlikely(info->txb_allocated < len))
     {
-        fprintf(stderr, "eTran_tcp_tx_submit_zc(): (%p), txb_allocated(%u) < len(%lu)\n", conn, conn->txb_allocated, len);
+        fprintf(stderr, "eTran_tcp_tx_submit_zc(): (%p), txb_allocated(%u) < len(%lu)\n", conn, info->txb_allocated, len);
         return -EINVAL;
     }
 
-    tcp_flow_tx_segmentation_zc(tctx, conn, buf, len);
+    tcp_flow_tx_segmentation_zc(tctx, conn, buf, len, stream_id);
 
-    conn->txb_allocated -= len;
-    conn->txb_sent += len;
+    info->txb_allocated -= len;
+    info->txb_sent += len;
 
     return 0;
 }
 
-static inline int eTran_tcp_tx_submit_zc_retransmission(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, size_t len)
+static inline int eTran_tcp_tx_submit_zc_retransmission(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, size_t len,
+    uint32_t stream_id)
 {
+    tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
+
     if (unlikely(conn->status != CONN_OPEN))
     {
         fprintf(stderr, "eTran_tcp_tx_submit_zc_retransmission(): conn->status != CONN_OPEN\n");
         return -EINVAL;
     }
 
-    len = tcp_flow_tx_segmentation_zc_retransmission(tctx, conn, len);
+    len = tcp_flow_tx_segmentation_zc_retransmission(tctx, conn, len, stream_id);
 
-    conn->txb_allocated -= len;
-    conn->txb_sent += len;
+    info->txb_allocated -= len;
+    info->txb_sent += len;
 
     return 0;
 }
 
-static inline ssize_t eTran_tcp_rx_peek_count_zc(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, size_t count, void *buf)
+static inline ssize_t eTran_tcp_rx_peek_count_zc(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, size_t count,
+    void *buf, uint32_t stream_id)
 {
+    tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
+
     uint32_t copy_offset = 0;
-    if (conn->rxb_used == 0) {
+
+    if (info->rxb_used == 0) {
+        printf("RXB_USED == 0, %u\n", stream_id);
         return 0;
     }
 
-    if (count > conn->rxb_used) {
-        count = conn->rxb_used;
+    if (count > info->rxb_used) {
+        count = info->rxb_used;
     }
 
-    if (conn->rxb_head + count > conn->rx_buf_size) {
+    if (info->rxb_head + count > conn->rx_buf_size) {
         // valid range [conn->rxb_head, conn->rx_buf_size), [0, conn->rxb_head + count - conn->rx_buf_size)
-        for (auto it = conn->rx_addrs.begin(); it != conn->rx_addrs.end();) {
+        for (auto it = info->rx_addrs.begin(); it != info->rx_addrs.end();) {
+            
             auto [addr, pkt] = *it;
             uint16_t py_len = rxmeta_plen(pkt);
             uint16_t py_off = rxmeta_poff(pkt);
             uint32_t rx_pos = rxmeta_pos(pkt);
-            if (rx_pos >= conn->rxb_head || rx_pos < conn->rxb_head + count - conn->rx_buf_size) {
+            if (rx_pos >= info->rxb_head || rx_pos < info->rxb_head + count - conn->rx_buf_size) {
                 auto append_len = std::min((size_t)py_len, count - copy_offset);
                 dma((uint8_t *)buf + copy_offset, pkt + py_off, append_len);
                 copy_offset += append_len;
@@ -143,7 +159,7 @@ static inline ssize_t eTran_tcp_rx_peek_count_zc(struct app_ctx_per_thread *tctx
                 if (likely(append_len == py_len)) {
                     thread_bcache_prod(&tctx->iobuffer, addr);
                     // remove from rx_addrs
-                    it = conn->rx_addrs.erase(it);
+                    it = info->rx_addrs.erase(it);
                 } else {
                     /* truncate packet */
                     rxmeta_set_poff(pkt, py_off + append_len);
@@ -163,12 +179,12 @@ static inline ssize_t eTran_tcp_rx_peek_count_zc(struct app_ctx_per_thread *tctx
         
     } else {
         // valid range [conn->rxb_head, conn->rxb_head + count)
-        for (auto it = conn->rx_addrs.begin(); it != conn->rx_addrs.end();) {
+        for (auto it = info->rx_addrs.begin(); it != info->rx_addrs.end();) {
             auto [addr, pkt] = *it;
             uint16_t py_len = rxmeta_plen(pkt);
             uint16_t py_off = rxmeta_poff(pkt);
             uint32_t rx_pos = rxmeta_pos(pkt);
-            if (rx_pos >= conn->rxb_head && rx_pos < conn->rxb_head + count) {
+            if (rx_pos >= info->rxb_head && rx_pos < info->rxb_head + count) {
                 auto append_len = std::min((size_t)py_len, count - copy_offset);
                 dma((uint8_t *)buf + copy_offset, pkt + py_off, append_len);
                 copy_offset += append_len;
@@ -176,7 +192,7 @@ static inline ssize_t eTran_tcp_rx_peek_count_zc(struct app_ctx_per_thread *tctx
                 if (likely(append_len == py_len)) {
                     thread_bcache_prod(&tctx->iobuffer, addr);
                     // remove from rx_addrs
-                    it = conn->rx_addrs.erase(it);
+                    it = info->rx_addrs.erase(it);
                 } else {
                     /* truncate packet */
                     rxmeta_set_poff(pkt, py_off + append_len);
@@ -205,30 +221,32 @@ static inline ssize_t eTran_tcp_rx_peek_count_zc(struct app_ctx_per_thread *tctx
  * @param len the length of data to be released
  * @return 0 on success, -EINVAL on failure
  */
-static inline int eTran_tcp_rx_release(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, size_t len)
+static inline int eTran_tcp_rx_release(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, size_t len, uint32_t stream_id)
 {
-    if (conn->rxb_used < len)
+    tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
+
+    if (info->rxb_used < len)
     {
         fprintf(stderr, "eTran_tcp_submit_rx(): conn->rxb_used < len\n");
         return -EINVAL;
     }
 
-    conn->rxb_used -= len;
-    conn->rxb_bump += len;
+    info->rxb_used -= len;
+    info->rxb_bump += len;
 
-    conn->rxb_head += len;
-    if (conn->rxb_head > conn->rx_buf_size) {
-        conn->rxb_head -= conn->rx_buf_size;
+    info->rxb_head += len;
+    if (info->rxb_head > conn->rx_buf_size) {
+        info->rxb_head -= conn->rx_buf_size;
     }
 
-    if (unlikely((conn->rxb_bump > std::min(std::min(conn->rx_buf_size >> 2, ((unsigned int)0xFFFF) << TCP_WND_SCALE), (unsigned int)32768) || conn->force_rx_bump) 
-        && !conn->in_rx_bump_pending))
+    if (unlikely((info->rxb_bump > std::min(std::min(conn->rx_buf_size >> 2, ((unsigned int)0xFFFF) << TCP_WND_SCALE), (unsigned int)32768) || info->force_rx_bump) 
+        && !info->in_rx_bump_pending))
     {
         tctx->rx_bump_pending_conns.push_back(conn);
-        conn->in_rx_bump_pending = true;
+        info->in_rx_bump_pending = true;
     }
 
-    conn->force_rx_bump = false;
+    info->force_rx_bump = false;
 
     return 0;
 }
@@ -236,9 +254,9 @@ static inline int eTran_tcp_rx_release(struct app_ctx_per_thread *tctx, struct e
 /**
  * @brief get the amount of data that can be transmitted in the connection's tx buffer
  */
-static inline ssize_t eTran_tcp_tx_avail(struct eTrantcp_connection *conn)
+static inline ssize_t eTran_tcp_tx_avail(struct eTrantcp_connection *conn, uint32_t stream_id)
 {
-    return txb_bytes_avail(conn);
+    return txb_bytes_avail(conn, stream_id);
 }
 
 /**
@@ -248,8 +266,11 @@ static inline ssize_t eTran_tcp_tx_avail(struct eTrantcp_connection *conn)
  * @param reserve_len the length of data to be reserved
  * @return the length of data reserved on success, -EINVAL on failure
  */
-static inline ssize_t eTran_tcp_tx_reserve_zc(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, size_t reserve_len)
+static inline ssize_t eTran_tcp_tx_reserve_zc(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, size_t reserve_len,
+    uint32_t stream_id)
 {
+    tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
+
     uint32_t avail;
     uint32_t head;
 
@@ -259,21 +280,21 @@ static inline ssize_t eTran_tcp_tx_reserve_zc(struct app_ctx_per_thread *tctx, s
         return -EINVAL;
     }
 
-    avail = txb_bytes_avail(conn);
+    avail = txb_bytes_avail(conn, stream_id);
     if (avail < reserve_len)
     {
         reserve_len = avail;
     }
 
     // get current head of tx buffer
-    head = conn->txb_head + conn->txb_allocated;
+    head = info->txb_head + info->txb_allocated;
 
     if (head >= conn->tx_buf_size)
     {
         head -= conn->tx_buf_size;
     }
 
-    conn->txb_allocated += reserve_len;
+    info->txb_allocated += reserve_len;
 
     return reserve_len;
 }
@@ -388,30 +409,32 @@ static inline int notify_kernel_tcp_conn_close(struct app_ctx_per_thread *tctx, 
     return 0;
 }
 
-static inline ssize_t conn_recv(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, void *buf, size_t count)
+static inline ssize_t conn_recv(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, void *buf,
+    size_t count, uint32_t stream_id)
 {
     ssize_t ret;
 
-    ret = eTran_tcp_rx_peek_count_zc(tctx, conn, count, buf);
+    ret = eTran_tcp_rx_peek_count_zc(tctx, conn, count, buf, stream_id);
 
     if (ret <= 0)
         return ret;
 
-    eTran_tcp_rx_release(tctx, conn, ret);
+    eTran_tcp_rx_release(tctx, conn, ret, stream_id);
 
     return ret;
 }
 
-static inline ssize_t conn_send(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, const void *buf, size_t count)
+static inline ssize_t conn_send(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, const void *buf,
+    size_t count, uint32_t stream_id)
 {
     ssize_t ret;
 
-    ret = eTran_tcp_tx_reserve_zc(tctx, conn, count);
+    ret = eTran_tcp_tx_reserve_zc(tctx, conn, count, stream_id);
 
     if (ret <= 0)
         return ret;    
 
-    eTran_tcp_tx_submit_zc(tctx, conn, buf, ret);
+    eTran_tcp_tx_submit_zc(tctx, conn, buf, ret, stream_id);
 
     return ret;
 }

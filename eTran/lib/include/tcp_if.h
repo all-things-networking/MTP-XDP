@@ -64,9 +64,7 @@ enum conn_status {
   CONN_CLOSE_REQUESTED,
 };
 
-struct eTrantcp_connection {
-    
-    /** pointer to next new byte to be received */
+struct tcp_rxtx_info{
     uint32_t rxb_head;
     /** number of received but not yet freed bytes (behind head). */
     uint32_t rxb_used;
@@ -79,6 +77,34 @@ struct eTrantcp_connection {
     uint32_t txb_sent;
     /** number of allocated but not yet sent bytes (after head) */
     uint32_t txb_allocated;
+
+    uint32_t pending_free_bytes;
+
+    std::list<std::pair<uint64_t, uint32_t> > unack_tx_addrs;
+
+    std::list<std::pair<uint64_t, char *> > rx_addrs;
+    std::list<std::pair<uint64_t, char *> > ooo_rx_addrs;
+
+    bool in_rx_bump_pending;
+
+    bool force_rx_bump;
+
+    tcp_rxtx_info(){
+        rxb_head = 0;
+        rxb_used = 0;
+        rxb_bump = 0;
+        txb_head = 0;
+        txb_sent = 0;
+        txb_allocated = 0;
+        in_rx_bump_pending = false;
+        force_rx_bump = false;
+    }
+};
+
+struct eTrantcp_connection {
+    
+    tcp_rxtx_info rxtx1;
+    tcp_rxtx_info rxtx2;
 
     uint32_t local_ip;
     uint32_t remote_ip;
@@ -95,16 +121,6 @@ struct eTrantcp_connection {
 
     enum conn_status status;
 
-    uint32_t pending_free_bytes;
-
-    std::list<std::pair<uint64_t, uint32_t> > unack_tx_addrs;
-
-    std::list<std::pair<uint64_t, char *> > rx_addrs;
-    std::list<std::pair<uint64_t, char *> > ooo_rx_addrs;
-
-    bool in_rx_bump_pending;
-
-    bool force_rx_bump;
 
     // socket
     struct eTran_socket_t *s;
@@ -112,12 +128,7 @@ struct eTrantcp_connection {
     bool try_accept_done;
 
     eTrantcp_connection() {
-        rxb_head = 0;
-        rxb_used = 0;
-        rxb_bump = 0;
-        txb_head = 0;
-        txb_sent = 0;
-        txb_allocated = 0;
+
         local_ip = 0;
         remote_ip = 0;
         local_port = 0;
@@ -127,8 +138,6 @@ struct eTrantcp_connection {
         xsk_budget = 0;
         qid = 0;
         status = CONN_CLOSED;
-        in_rx_bump_pending = false;
-        force_rx_bump = false;
         s = nullptr;
         try_accept_done = false;
     }

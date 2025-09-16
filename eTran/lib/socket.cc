@@ -261,6 +261,13 @@ static int socket_tcp_poll(struct app_ctx_per_thread *tctx, int budget, int time
         return -1;
     }
 
+    /*int nr_events = eTran_tcp_poll_events(tctx, events, budget, timeout, 1);
+    if (nr_events < 0)
+    {
+        fprintf(stderr, "socket_info:Failed to eTran_tcp_poll_events\n");
+        return -1;
+    }*/
+
     for (int i = 0; i < nr_events; i++)
     {
         if (likely(events[i].type == ETRANTCP_EV_CONN_RECVED ||
@@ -1214,16 +1221,17 @@ ssize_t eTran_read(int fd, void *buf, size_t count, uint32_t stream_id)
         return -EINVAL;
     }
 
-    ret = conn_recv(tctx, s->conn, buf, count);
+    ret = conn_recv(tctx, s->conn, buf, count, stream_id);
 
     while (ret == 0 && !(s->flags & SOF_NONBLOCK) && s->status == S_CONN_CONNECTED)
     {
         socket_tcp_poll(tctx, 64, -1);
-        ret = conn_recv(tctx, s->conn, buf, count);
+        ret = conn_recv(tctx, s->conn, buf, count, stream_id);
         polled = true;
     }
+    tcp_rxtx_info* info = stream_id == 1? &s->conn->rxtx1 : &s->conn->rxtx2;
 
-    if (s->conn->rxb_used == 0)
+    if (info->rxb_used == 0)
     {
         clear_epoll_events(s, EPOLLIN);
     }
@@ -1270,16 +1278,16 @@ ssize_t eTran_write(int fd, const void *buf, size_t count, uint32_t stream_id)
         return -EINVAL;
     }
 
-    ret = conn_send(tctx, s->conn, buf, count);
+    ret = conn_send(tctx, s->conn, buf, count, stream_id);
 
     while (ret == 0 && !(s->flags & SOF_NONBLOCK) && s->status == S_CONN_CONNECTED)
     {
         socket_tcp_poll(tctx, 64, -1);
-        ret = conn_send(tctx, s->conn, buf, count);
+        ret = conn_send(tctx, s->conn, buf, count, stream_id);
         polled = true;
     }
 
-    if (txb_bytes_avail(s->conn) == 0)
+    if (txb_bytes_avail(s->conn, stream_id) == 0)
         clear_epoll_events(s, EPOLLOUT);
 
     if (!polled)

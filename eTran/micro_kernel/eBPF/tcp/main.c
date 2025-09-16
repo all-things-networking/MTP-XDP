@@ -302,6 +302,10 @@ err_pkt:
     return XDP_EGRESS_DROP;
 }
 
+bool stream_1 = false;
+
+int teste = 0;
+
 SEC("xdp_sock")
 int xdp_sock_prog(struct xdp_md *ctx)
 {
@@ -409,7 +413,12 @@ int xdp_sock_prog(struct xdp_md *ctx)
     stream_key.remote_ip = bpf_ntohl(iph->saddr);
     stream_key.local_port = bpf_ntohs(tcph->dest);
     stream_key.remote_port = bpf_ntohs(tcph->source);
-    //bpf_printk("Regular XDP %u", tcph->urg_ptr);
+
+    if(!stream_1) {
+        bpf_printk("Regular XDP %u", tcph->urg_ptr);
+    }
+    if(tcph->urg_ptr == 1)
+        stream_1 = true;
     stream_key.stream_id = tcph->urg_ptr;
 
     stream_c = bpf_map_lookup_elem(&bpf_tcp_conn_per_stream_map, &stream_key);
