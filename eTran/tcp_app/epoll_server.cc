@@ -113,11 +113,24 @@ static inline int connection_send(unsigned int tid, struct connection *c)
     return need_epoll_out;
 }
 
-static inline void connection_recv(unsigned int tid, struct connection *c)
+static inline void connection_recv(unsigned int tid, struct connection *c, uint32_t stream_id)
 {
     ssize_t ret;
+    uint32_t target_bytes_with_stream_id = 0;
+
     while (1) {
-        ret = read(c->fd, c->buf + c->recv_len, c->message_bytes - c->recv_len);
+        uint32_t target_bytes = c->message_bytes - c->recv_len;
+
+        target_bytes_with_stream_id = target_bytes;
+        if(stream_id & 1u << 0) {
+            printf("STREAM 1\n");
+            target_bytes_with_stream_id = target_bytes | 1u << 31;
+        }
+        if(stream_id & 1u << 1) {
+            printf("STREAM 2\n");
+            target_bytes_with_stream_id = target_bytes_with_stream_id | 1u << 30;
+        }
+        ret = read(c->fd, c->buf + c->recv_len, target_bytes_with_stream_id);
         if (ret > 0) {
             c->recv_len += ret;
             total_recv_bytes[tid].fetch_add(ret);
@@ -131,10 +144,10 @@ static inline void connection_recv(unsigned int tid, struct connection *c)
     }
 }
 
-static inline int connection_events(unsigned int tid, struct connection *c, uint32_t events)
+static inline int connection_events(unsigned int tid, struct connection *c, uint32_t events, uint32_t stream_id)
 {
     if (events & EPOLLIN) {
-        connection_recv(tid, c);
+        connection_recv(tid, c, stream_id);
     }
 
     return connection_send(tid, c);
@@ -193,11 +206,26 @@ void thread_func(unsigned int tid)
         return;
     }
 
+    int stream_id = 0;
     while (1) {
-
         int nfds = epoll_wait(epfd, events, 128, -1);
+
         if (nfds) avg_nr_events.store((avg_nr_events.load() + nfds) / 2);
+        
         for (int i = 0; i < nfds; i++) {
+
+            stream_id = 0;
+            if(events[i].events & 1u << 27) {
+                printf("STREAM ID 1\n");
+                stream_id |= 1u << 0;
+                events[i].events &= ~(1u << 27);
+            }
+            if(events[i].events & 1u << 26) {
+                printf("STREAM ID 2\n");
+                stream_id |= 1u << 1;
+                events[i].events &= ~(1u << 26);
+            }
+
             c = (struct connection *)events[i].data.ptr;
 
             if (c == NULL) {
@@ -215,7 +243,7 @@ void thread_func(unsigned int tid)
                 continue;
             }
 
-            int ret = connection_events(tid, c, events[i].events);
+            int ret = connection_events(tid, c, events[i].events, stream_id);
 
             if (ret == 1 && !c->has_epoll_out) {
                 ev.events = EPOLLIN | EPOLLOUT;
