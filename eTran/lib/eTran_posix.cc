@@ -286,6 +286,8 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
         }
         // Timeout packet from slowpath, don't update need_fill!!!
         thread_bcache_prod(bc, addr);
+
+        printf("AQUI\n");
         goto out;
     }
 
@@ -303,6 +305,8 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
         *cached_sendbuf_event = true;
     }
 
+    tcp = (struct tcphdr *) (pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
+
     // XDP has prepared the position in received buffer, payload offset and payload length for us
     py_len = rxmeta_plen(pkt);
     ooo_bump = rxmeta_ooo_bump(pkt);
@@ -316,8 +320,7 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
         thread_bcache_prod(bc, addr);
         goto out;
     }
-
-    tcp = (struct tcphdr *) (pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
+    
     stream_id = tcp->urg_ptr;
     #ifdef MTP_ON
     rx_pos = rxmeta_pos(pkt);

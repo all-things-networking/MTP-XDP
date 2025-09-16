@@ -174,11 +174,11 @@ static inline void connection_recv(unsigned int tid, struct connection *c, uint3
 
         target_bytes_with_stream_id = target_bytes;
         if(stream_id & 1u << 0) {
-            ////printf("STREAM 0\n");
+            //printf("STREAM 0\n");
             target_bytes_with_stream_id = target_bytes | 1u << 31;
         }
         if(stream_id & 1u << 1) {
-            ////printf("STREAM 1\n");
+            //printf("STREAM 1\n");
             target_bytes_with_stream_id = target_bytes_with_stream_id | 1u << 30;
         }
         //target_bytes_with_stream_id = target_bytes | 1u << 31;
@@ -297,7 +297,7 @@ void thread_func(unsigned int tid)
         conn_fds_mtx.unlock();
     }
 
-    //printf("Connected to %s:%d successfully, total connections (%u) on Thread#%u\n", server_ip_str.c_str(), t_server_port, t_nr_flows, tid);
+    printf("Connected to %s:%d successfully, total connections (%u) on Thread#%u\n", server_ip_str.c_str(), t_server_port, t_nr_flows, tid);
     
     mtx.lock();
     ready_threads++;
@@ -318,12 +318,12 @@ void thread_func(unsigned int tid)
         for (int i = 0; i < nfds; i++) {
             stream_id = 0;
             if(events[i].events & 1u << 27) {
-                ////printf("STREAM ID 0");
+                //printf("STREAM ID 0");
                 stream_id |= 1u << 0;
                 events[i].events &= ~(1u << 27);
             }
             if(events[i].events & 1u << 26) {
-                ////printf("STREAM ID 1");
+                //printf("STREAM ID 1");
                 stream_id |= 1u << 1;
                 events[i].events &= ~(1u << 26);
             }

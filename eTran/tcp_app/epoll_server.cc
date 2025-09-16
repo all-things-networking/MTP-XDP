@@ -97,9 +97,17 @@ static inline int connection_send(unsigned int tid, struct connection *c)
     int need_epoll_out = 0;
     ssize_t ret;
     uint32_t target_bytes;
+
+    uint32_t write_bytes_with_stream_id;
+
     while (c->pending_bytes) {
         target_bytes = std::min(c->pending_bytes, c->response_bytes + c->unsent_bytes);
-        ret = write(c->fd, c->buf, std::min(target_bytes, (unsigned int)DATA_BLOCK_SIZE));
+
+        write_bytes_with_stream_id = std::min(target_bytes, (unsigned int)DATA_BLOCK_SIZE);
+        write_bytes_with_stream_id |= 1u << 31;
+
+        
+        ret = write(c->fd, c->buf, write_bytes_with_stream_id);
         if (ret > 0) {
             c->pending_bytes -= ret;
             total_resp_bytes[tid].fetch_add(ret);
@@ -123,14 +131,16 @@ static inline void connection_recv(unsigned int tid, struct connection *c, uint3
 
         target_bytes_with_stream_id = target_bytes;
         if(stream_id & 1u << 0) {
-            printf("STREAM 1\n");
+            //printf("STREAM 1\n");
             target_bytes_with_stream_id = target_bytes | 1u << 31;
         }
         if(stream_id & 1u << 1) {
-            printf("STREAM 2\n");
+            //printf("STREAM 2\n");
             target_bytes_with_stream_id = target_bytes_with_stream_id | 1u << 30;
         }
         ret = read(c->fd, c->buf + c->recv_len, target_bytes_with_stream_id);
+
+        //printf("Read %lu bytes\n", ret);
         if (ret > 0) {
             c->recv_len += ret;
             total_recv_bytes[tid].fetch_add(ret);
@@ -216,12 +226,12 @@ void thread_func(unsigned int tid)
 
             stream_id = 0;
             if(events[i].events & 1u << 27) {
-                printf("STREAM ID 1\n");
+                //printf("STREAM ID 1\n");
                 stream_id |= 1u << 0;
                 events[i].events &= ~(1u << 27);
             }
             if(events[i].events & 1u << 26) {
-                printf("STREAM ID 2\n");
+                //printf("STREAM ID 2\n");
                 stream_id |= 1u << 1;
                 events[i].events &= ~(1u << 26);
             }

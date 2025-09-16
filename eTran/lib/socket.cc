@@ -261,13 +261,6 @@ static int socket_tcp_poll(struct app_ctx_per_thread *tctx, int budget, int time
         return -1;
     }
 
-    /*int nr_events = eTran_tcp_poll_events(tctx, events, budget, timeout, 1);
-    if (nr_events < 0)
-    {
-        fprintf(stderr, "socket_info:Failed to eTran_tcp_poll_events\n");
-        return -1;
-    }*/
-
     for (int i = 0; i < nr_events; i++)
     {
         if (likely(events[i].type == ETRANTCP_EV_CONN_RECVED ||
