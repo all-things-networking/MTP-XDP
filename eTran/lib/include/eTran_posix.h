@@ -135,7 +135,7 @@ static inline ssize_t eTran_tcp_rx_peek_count_zc(struct app_ctx_per_thread *tctx
     uint32_t copy_offset = 0;
 
     if (info->rxb_used == 0) {
-        printf("RXB_USED == 0, %u\n", stream_id);
+        //printf("RXB_USED == 0, %u\n", stream_id);
         return 0;
     }
 

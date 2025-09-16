@@ -111,7 +111,7 @@ static inline int connection_send(unsigned int tid, struct connection *c)
         c->start_time = time(NULL);
     }*/
 
-    printf("START SEND\n");
+    //printf("START SEND\n");
     // Transmit messages as much as possible through this connection until we reach max_outstanding or no buffer space
     while (c->pending_bytes1/* || c->pending_bytes2*/) {
         /*if(c->curr_buffer_send == 1){
@@ -127,7 +127,7 @@ static inline int connection_send(unsigned int tid, struct connection *c)
 
         ret = write(c->fd, c->buf1 + (c->total_bytes1 - c->pending_bytes1), write_bytes_with_stream_id);
 
-        printf("SEND %lu %u\n", ret, c->pending_bytes1);
+        //printf("SEND %lu %u\n", ret, c->pending_bytes1);
 
         if (ret > 0) {
             /*if(c->curr_buffer_send == 1){
@@ -155,18 +155,18 @@ static inline int connection_send(unsigned int tid, struct connection *c)
             break;
         }
     }
-    printf("END SEND\n\n");
+    //printf("END SEND\n\n");
     return need_epoll_out;
 }
 
 static inline void connection_recv(unsigned int tid, struct connection *c, uint32_t stream_id)
 {
-    ssize_t ret;
+    ssize_t ret = 0;
     bool wait_response = c->pending_bytes1 + c->message_bytes1 <= c->total_bytes1;
 
     uint32_t target_bytes_with_stream_id;
 
-    printf("START RECV\n");
+    //printf("START RECV\n");
 
     // Receive messages as much as possible through this connection if there are outstanding messages
     while (wait_response) {
@@ -174,18 +174,30 @@ static inline void connection_recv(unsigned int tid, struct connection *c, uint3
 
         target_bytes_with_stream_id = target_bytes;
         if(stream_id & 1u << 0) {
-            //printf("STREAM 0\n");
+            ////printf("STREAM 0\n");
             target_bytes_with_stream_id = target_bytes | 1u << 31;
         }
         if(stream_id & 1u << 1) {
-            //printf("STREAM 1\n");
+            ////printf("STREAM 1\n");
             target_bytes_with_stream_id = target_bytes_with_stream_id | 1u << 30;
         }
         //target_bytes_with_stream_id = target_bytes | 1u << 31;
 
-        ret = read(c->fd, c->buf1 + c->recv_len, target_bytes_with_stream_id);
+        if(stream_id == 3) {
+            ret = read(c->fd, c->buf1 + c->recv_len, target_bytes_with_stream_id);
 
-        printf("RECEIVED %lu %u %u\n", ret, c->pending_bytes1, c->recv_len);
+            // TODO: set target_bytes_with_stream_id with bit of each stream before calling twice
+            // ret1 = read(c->fd, c->buf1 + c->recv_len, target_bytes_with_stream_id);
+            // ret2 = read(c->fd, c->buf1 + c->recv_len, target_bytes_with_stream_id);
+        } else if(stream_id == 2) {
+            ret = read(c->fd, c->buf1 + c->recv_len, target_bytes_with_stream_id);
+            // ret2 = read(c->fd, c->buf1 + c->recv_len, target_bytes_with_stream_id);
+        } else if(stream_id == 1) {
+            ret = read(c->fd, c->buf1 + c->recv_len, target_bytes_with_stream_id);
+            // ret1 = read(c->fd, c->buf1 + c->recv_len, target_bytes_with_stream_id);
+        }
+
+        //printf("RECEIVED %lu %u %u\n", ret, c->pending_bytes1, c->recv_len);
         if (ret > 0) {
             c->recv_len += ret;
             total_resp_bytes[tid].fetch_add(ret);
@@ -198,7 +210,7 @@ static inline void connection_recv(unsigned int tid, struct connection *c, uint3
             c->pending_bytes1 += c->message_bytes1;
         }
     }
-    printf("END RECV\n\n");
+    //printf("END RECV\n\n");
 }
 
 static inline int connection_events(unsigned int tid, struct connection *c, uint32_t events, uint32_t stream_id)
@@ -240,14 +252,14 @@ void thread_func(unsigned int tid)
     epfd = epoll_create1(0);
 
     if (epfd < 0) {
-        fprintf(stderr, "Failed to create epoll\n");
+        //fprintf(stderr, "Failed to create epoll\n");
         return;
     }
 
     for (unsigned int i = 0; i < t_nr_flows; i++) {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) {
-            fprintf(stderr, "Failed to create socket\n");
+            //fprintf(stderr, "Failed to create socket\n");
             perror("\n");
             return;
         }
@@ -257,7 +269,7 @@ void thread_func(unsigned int tid)
         server_addr.sin_port = htons(t_server_port);
         server_addr.sin_addr.s_addr = server_ip_addr.s_addr;
         if (connect(fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-            fprintf(stderr, "Failed to connect to server\n");
+            //fprintf(stderr, "Failed to connect to server\n");
             perror("connect");
             close(fd);
             return;
@@ -266,7 +278,7 @@ void thread_func(unsigned int tid)
         // close(fd);
 
         if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) < 0) {
-            fprintf(stderr, "Failed to set non-blocking\n");
+            //fprintf(stderr, "Failed to set non-blocking\n");
             close(fd);
             return;
         }
@@ -275,7 +287,7 @@ void thread_func(unsigned int tid)
         ev.data.ptr = new connection(fd, message_bytes_long, message_bytes_short, max_outstanding);
 
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-            fprintf(stderr, "Failed to add fd to epoll\n");
+            //fprintf(stderr, "Failed to add fd to epoll\n");
             close(fd);
             close(epfd);
             return;
@@ -285,7 +297,7 @@ void thread_func(unsigned int tid)
         conn_fds_mtx.unlock();
     }
 
-    printf("Connected to %s:%d successfully, total connections (%u) on Thread#%u\n", server_ip_str.c_str(), t_server_port, t_nr_flows, tid);
+    //printf("Connected to %s:%d successfully, total connections (%u) on Thread#%u\n", server_ip_str.c_str(), t_server_port, t_nr_flows, tid);
     
     mtx.lock();
     ready_threads++;
@@ -306,12 +318,12 @@ void thread_func(unsigned int tid)
         for (int i = 0; i < nfds; i++) {
             stream_id = 0;
             if(events[i].events & 1u << 27) {
-                //printf("STREAM ID 0");
+                ////printf("STREAM ID 0");
                 stream_id |= 1u << 0;
                 events[i].events &= ~(1u << 27);
             }
             if(events[i].events & 1u << 26) {
-                //printf("STREAM ID 1");
+                ////printf("STREAM ID 1");
                 stream_id |= 1u << 1;
                 events[i].events &= ~(1u << 26);
             }
@@ -319,7 +331,7 @@ void thread_func(unsigned int tid)
             c = (connection *)events[i].data.ptr;
             
             if (events[i].events & EPOLLERR || events[i].events & EPOLLHUP) {
-                fprintf(stderr, "EPOLLERR\n");
+                //fprintf(stderr, "EPOLLERR\n");
                 conn_fds.remove(c->fd);
                 // remove from epoll
                 epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
@@ -332,7 +344,7 @@ void thread_func(unsigned int tid)
                 ev.events = EPOLLIN | EPOLLERR;
                 ev.data.ptr = c;
                 if (epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev) < 0) {
-                    fprintf(stderr, "Failed to add fd to epoll\n");
+                    //fprintf(stderr, "Failed to add fd to epoll\n");
                     return;
                 }
                 c->no_epoll_out = 1;
@@ -340,7 +352,7 @@ void thread_func(unsigned int tid)
                 ev.events = EPOLLIN | EPOLLERR | EPOLLOUT;
                 ev.data.ptr = c;
                 if (epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev) < 0) {
-                    fprintf(stderr, "Failed to add fd to epoll\n");
+                    //fprintf(stderr, "Failed to add fd to epoll\n");
                     return;
                 }
                 c->no_epoll_out = 0;

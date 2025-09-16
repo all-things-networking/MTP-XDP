@@ -86,7 +86,7 @@ static inline uint32_t set_stream_id(uint32_t num, uint32_t stream_id) {
 static inline void lazy_update_prev_conn_rxev(struct eTrantcp_connection *cached_conn, size_t cached_rx_bump,
                                               struct eTrantcp_event *ret_events, int *nr_event, uint32_t stream_id)
 {
-    printf("Stream id %u\n", stream_id);
+    //printf("Stream id %u\n", stream_id);
     tcp_rxtx_info* info = stream_id == 1? &cached_conn->rxtx1 : &cached_conn->rxtx2;
     if (!cached_rx_bump)
         return;
@@ -94,7 +94,7 @@ static inline void lazy_update_prev_conn_rxev(struct eTrantcp_connection *cached
     ret_events[*nr_event].ev.recv.conn = cached_conn;
     (*nr_event)++;
 
-    printf("Updating rxb_used stream %u: %lu\n", stream_id, cached_rx_bump);
+    //printf("Updating rxb_used stream %u: %lu\n", stream_id, cached_rx_bump);
 
     // update connection receive buffer
 
@@ -210,7 +210,7 @@ static inline bool sync_state(struct app_ctx_per_thread *tctx, struct eTrantcp_c
         if (!info->pending_free_bytes)
             tctx->free_pending_conns.push_back(conn);
         info->pending_free_bytes += ack_bytes;
-        //printf("%u %u\n", stream_id,  info->pending_free_bytes);
+        //printf("pending_free_bytes: %u %u\n", stream_id,  info->pending_free_bytes);
     }
 
     return send_event;
@@ -270,8 +270,8 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
     info = *cached_stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
 
     // Which one is correct?
-    printf("%u\n", ret_events[*nr_event].ev.recv.stream_id);
     ret_events[*nr_event].ev.recv.stream_id = set_stream_id(ret_events[*nr_event].ev.recv.stream_id, stream_id);
+    //printf("%u\n", ret_events[*nr_event].ev.recv.stream_id);
     //ret_events[*nr_event].ev.recv.stream_id = set_stream_id(ret_events[*nr_event].ev.recv.stream_id, *cached_stream_id);
     
     //printf("%u\n", ret_events[*nr_event].ev.recv.stream_id);
