@@ -392,10 +392,10 @@ void thread_func(unsigned int tid)
     while (1) {
 
         //printf("BEFORE WAIT\n");
-        //fflush(stdout);
+        fflush(stdout);
         int nfds = epoll_wait(epfd, events, 128, -1);
         //printf("AFTER WAIT %d\n", nfds);
-        //fflush(stdout);
+        fflush(stdout);
 
         if (nfds) avg_nr_events.store((avg_nr_events.load() + nfds) / 2);
         for (int i = 0; i < nfds; i++) {

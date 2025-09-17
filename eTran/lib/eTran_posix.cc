@@ -163,7 +163,7 @@ static inline bool sync_state(struct app_ctx_per_thread *tctx, struct eTrantcp_c
             info->txb_allocated += go_back_bytes;
             info->txb_sent -= go_back_bytes;
 #ifdef DEBUG
-            printf("sync_state: go_back_bytes = %u\n", go_back_bytes);
+          //printf("sync_state: go_back_bytes = %u\n", go_back_bytes);
 #endif
             // enqueue to retransmission queue
             // fprintf(stdout, "Reset pointer to %u for conn(%p)\n", go_back_pos, conn);
@@ -176,7 +176,7 @@ static inline bool sync_state(struct app_ctx_per_thread *tctx, struct eTrantcp_c
     {
         conn->xsk_budget = xsk_budget_avail;
 #ifdef DEBUG
-        printf("sync_state: xsk_budget_avail = %u\n", xsk_budget_avail);
+      //printf("sync_state: xsk_budget_avail = %u\n", xsk_budget_avail);
 #endif
         // we can continue to send even if retransmission happens
 
@@ -199,7 +199,7 @@ static inline bool sync_state(struct app_ctx_per_thread *tctx, struct eTrantcp_c
     {
         info->txb_sent -= ack_bytes;
 #ifdef DEBUG
-        printf("sync_state: ack_bytes = %u\n", ack_bytes);
+      //printf("sync_state: ack_bytes = %u\n", ack_bytes);
 #endif
         // option1: as long as we have budget, we can continue to send
         // can_continue_send = txb_bytes_avail(conn) > 0;
@@ -210,14 +210,14 @@ static inline bool sync_state(struct app_ctx_per_thread *tctx, struct eTrantcp_c
         if (!info->pending_free_bytes)
             tctx->free_pending_conns.push_back(conn);
         info->pending_free_bytes += ack_bytes;
-        //printf("pending_free_bytes: %u %u\n", stream_id,  info->pending_free_bytes);
+      //printf("pending_free_bytes: %u %u\n", stream_id,  info->pending_free_bytes);
     }
 
     return send_event;
 }
 
 static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_connection **cached_conn_ptr, size_t *cached_rx_bump, bool *cached_sendbuf_event,
-    struct eTrantcp_event *ret_events, int *nr_event, uint64_t addr, char *pkt, bool last, uint32_t *cached_stream_id)
+    struct eTrantcp_event *ret_events, int *nr_event, uint64_t addr, char *pkt, bool last)
 {
     struct thread_bcache *bc = &tctx->iobuffer;
     struct eTrantcp_connection *cached_conn = *cached_conn_ptr;
@@ -246,7 +246,7 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
     // it's likely that we are processing the same connection
     if (unlikely(cached_conn != NULL && conn != cached_conn))
     {
-        lazy_update_prev_conn_rxev(cached_conn, *cached_rx_bump, ret_events, nr_event, *cached_stream_id);
+        lazy_update_prev_conn_rxev(cached_conn, *cached_rx_bump, ret_events, nr_event, stream_id);
         if (*cached_sendbuf_event)
             lazy_update_prev_conn_txev(cached_conn, ret_events, nr_event);
         //ret_events[*nr_event].ev.recv.stream_id = set_stream_id(ret_events[*nr_event].ev.recv.stream_id, *cached_stream_id);
@@ -254,7 +254,6 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
         cached_conn = conn;
         *cached_rx_bump = 0;
         *cached_sendbuf_event = false;
-        *cached_stream_id = stream_id;
         ret_events[*nr_event].ev.recv.stream_id = 0;
     }
     else if (unlikely(cached_conn == NULL))
@@ -263,11 +262,9 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
         cached_conn = conn;
         *cached_rx_bump = 0;
         ret_events[*nr_event].ev.recv.stream_id = 0;
-
-        *cached_stream_id = stream_id;
     }
 
-    info = *cached_stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
+    info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
 
     // Which one is correct?
     ret_events[*nr_event].ev.recv.stream_id = set_stream_id(ret_events[*nr_event].ev.recv.stream_id, stream_id);
@@ -280,13 +277,14 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
     if (unlikely(qid == POISON_32))
     {
         // printf("Receive TO signal from slowpath\n");
-        if (sync_state(tctx, conn, pkt, true, *cached_stream_id))
+        if (sync_state(tctx, conn, pkt, true, stream_id))
         {
             *cached_sendbuf_event = true;
         }
         // Timeout packet from slowpath, don't update need_fill!!!
         thread_bcache_prod(bc, addr);
 
+        printf("AQUI\n");
         goto out;
     }
 
@@ -299,7 +297,7 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
     if (!(tctx->txrx_xsk_info[tctx->actx->qid2idx[qid]]->cached_needfill++))
         tctx->cached_fqidx.push(tctx->actx->qid2idx[qid]);
 
-    if (sync_state(tctx, conn, pkt, false, *cached_stream_id))
+    if (sync_state(tctx, conn, pkt, false, stream_id))
     {
         *cached_sendbuf_event = true;
     }
@@ -319,13 +317,12 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
         thread_bcache_prod(bc, addr);
         goto out;
     }
-
-    stream_id = tcp->urg_ptr;
+    
     #ifdef MTP_ON
     rx_pos = rxmeta_pos(pkt);
     uint32_t start_seq, end_seq;
     parse_packet(pkt, &start_seq, &end_seq, py_len);
-    mtp_add_data_seg_wrapper(tctx, pkt, start_seq, end_seq, py_len, conn, addr, cached_rx_bump, rx_pos, *cached_stream_id);
+    mtp_add_data_seg_wrapper(tctx, pkt, start_seq, end_seq, py_len, conn, addr, cached_rx_bump, rx_pos, stream_id);
     #else
 
     if (ooo_bump != POISON_32)
@@ -362,7 +359,7 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
 out:
     if (unlikely(last)) {
         if (likely(cached_conn && *cached_rx_bump)) {
-            lazy_update_prev_conn_rxev(cached_conn, *cached_rx_bump, ret_events, nr_event, *cached_stream_id);
+            lazy_update_prev_conn_rxev(cached_conn, *cached_rx_bump, ret_events, nr_event, stream_id);
             //ret_events[*nr_event].ev.recv.stream_id = set_stream_id(ret_events[*nr_event].ev.recv.stream_id, *cached_stream_id);
         }
 
@@ -454,7 +451,6 @@ int tcp_nic_poll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *ret_eve
 
     tctx->next_rcv_qidx = (tctx->next_rcv_qidx + 1) % nr_nic_queues;
 
-    uint32_t cached_stream_id = 0;
 
     for (i = 0; i < total_rcvd; i++)
     {
@@ -463,7 +459,7 @@ int tcp_nic_poll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *ret_eve
         uint64_t addr = addrs[i];
         char *pkt = pkts[i];
 
-        handle_rx(tctx, &cached_conn, &cached_rx_bump, &cached_sendbuf_event, ret_events, &nr_event, addr, pkt, i == total_rcvd - 1, &cached_stream_id);
+        handle_rx(tctx, &cached_conn, &cached_rx_bump, &cached_sendbuf_event, ret_events, &nr_event, addr, pkt, i == total_rcvd - 1);
     }
 
     while (tctx->cached_fqidx.pop(&qidx) == 0)
@@ -737,8 +733,6 @@ int tcp_nic_poll_epoll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *r
 
     quantum = budget / nfds;
 
-    uint32_t cached_stream_id;
-
     for (j = 0; j < nfds; j++)
     {
         if (unlikely(events[j].data.fd == tctx->evfd))
@@ -775,7 +769,6 @@ int tcp_nic_poll_epoll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *r
         cached_rx_bump = 0;
         cached_sendbuf_event = false;
 
-        cached_stream_id = 0;
         for (i = 0; i < rcvd; i++)
         {
             if (i + 2 < rcvd)
@@ -783,7 +776,7 @@ int tcp_nic_poll_epoll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *r
             uint64_t addr = addrs[i];
             char *pkt = pkts[i];
 
-            handle_rx(tctx, &cached_conn, &cached_rx_bump, &cached_sendbuf_event, ret_events, &nr_event, addr, pkt, i == rcvd - 1, &cached_stream_id); 
+            handle_rx(tctx, &cached_conn, &cached_rx_bump, &cached_sendbuf_event, ret_events, &nr_event, addr, pkt, i == rcvd - 1); 
         }
 
         if (xsk_rxring_empty(rx))
@@ -1099,7 +1092,7 @@ static void tcp_ebpf_sync(struct app_ctx_per_thread *tctx)
             // ADD_CQ_WORK(qidx, 1);
 
     #ifdef DEBUG
-            printf("Connection(%p): sync rxb_bump(%u) with ebpf\n", conn, info->rxb_bump);
+          //printf("Connection(%p): sync rxb_bump(%u) with ebpf\n", conn, info->rxb_bump);
     #endif
             kick_tx(tctx->txrx_xsk_fd[qidx], tx);
 
@@ -1141,21 +1134,36 @@ static inline void tcp_free_buffers(struct app_ctx_per_thread *tctx)
 {
     struct thread_bcache *bc = &tctx->iobuffer;
 
+  //printf("tcp_free_buffers 1\n");
+    fflush(stdout);
+
     while (!tctx->free_pending_conns.empty()) {
         auto it = tctx->free_pending_conns.begin();
         struct eTrantcp_connection *conn = *it;
+      //printf("tcp_free_buffers 2\n");
+        fflush(stdout);
         for(int stream_id = 1; stream_id < 3; stream_id++) {
+          //printf("tcp_free_buffers 3\n");
+            fflush(stdout);
             tcp_rxtx_info* info = stream_id == 1? &conn->rxtx1 : &conn->rxtx2;
             //printf("TCP_FREE_BUFFERS %u %u\n", stream_id, info->pending_free_bytes);
             while (info->pending_free_bytes) {
+              //printf("tcp_free_buffers 4\n");
+                fflush(stdout);
                 auto [addr, plen] = info->unack_tx_addrs.front();
                 info->unack_tx_addrs.pop_front();
+              //printf("tcp_free_buffers 5\n");
+                fflush(stdout);
                 thread_bcache_prod(bc, addr);
+              //printf("tcp_free_buffers 6\n");
+                fflush(stdout);
                 info->pending_free_bytes -= plen;
             }
         }
         tctx->free_pending_conns.erase(it);
     }
+  //printf("tcp_free_buffers 7\n");
+    fflush(stdout);
 }
 
 /**
@@ -1170,11 +1178,21 @@ int eTran_tcp_poll_events(struct app_ctx_per_thread *tctx, struct eTrantcp_event
     int nr_event = 0;
     int ret = 0;
 
+  //printf("eTran_tcp_poll_events 1\n");
+    fflush(stdout);
     tcp_ebpf_sync(tctx);
+
+  //printf("eTran_tcp_poll_events 2\n");
+    fflush(stdout);
 
     if (timeout == 0)
     {
+      //printf("eTran_tcp_poll_events 3\n");
+        fflush(stdout);
         ret = tcp_nic_poll(tctx, events, maxevents);
+
+      //printf("eTran_tcp_poll_events 4\n");
+        fflush(stdout);
         if (ret > 0)
             nr_event += ret;
         if (unlikely(!lrpc_empty(&tctx->app_in)))
@@ -1182,23 +1200,35 @@ int eTran_tcp_poll_events(struct app_ctx_per_thread *tctx, struct eTrantcp_event
             while (!lrpc_empty(&tctx->app_in))
                 nr_event += process_tcp_kernel_events(tctx, events + nr_event, maxevents - nr_event);
         }
+      //printf("eTran_tcp_poll_events 5\n");
+        fflush(stdout);
     }
     else
     {
+      //printf("eTran_tcp_poll_events 6\n");
+        fflush(stdout);
         ret = tcp_nic_poll_epoll(tctx, events, maxevents, timeout);
         if (ret > 0)
             nr_event += ret;
     }
 
+  //printf("eTran_tcp_poll_events 7\n");
+    fflush(stdout);
     /* Note: this function must be called before tcp_retransmission() 
      * since it manipulates conn->unack_tx_addrs
      */
     
+    
     tcp_free_buffers(tctx);
+
+  //printf("eTran_tcp_poll_events 8\n");
+    fflush(stdout);
 
     for(int i = 1; i < 3; i++) {
         tcp_retransmission(tctx, i);
     }
+  //printf("eTran_tcp_poll_events 9\n");
+    fflush(stdout);
 
     return nr_event;
 }

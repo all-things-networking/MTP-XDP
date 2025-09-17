@@ -254,12 +254,17 @@ static int socket_tcp_poll(struct app_ctx_per_thread *tctx, int budget, int time
     if (budget > 64)
         budget = 64;
 
+  //printf("SOCKET_TCP_POLL 1\n");
+    fflush(stdout);
     int nr_events = eTran_tcp_poll_events(tctx, events, budget, timeout);
     if (nr_events < 0)
     {
         fprintf(stderr, "socket_info:Failed to eTran_tcp_poll_events\n");
         return -1;
     }
+
+  //printf("SOCKET_TCP_POLL 2\n");
+    fflush(stdout);
 
     for (int i = 0; i < nr_events; i++)
     {
@@ -355,7 +360,7 @@ static int socket_tcp_poll(struct app_ctx_per_thread *tctx, int budget, int time
             socket_lock(s);
             if (s->listener != events[i].ev.newconn.listener)
             {
-                printf("ETRANTCP_EV_LISTEN_NEWCONN\n");
+              //printf("ETRANTCP_EV_LISTEN_NEWCONN\n");
                 socket_unlock(s);
                 break;
             }
@@ -420,6 +425,9 @@ static int socket_tcp_poll(struct app_ctx_per_thread *tctx, int budget, int time
             break;
         }
     }
+
+  //printf("SOCKET_TCP_POLL 3\n");
+    fflush(stdout);
 
     return 0;
 }
@@ -1271,10 +1279,10 @@ ssize_t eTran_write(int fd, const void *buf, size_t count, uint32_t stream_id)
         return -EINVAL;
     }
 
-    printf("HERE 1\n");
+  //printf("HERE 1\n");
     fflush(stdout);
     ret = conn_send(tctx, s->conn, buf, count, stream_id);
-    printf("HERE 2\n");
+  //printf("HERE 2\n");
     fflush(stdout);
 
     while (ret == 0 && !(s->flags & SOF_NONBLOCK) && s->status == S_CONN_CONNECTED)
@@ -1283,19 +1291,19 @@ ssize_t eTran_write(int fd, const void *buf, size_t count, uint32_t stream_id)
         ret = conn_send(tctx, s->conn, buf, count, stream_id);
         polled = true;
     }
-    printf("HERE 3\n");
+  //printf("HERE 3\n");
     fflush(stdout);
 
     if (txb_bytes_avail(s->conn, stream_id) == 0)
         clear_epoll_events(s, EPOLLOUT);
 
-    printf("HERE 4\n");
+  //printf("HERE 4\n");
     fflush(stdout);
 
     if (!polled)
         socket_tcp_poll(tctx, 64, 0);
 
-    printf("HERE 5\n");
+  //printf("HERE 5\n");
     fflush(stdout);
 
     return ret;
@@ -1622,11 +1630,16 @@ int eTran_epoll_wait(int epfd, struct epoll_event *events,
         return libc_epoll_wait(epfd, events, maxevents, timeout);
     }
 
+  //printf("WAIT HERE 1\n");
+    fflush(stdout);
+
     if (!ep->num_linux)
     { // all fds are managed by eTran
 
         /* call socket_tcp_poll() at least once */
         socket_tcp_poll(tctx, maxevents, 0);
+      //printf("WAIT HERE 2\n");
+        fflush(stdout);
         epoll_lock(ep);
         /* traverse epoll's active list */
         for (auto it = ep->active_list.begin(); it != ep->active_list.end();)
@@ -1657,13 +1670,21 @@ int eTran_epoll_wait(int epfd, struct epoll_event *events,
         }
         epoll_unlock(ep);
 
+      //printf("WAIT HERE 3\n");
+        fflush(stdout);
+
         // no events, use timeout
         if (!nr_event && timeout)
             socket_tcp_poll(tctx, maxevents, timeout);
+
+      //printf("WAIT HERE 4\n");
+        fflush(stdout);
     }
     else if (ep->linux_first)
     {
 
+      //printf("WAIT HERE 5\n");
+        fflush(stdout);
         /* linux epoll first, then eTran */
         ep->linux_first = false;
         n = libc_epoll_wait(epfd, events, maxevents, timeout);
@@ -1681,6 +1702,9 @@ int eTran_epoll_wait(int epfd, struct epoll_event *events,
 
         /* call socket_tcp_poll() at least once */
         socket_tcp_poll(tctx, maxevents, 0);
+
+      //printf("WAIT HERE 6\n");
+        fflush(stdout);
 
         epoll_lock(ep);
         /* traverse epoll's active list */
@@ -1729,6 +1753,8 @@ int eTran_epoll_wait(int epfd, struct epoll_event *events,
             goto out;
         }
 #endif
+      //printf("WAIT HERE 7\n");
+        fflush(stdout);
 
         /* eTran epoll first, then linux */
         ep->linux_first = true;
@@ -1762,6 +1788,9 @@ int eTran_epoll_wait(int epfd, struct epoll_event *events,
             it++;
         }
         epoll_unlock(ep);
+
+      //printf("WAIT HERE 8\n");
+        fflush(stdout);
 
         if (nr_event < maxevents)
         {
