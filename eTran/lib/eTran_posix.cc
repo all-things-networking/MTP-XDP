@@ -569,11 +569,22 @@ static inline int process_tcp_kernel_events(struct app_ctx_per_thread *tctx, str
                     std::make_pair(eTran_tcp_flow_tuple(accept_msg->remote_ip, accept_msg->remote_port, accept_msg->local_ip,
                                                         ret_events[nr_event].ev.accept.conn->local_port),
                                    ret_events[nr_event].ev.accept.conn));
-                struct mtp_value new_fields = {0};
+                /*struct mtp_value new_fields = {0};
                 tctx->mtp_values.insert(
                 std::make_pair(eTran_tcp_flow_tuple(accept_msg->remote_ip, accept_msg->remote_port, accept_msg->local_ip,
                                                     ret_events[nr_event].ev.accept.conn->local_port),
-                                new_fields));
+                                new_fields));*/
+                struct mtp_value new_fields1 = {0};
+                tctx->mtp_values.insert(
+                std::make_pair(eTran_quic_stream_tuple(accept_msg->remote_ip, accept_msg->remote_port, accept_msg->local_ip,
+                                                        ret_events[nr_event].ev.accept.conn->local_port, 0),
+                                    new_fields1));
+
+                struct mtp_value new_fields2 = {0};
+                tctx->mtp_values.insert(
+                std::make_pair(eTran_quic_stream_tuple(accept_msg->remote_ip, accept_msg->remote_port, accept_msg->local_ip,
+                                                        ret_events[nr_event].ev.accept.conn->local_port, 1),
+                                    new_fields2));
             }
             else
             {
@@ -605,13 +616,22 @@ static inline int process_tcp_kernel_events(struct app_ctx_per_thread *tctx, str
                                                                             ret_events[nr_event].ev.open.conn->local_ip,
                                                                             ret_events[nr_event].ev.open.conn->local_port),
                                                        ret_events[nr_event].ev.open.conn));
-                struct mtp_value new_fields = {0};
+                struct mtp_value new_fields1 = {0};
                 tctx->mtp_values.insert(
-                std::make_pair(eTran_tcp_flow_tuple(ret_events[nr_event].ev.open.conn->remote_ip,
+                std::make_pair(eTran_quic_stream_tuple(ret_events[nr_event].ev.open.conn->remote_ip,
                                                     ret_events[nr_event].ev.open.conn->remote_port,
                                                     ret_events[nr_event].ev.open.conn->local_ip,
-                                                    ret_events[nr_event].ev.open.conn->local_port),
-                                new_fields));
+                                                    ret_events[nr_event].ev.open.conn->local_port,
+                                                    0),
+                                new_fields1));
+                struct mtp_value new_fields2 = {0};
+                tctx->mtp_values.insert(
+                std::make_pair(eTran_quic_stream_tuple(ret_events[nr_event].ev.open.conn->remote_ip,
+                                                    ret_events[nr_event].ev.open.conn->remote_port,
+                                                    ret_events[nr_event].ev.open.conn->local_ip,
+                                                    ret_events[nr_event].ev.open.conn->local_port,
+                                                    1),
+                                new_fields2));
 
                 // generate a ETRANTCP_EV_CONN_SENDBUF event
                 nr_event++;

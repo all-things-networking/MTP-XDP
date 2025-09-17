@@ -68,15 +68,18 @@ struct connection {
         pending_bytes1 = 0;
         recv_len1 = 0;
         unsent_bytes1 = 0;
-        response_bytes1 = short_response ? SHORT_RESPONSE_SIZE : message_bytes;
-        buf1 = (char *)calloc(1, max_buf_size);
+        response_bytes1 = short_response ? SHORT_RESPONSE_SIZE : message_bytes1;
+
+        // Question: before, it was message_bytes and it was resulting in a segmentation fault. Why?
+        buf1 = (char *)calloc(1, message_bytes_short);
 
         message_bytes2 = message_bytes_long;
         pending_bytes2 = 0;
         recv_len2 = 0;
         unsent_bytes2 = 0;
-        response_bytes2 = short_response ? SHORT_RESPONSE_SIZE : message_bytes;
-        buf2 = (char *)calloc(1, max_buf_size);
+        response_bytes2 = short_response ? SHORT_RESPONSE_SIZE : message_bytes2;
+        // Question: before, it was message_bytes and it was resulting in a segmentation fault. Why?
+        buf2 = (char *)calloc(1, message_bytes_long);
     }
 };
 
@@ -125,6 +128,9 @@ static inline int connection_send(unsigned int tid, struct connection *c)
     bool skip1 = false;
     bool skip2 = false;
 
+    bool quit1 = false;
+    bool quit2 = false;
+
     while (c->pending_bytes1 || c->pending_bytes2) {
 
         if(!skip1) {
@@ -133,8 +139,10 @@ static inline int connection_send(unsigned int tid, struct connection *c)
             write_bytes_with_stream_id1 |= 1u << 31;
 
             ret1 = write(c->fd, c->buf1, write_bytes_with_stream_id1);
-            if(ret1 == 0)
+            if(ret1 == 0) {
                 skip1 = true;
+                quit1 = true;
+            }
         }
         if(!skip2) {
             target_bytes2 = std::min(c->pending_bytes2, c->response_bytes2 + c->unsent_bytes2);
@@ -142,24 +150,53 @@ static inline int connection_send(unsigned int tid, struct connection *c)
             write_bytes_with_stream_id2 |= 1u << 30;
 
             ret2 = write(c->fd, c->buf2, write_bytes_with_stream_id2);
-            if(ret2 == 0)
+            if(ret2 == 0) {
                 skip2 = true;
+                quit2 = true;
+            }
         }
 
-        if (ret1 > 0) {
+        if (!skip1 && ret1 > 0) {
             c->pending_bytes1 -= ret1;
             total_resp_bytes[tid].fetch_add(ret1);
             // accumulate unsent_bytes
             c->unsent_bytes1 += target_bytes1 - ret1;
+
+            if(c->pending_bytes1 == 0) {
+                //printf("Pending bytes 0 stream 1\n");
+                //fflush(stdout);
+                skip1 = true;
+                quit1 = true;
+            }
         }
-        if (ret2 > 0) {
+        if (!skip1 && ret2 > 0) {
             c->pending_bytes2 -= ret2;
             total_resp_bytes[tid].fetch_add(ret2);
             // accumulate unsent_bytes
             c->unsent_bytes2 += target_bytes2 - ret2;
+
+            if(c->pending_bytes2 == 0) {
+                //printf("Pending bytes 0 stream 1\n");
+                //fflush(stdout);
+                skip2 = true;
+                quit2 = true;
+            }
         }
-        if(ret1 == 0 && ret2 == 0) {
-            need_epoll_out = 1;
+        if(ret1 == 0) {
+            // no buffer space
+            //printf("RET 0 STREAM 1\n");
+            fflush(stdout);
+            need_epoll_out |= (1u << 0);
+            //break;
+        }
+        if(ret2 == 0) {
+            // no buffer space
+            //printf("RET 0 STREAM 2\n");
+            fflush(stdout);
+            need_epoll_out |= (1u << 1);
+            //break;
+        }
+        if(quit1 && quit2) {
             break;
         }
     }
@@ -176,20 +213,29 @@ static inline void connection_recv(unsigned int tid, struct connection *c, uint3
 
     uint32_t target_bytes1 = 0;
     uint32_t target_bytes2 = 0;
+
+    bool skip1 = false;
+    bool skip2 = false;
     while (1) {
-        if(stream_id & 1u << 0) {
+        if(stream_id & 1u << 0 && !skip1) {
             target_bytes1 = c->message_bytes1 - c->recv_len1;
             target_bytes_with_stream_id1 = target_bytes1;
             //printf("STREAM 1\n");
             target_bytes_with_stream_id1 = target_bytes1 | 1u << 31;
             ret1 = read(c->fd, c->buf1 + c->recv_len1, target_bytes_with_stream_id1);
+
+            if(ret1 == 0)
+                skip1 = true;
         }
-        if(stream_id & 1u << 1) {
+        if(stream_id & 1u << 1 && !skip2) {
             target_bytes2 = c->message_bytes2 - c->recv_len2;
             target_bytes_with_stream_id2 = target_bytes2;
             //printf("STREAM 1\n");
             target_bytes_with_stream_id2 = target_bytes2 | 1u << 30;
-            ret1 = read(c->fd, c->buf2 + c->recv_len2, target_bytes_with_stream_id2);
+            ret2 = read(c->fd, c->buf2 + c->recv_len2, target_bytes_with_stream_id2);
+
+            if(ret2 == 0)
+                skip2 = true;
         }
 
         //printf("Read %lu bytes\n", ret);
@@ -205,11 +251,11 @@ static inline void connection_recv(unsigned int tid, struct connection *c, uint3
         if(ret1 == 0 && ret2 == 0) {     
             break;
         }
-        if (c->recv_len1 == c->message_bytes1) {
+        if (!skip1 && c->recv_len1 == c->message_bytes1) {
             c->recv_len1 = 0;
             c->pending_bytes1 += c->response_bytes1;
         }
-        if (c->recv_len2 == c->message_bytes2) {
+        if (!skip1 && c->recv_len2 == c->message_bytes2) {
             c->recv_len2 = 0;
             c->pending_bytes2 += c->response_bytes2;
         }

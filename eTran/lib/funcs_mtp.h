@@ -40,7 +40,7 @@ void mtp_add_data_seg_wrapper(struct app_ctx_per_thread *tctx, char *pkt, unsign
     struct iphdr *ip = (struct iphdr *)(pkt + sizeof(struct ethhdr));
     struct tcphdr *tcp = (struct tcphdr *)(pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
 
-    struct eTran_tcp_flow_tuple tuple = {ip->saddr, ntohs(tcp->source), ip->daddr, ntohs(tcp->dest)};
+    struct eTran_quic_stream_tuple tuple = {ip->saddr, ntohs(tcp->source), ip->daddr, ntohs(tcp->dest), tcp->urg_ptr};
 
     // If it is the first packet
     if(!tctx->mtp_values[tuple].following_packets) {

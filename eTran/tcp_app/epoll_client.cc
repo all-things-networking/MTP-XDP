@@ -84,7 +84,7 @@ struct connection {
     float start_time;
     float end_time;
     
-    connection(int fd, unsigned int message_bytes_long, unsigned int message_bytes_short, unsigned int max_outstanding) : fd(fd), /*message_bytes(message_bytes), */max_outstanding(max_outstanding) {
+    connection(int fd, unsigned int message_bytes_short, unsigned int message_bytes_long, unsigned int max_outstanding) : fd(fd), /*message_bytes(message_bytes), */max_outstanding(max_outstanding) {
         no_epoll_out1 = false;
         no_epoll_out2 = false;
         recv_len1 = 0;
@@ -139,7 +139,7 @@ static inline int connection_send(unsigned int tid, struct connection *c)
             target_bytes1 = std::min(c->pending_bytes1, c->message_bytes1);
             write_bytes_with_stream_id1 = std::min(target_bytes1, (unsigned int)DATA_BLOCK_SIZE);
             write_bytes_with_stream_id1 |= 1u << 31;
-            printf("BEFORE WRITE S1 %u \n", (c->total_bytes1 - c->pending_bytes1));
+            printf("BEFORE WRITE S1 %u %u %u \n", c->total_bytes1, c->pending_bytes1, (c->total_bytes1 - c->pending_bytes1));
             fflush(stdout);
             ret1 = write(c->fd, c->buf1 + (c->total_bytes1 - c->pending_bytes1), write_bytes_with_stream_id1);
             printf("AFTER WRITE S1 %u \n", (c->total_bytes1 - c->pending_bytes1));
@@ -238,7 +238,7 @@ static inline void connection_recv(unsigned int tid, struct connection *c, uint3
         
         if(stream_id & 1u << 0 && !skip1) {
             target_bytes1 = short_response ? SHORT_RESPONSE_SIZE : c->message_bytes1;
-            target_bytes_with_stream_id1 = target_bytes1;
+            target_bytes_with_stream_id1 = std::min(target_bytes1, (unsigned int)DATA_BLOCK_SIZE);
             //printf("STREAM 0\n");
             target_bytes_with_stream_id1 = target_bytes1 | 1u << 31;
             printf("READ RET STREAM 1 BEFORE %lu %u\n", ret1, c->pending_bytes1);
@@ -251,7 +251,7 @@ static inline void connection_recv(unsigned int tid, struct connection *c, uint3
         }
         if(stream_id & 1u << 1 && !skip2) {
             target_bytes2 = short_response ? SHORT_RESPONSE_SIZE : c->message_bytes2;
-            target_bytes_with_stream_id2 = target_bytes2;
+            target_bytes_with_stream_id2 = std::min(target_bytes2, (unsigned int)DATA_BLOCK_SIZE);
             //printf("STREAM 1\n");
             target_bytes_with_stream_id2 = target_bytes_with_stream_id2 | 1u << 30;
             printf("READ RET STREAM 2 BEFORE %lu %u\n", ret2, c->pending_bytes2);
@@ -276,16 +276,22 @@ static inline void connection_recv(unsigned int tid, struct connection *c, uint3
             // no more data
             break;
         }
-        if (c->recv_len1 >= target_bytes1) {
+        if (stream_id & 1u << 0 && !skip1 && c->recv_len1 >= target_bytes1) {
+            printf("->>> before recv 1 increase %u %u %u %u\n", c->recv_len1, target_bytes1, c->pending_bytes1, c->message_bytes1);
+            fflush(stdout);
             c->recv_len1 -= target_bytes1;
             c->pending_bytes1 += c->message_bytes1;
+            printf("->>> after recv 1 increase %u %u %u %u\n", c->recv_len1, target_bytes1, c->pending_bytes1, c->message_bytes1);
+            fflush(stdout);
         }
-        printf("BEFORE CONDITION %u %u\n", c->recv_len2, target_bytes2);
-        if (c->recv_len2 >= target_bytes2) {
-            printf("CONDITION %u %u\n", c->recv_len2, target_bytes2);
+
+        if (stream_id & 1u << 1 && !skip2 && c->recv_len2 >= target_bytes2) {
+            printf("->>> before recv 2 increase %u %u %u %u\n", c->recv_len2, target_bytes2, c->pending_bytes2, c->message_bytes2);
             fflush(stdout);
             c->recv_len2 -= target_bytes2;
-            //c->pending_bytes2 += c->message_bytes2;
+            c->pending_bytes2 += c->message_bytes2;
+            printf("->>> after recv 2 increase %u %u %u %u\n", c->recv_len2, target_bytes2, c->pending_bytes2, c->message_bytes2);
+            fflush(stdout);
         }
     }
     printf("------END RECV------\n\n");
@@ -363,7 +369,7 @@ void thread_func(unsigned int tid)
         }
 
         ev.events = EPOLLIN | EPOLLOUT | EPOLLERR;
-        ev.data.ptr = new connection(fd, message_bytes_long, message_bytes_short, max_outstanding);
+        ev.data.ptr = new connection(fd, message_bytes_short, message_bytes_long, max_outstanding);
 
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
             //fprintf(stderr, "Failed to add fd to epoll\n");

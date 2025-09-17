@@ -48,6 +48,53 @@ struct eTran_tcp_flow_tuple_equal
     }
 };
 
+struct eTran_quic_stream_tuple {
+    uint32_t remote_ip;
+    uint16_t remote_port;
+    uint32_t local_ip;
+    uint16_t local_port;
+    uint16_t stream_id;
+
+    // constructor
+    eTran_quic_stream_tuple(uint32_t remote_ip, uint16_t remote_port, 
+                         uint32_t local_ip, uint16_t local_port, 
+                         uint16_t stream_id)
+        : remote_ip(remote_ip), remote_port(remote_port), 
+          local_ip(local_ip), local_port(local_port), 
+          stream_id(stream_id) {}
+    
+    uint32_t hash() const
+    {
+        return (((std::hash<uint32_t>()(remote_ip) ^ (std::hash<uint32_t>()(local_ip) << 1)) >> 1) ^
+                (std::hash<uint16_t>()(remote_port) << 1) ^
+                (std::hash<uint16_t>()(local_port) << 1)) ^
+                (std::hash<uint16_t>()(stream_id) << 1);
+    }
+};
+
+struct eTran_quic_stream_tuple_hash
+{
+    std::size_t operator()(const eTran_quic_stream_tuple &k) const
+    {
+        return (((std::hash<uint32_t>()(k.remote_ip) ^ (std::hash<uint32_t>()(k.local_ip) << 1)) >> 1) ^
+                (std::hash<uint16_t>()(k.remote_port) << 1) ^
+                (std::hash<uint16_t>()(k.local_port) << 1)) ^
+                (std::hash<uint16_t>()(k.stream_id) << 1);
+    }
+};
+
+struct eTran_quic_stream_tuple_equal
+{
+    bool operator()(const eTran_quic_stream_tuple &lhs, const eTran_quic_stream_tuple &rhs) const
+    {
+        return lhs.remote_ip == rhs.remote_ip && 
+               lhs.remote_port == rhs.remote_port && 
+               lhs.local_ip == rhs.local_ip &&
+               lhs.local_port == rhs.local_port &&
+               lhs.stream_id == rhs.stream_id;
+    }
+};
+
 struct eTrantcp_listener {
     std::list<struct tcp_connection *> conns;
 

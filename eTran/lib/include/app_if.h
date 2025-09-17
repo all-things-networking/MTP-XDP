@@ -194,7 +194,8 @@ struct app_ctx_per_thread {
 
     /* Values added in MTP */
 
-    std::unordered_map<struct eTran_tcp_flow_tuple, struct mtp_value, eTran_tcp_flow_tuple_hash, eTran_tcp_flow_tuple_equal> mtp_values;
+    //std::unordered_map<struct eTran_tcp_flow_tuple, struct mtp_value, eTran_tcp_flow_tuple_hash, eTran_tcp_flow_tuple_equal> mtp_values;
+    std::unordered_map<struct eTran_quic_stream_tuple, struct mtp_value, eTran_quic_stream_tuple_hash, eTran_quic_stream_tuple_equal> mtp_values;
 };
 
 // application context in application
