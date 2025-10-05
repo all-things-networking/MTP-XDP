@@ -508,6 +508,11 @@ static inline int process_tcp_kernel_events(struct app_ctx_per_thread *tctx, str
                     std::make_pair(eTran_tcp_flow_tuple(accept_msg->remote_ip, accept_msg->remote_port, accept_msg->local_ip,
                                                         ret_events[nr_event].ev.accept.conn->local_port),
                                    ret_events[nr_event].ev.accept.conn));
+                struct mtp_value new_fields = {0};
+                tctx->mtp_values.insert(
+                std::make_pair(eTran_tcp_flow_tuple(accept_msg->remote_ip, accept_msg->remote_port, accept_msg->local_ip,
+                                                    ret_events[nr_event].ev.accept.conn->local_port),
+                                new_fields));
             }
             else
             {
@@ -539,6 +544,13 @@ static inline int process_tcp_kernel_events(struct app_ctx_per_thread *tctx, str
                                                                             ret_events[nr_event].ev.open.conn->local_ip,
                                                                             ret_events[nr_event].ev.open.conn->local_port),
                                                        ret_events[nr_event].ev.open.conn));
+                struct mtp_value new_fields = {0};
+                tctx->mtp_values.insert(
+                std::make_pair(eTran_tcp_flow_tuple(ret_events[nr_event].ev.open.conn->remote_ip,
+                                                    ret_events[nr_event].ev.open.conn->remote_port,
+                                                    ret_events[nr_event].ev.open.conn->local_ip,
+                                                    ret_events[nr_event].ev.open.conn->local_port),
+                                new_fields));
 
                 // generate a ETRANTCP_EV_CONN_SENDBUF event
                 nr_event++;
@@ -901,6 +913,11 @@ void tcp_flow_tx_segmentation_zc(struct app_ctx_per_thread *tctx, struct eTrantc
                 tcp_txmeta_pending(umem_area, addr, len);
                 first_pkt = false;
             }
+            #if MTP_ON
+            else {
+                tcp_txmeta_pending(umem_area, addr, 0);
+            }
+            #endif
 
             dma(pkt, (uint8_t *)buf + copy_offset, plen);
 

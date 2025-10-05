@@ -283,7 +283,7 @@ static __always_inline __u32 fast_retransmit(struct bpf_tcp_conn *c, struct bpf_
 
 // Caller must hold bpf_spin_lock
 static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph, struct bpf_tcp_conn *c, struct meta_info *data_meta, void *data_end,
-    struct app_timer_event *ev)
+    struct app_timer_event *ev, struct TCPBP *bp)
 {
     __u32 cpu = bpf_get_smp_processor_id();
     if (unlikely(cpu >= MAX_CPU))
@@ -365,7 +365,7 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
     // but there are pending packets in the queue, simply drop them
     if (unlikely(tx_pos != c->tx_next_pos)) {
         TCP_UNLOCK(c);
-        xdp_egress_log("tx_pos(%u) != c->tx_next_pos(%u)", tx_pos, c->tx_next_pos);
+        bpf_printk("tx_pos(%u) != c->tx_next_pos(%u)", tx_pos, c->tx_next_pos);
         // bpf_printk("tx_pos(%u) != c->tx_next_pos(%u)", tx_pos, c->tx_next_pos);
         return XDP_DROP;
     }
@@ -385,7 +385,13 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
     struct interm_out int_out;
     ev->timestamp = ref_ts;
     if(ev->type == APP_EVENT) {
-        send_ep(ev, c, &int_out, data_meta, cc, tcph, iph, data_end);
+        if(data_meta->tx.tx_pending > 0) { // First packet of batch
+            send_ep(ev, c, &int_out, data_meta, cc, tcph, iph, data_end, bp);
+            //bpf_printk("send");
+        } else {
+            following_pkts(bp, c, data_meta, cc, tcph, iph, ev->timestamp, data_end);
+            //bpf_printk("following");
+        }
     } else if(ev->type == TIMER_EVENT) {
         int xdp_op = ack_timeout_xdp_ep(ev, c, &int_out, data_meta, cc);
         TCP_UNLOCK(c);
