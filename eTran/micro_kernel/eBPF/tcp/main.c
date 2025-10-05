@@ -159,6 +159,8 @@ int xdp_egress_prog(struct xdp_md *ctx)
     struct ebpf_flow_tuple key;
     struct meta_info *data_meta;
 
+
+    /* Packet parsing */
     if (unlikely(ret = bpf_xdp_adjust_meta(ctx, -(int)sizeof(*data_meta)))) {
         xdp_egress_log_panic("xdp_adjust_meta failed: %d", ret);
         return XDP_EGRESS_DROP;
@@ -198,6 +200,8 @@ int xdp_egress_prog(struct xdp_md *ctx)
         goto err_pkt;
     }
 
+    /* Flow context retrieval */
+
     key.local_ip = bpf_ntohl(iph->saddr);
     key.remote_ip = bpf_ntohl(iph->daddr);
     key.local_port = bpf_ntohs(tcph->source);
@@ -209,16 +213,12 @@ int xdp_egress_prog(struct xdp_md *ctx)
         goto err_pkt;
     }
 
+    /* Packet blueprint retrieval */
+
     struct TCPBP *bp = NULL;
     if(!get_pkt_bp_mtp(&key, &bp) || !bp)
         return XDP_DROP;
 
-    // // qid check
-    // if (unlikely(c->qid != ctx->rx_queue_index)) {
-    //     xdp_egress_log_err("ctx->rx_queue_index(%u) != c->qid(%u)", ctx->rx_queue_index, c->qid);
-    //     goto err_pkt;
-    // }
-    
     // address and port check
     if (unlikely(c->local_ip != key.local_ip || c->remote_ip != key.remote_ip ||
                  c->local_port != key.local_port || c->remote_port != key.remote_port)) {
@@ -229,17 +229,10 @@ int xdp_egress_prog(struct xdp_md *ctx)
     struct app_timer_event ev;
 
     #ifdef MTP_ON
-    // Question: this comparison to check if it is a timeout flag might be
-    // problematic. This is because this flag represent the idea of timeout as a whole, i.e.
-    // if we had multiple timers, they would all be represented by this one.
-    // But the problem is that changing the metadata will probably be difficult. Again, the
-    // problem with the metadata
     if (unlikely(data_meta->tx.flag & FLAG_TO)) {
         ev = parse_req_to_timer_event(data_meta);
-        //ret = app_ev_dispatcher(&ev, c, data_meta);
     } else {
         ev = parse_req_to_app_event(data_meta);
-        //ret = timer_ev_dispatcher(&ev, c, data_meta);
     }
     #endif
 
@@ -264,12 +257,6 @@ int xdp_egress_prog(struct xdp_md *ctx)
         goto redirect;
     }
 
-    #ifdef XDP_EGRESS_DEBUG
-    //bpf_printk("");
-    //xdp_egress_dump_eth(eth);
-    //xdp_egress_dump_ip(iph);
-    //xdp_egress_dump_tcp(tcph);
-    #endif
     return XDP_TX;
 
 redirect:
