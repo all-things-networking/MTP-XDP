@@ -282,140 +282,87 @@ static __always_inline __u32 fast_retransmit(struct bpf_tcp_conn *c, struct bpf_
 }
 
 // Caller must hold bpf_spin_lock
-static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph, struct bpf_tcp_conn *c, struct meta_info *data_meta, void *data_end,
-    struct app_timer_event *ev, struct TCPBP *bp)
+static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph, struct bpf_tcp_conn *c,
+    struct meta_info *data_meta, void *data_end, struct app_timer_event *ev, struct TCPBP *bp,
+    struct bpf_cc *cc)
 {
-    __u32 cpu = bpf_get_smp_processor_id();
-    if (unlikely(cpu >= MAX_CPU))
-        return XDP_DROP;
     __u32 rx_bump = data_meta->tx.rx_bump;
     __u32 payload_len = data_meta->tx.plen;
-    #ifndef MTP_ON
-    __u32 tx_pending = data_meta->tx.tx_pending;
-    #endif
     __u32 tx_pos = data_meta->tx.tx_pos;
-    
-    __u64 ref_ts = 0;
-    // optimization for timestamp
-    if (!has_kick[cpu])
-        ref_ts = bpf_ktime_get_ns();
-    else
-        ref_ts = tx_cached_ts[cpu];
 
     bool wnd_upd = false;
 
-    struct bpf_cc *cc = bpf_map_lookup_elem(&bpf_cc_map, &c->cc_idx);
-    if (unlikely(!cc)) {
-        xdp_log_panic("cc is NULL, BUG!!!");
-        return XDP_DROP;
-    }
-
     TCP_LOCK(c);
 
-    #ifndef MTP_ON
-    /* Timeout packet from slowpath, process it first */
-    if (unlikely(data_meta->tx.flag & FLAG_TO)) {
-        if (!c->tx_sent) {
-            TCP_UNLOCK(c);
-            xdp_egress_log("Timeout but no data to retransmit");
-            return XDP_DROP;
-        }
-        data_meta->rx.go_back_pos = fast_retransmit(c, cc);
-        // prepare to redirect to userspace
-        data_meta->rx.qid = POISON_32;
-        data_meta->rx.conn = c->opaque_connection;
-        data_meta->rx.rx_pos = POISON_32;
-        data_meta->rx.poff = POISON_16;
-        data_meta->rx.plen = POISON_16;
-        data_meta->rx.xsk_budget_avail = xsk_budget_avail(c);
-        data_meta->rx.go_back_pos |= RECOVERY_MASK;
-        data_meta->rx.ooo_bump = POISON_32;
-        TCP_UNLOCK(c);
-        // bpf_printk("Timeout triggers fast retransmission");
-        return XDP_PASS; // redirect to userspace
-    }
-    #endif
+    /* 
+    Receives an update from userspace, specifying the amount of space in the RX buffer
+    was freed there.
 
-    /* update receving buffer space */
+    Question: could we consider this a part of the eTran-specific TCP implementation
+    and have it in an EP? Having rx_bump as a value in the application event
+    */
     if (rx_bump) {
-        // if ((c->rx_avail >> TCP_WND_SCALE) == 0 && c->tx_avail == 0)
         if (c->tx_pending == 0)
             wnd_upd = true;
         c->rx_avail += rx_bump;
-        xdp_egress_log("Rxwnd is updated from %u to %u", min((c->rx_avail - rx_bump) >> TCP_WND_SCALE, 0xFFFF), c->rx_avail);
     }
 
-    /* Pure sync packet from userspace, drop or send a extra window update */
+    /*
+    Userspace may send a dummy packet for synchronization, which might result
+    in being sent to the other side to specify the current RX buffer size (window update).
+
+    Question: again, this seems to be a eTran-specific TCP implementation part.
+    Can we add it to an EP?
+    */
     if (unlikely(data_meta->tx.flag & FLAG_SYNC)) {
-        xdp_egress_log("pure ctrl signal");
         if (wnd_upd) {
-            /* receive buffer freed up from empty, need to send out a window update, if
-             * we're not sending anyways. */
-            fill_tcp_hdr(iph, tcph, c, ref_ts, data_end, TCP_FLAG_ACK);
+            fill_tcp_hdr(iph, tcph, c, ev->timestamp, data_end, TCP_FLAG_ACK);
             fill_ip_hdr(iph, 0, false);
             TCP_UNLOCK(c);
-            xdp_egress_log("Rxwnd is updated from empty to %u, send extra ack", min(c->rx_avail >> TCP_WND_SCALE, 0xFFFF));
             return XDP_TX;
         }
         TCP_UNLOCK(c);
         return XDP_DROP;
     }
 
-    // this is probably caused by fast retransmission as we reset the c->tx_next_pos
-    // but there are pending packets in the queue, simply drop them
+    /*
+    When fast-retransmission is done in XDP, we move c->tx_next_pos N steps
+    back (go-back-N). And, since, we dispatch packets in batches via AF_XDP, some
+    of the already enqueued packets (in TX ring buffer) may need to be dropped,
+    as they may be beyond the decreased c->tx_next_pos.
+    
+    Question: where to put this?
+    */
     if (unlikely(tx_pos != c->tx_next_pos)) {
         TCP_UNLOCK(c);
-        bpf_printk("tx_pos(%u) != c->tx_next_pos(%u)", tx_pos, c->tx_next_pos);
-        // bpf_printk("tx_pos(%u) != c->tx_next_pos(%u)", tx_pos, c->tx_next_pos);
         return XDP_DROP;
     }
 
-    /*__u32 avail = tcp_txavail(c);
 
-    if (unlikely(avail < payload_len)) {
-        // FIXME
-        // bpf_printk("c->rx_remote_avail(%u), c->tx_sent(%u), c->tx_avail(%u), payload_len(%u)", 
-        //     c->rx_remote_avail, c->tx_sent, c->tx_avail, payload_len);
-        // bpf_printk("avail(%u) < payload_len(%u)", avail, payload_len);
-    }*/
-
-    __u64 desired_tx_ts = cc_get_desired_tx_ts(cc, ref_ts, payload_len);
-
-    #ifdef MTP_ON
+    /* Dispatcher */
     struct interm_out int_out;
-    ev->timestamp = ref_ts;
+
     if(ev->type == APP_EVENT) {
-        if(data_meta->tx.tx_pending > 0) { // First packet of batch
+        if(ev->data_size > 0) { // First packet of batch
             send_ep(ev, c, &int_out, data_meta, cc, tcph, iph, data_end, bp);
-            //bpf_printk("send");
         } else {
             following_pkts(bp, c, data_meta, cc, tcph, iph, ev->timestamp, data_end);
-            //bpf_printk("following");
         }
     } else if(ev->type == TIMER_EVENT) {
         int xdp_op = ack_timeout_xdp_ep(ev, c, &int_out, data_meta, cc);
         TCP_UNLOCK(c);
         return xdp_op;
     }
-    #else
-    if (tx_pending)
-        c->tx_pending += tx_pending;
 
-    fill_tcp_hdr(iph, tcph, c, desired_tx_ts, data_end, 0);
-    fill_ip_hdr(iph, payload_len, c->ecn_enable);
-    c->tx_next_seq += payload_len;
-    c->tx_sent += payload_len;
-    cc->txp = c->tx_sent > 0;
-    c->tx_pending -= payload_len;
-    c->tx_next_pos += payload_len;
-    if (c->tx_next_pos >= c->tx_buf_size)
-        c->tx_next_pos -= c->tx_buf_size;
-    #endif
+    /* End of dispatcher */
 
-    // /*** NO CC ***/
-    // TCP_UNLOCK(c);
-    // // xdp_egress_log("Always bypass rate limiter");
-    // return XDP_TX;
+    /* Rate limiting stage */
+
+    __u32 cpu = bpf_get_smp_processor_id();
+    if (unlikely(cpu >= MAX_CPU))
+        return XDP_DROP;
+
+    __u64 desired_tx_ts = cc_get_desired_tx_ts(cc, ev->timestamp, payload_len);
     
     #ifdef BYPASS_RL
     if (cc->rate >= LINK_BANDWIDTH && !nr_pkts_in_tw[cpu]) {
@@ -425,20 +372,12 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
     #endif
 
     #ifdef BYPASS_RL
-    #ifdef MTP_ON
-    if ((!nr_pkts_in_tw[cpu] || c->tx_next_seq - c->send_una == payload_len) && desired_tx_ts <= ref_ts) {
+    if ((!nr_pkts_in_tw[cpu] || c->tx_next_seq - c->send_una == payload_len) && desired_tx_ts <= ev->timestamp) {
         goto bypass_rl;
     }
-    #else
-    if ((!nr_pkts_in_tw[cpu] || c->tx_sent == payload_len) && desired_tx_ts <= ref_ts) {
-        goto bypass_rl;
-    }
-    #endif
     #endif
 
     TCP_UNLOCK(c);
-
-    // bpf_printk("cc->rate(%lu)", cc->rate);
 
     __u32 key = cpu;
     struct timing_wheel *tw_map = bpf_map_lookup_elem(&tw_outer_map, &key);
@@ -452,7 +391,8 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
         log_panic("idx == POISON_32");
         return XDP_DROP;
     }
-    // bpf_printk("TW idx(%u), tx_ts(%lu), (%u)", idx, desired_tx_ts, cc->rate);
+
+    /* End of rate limiting stage */
 
     return bpf_redirect_map(tw_map, idx, 0);
 

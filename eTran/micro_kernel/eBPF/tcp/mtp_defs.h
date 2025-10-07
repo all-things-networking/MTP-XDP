@@ -43,10 +43,12 @@ struct app_timer_event {
     __u8 type;
     // APP fields
     __u32 data_size;
-    __u32 timestamp;
 
     // TIMER fields
     __u32 seq_num;
+
+    // Field for both
+    __u64 timestamp;
 };
 struct net_event {
     __u8 minor_type;

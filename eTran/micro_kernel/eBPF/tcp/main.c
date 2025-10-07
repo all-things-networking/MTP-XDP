@@ -128,9 +128,7 @@ int xdp_gen_prog(struct xdp_md *ctx)
     tcph->syn = 0;
     tcph->rst = 0;
     tcph->psh = 0;
-    // TODO: remember to change this back when ACK ep is working properly
-    tcph->ack = 1;
-    //tcph->ack = ack->is_ack;
+    tcph->ack = ack->is_ack;
     tcph->urg = 0;
     tcph->ece = ack->ecn_flags;
     tcph->cwr = 0;
@@ -187,7 +185,9 @@ int xdp_egress_prog(struct xdp_md *ctx)
         xdp_egress_log_err("iph + 1 > data_end");
         goto err_pkt;
     }
-    // TODO: use another way to distinguish packets from slowpath, e.g., a encrpyted key
+
+    // Packet from slowpath (usually connection stablishment)
+    // Has to bypass the XDP_EGRESS processing
     if (unlikely(data_meta->tx.slowpath && !(data_meta->tx.flag & FLAG_TO))) {
         xdp_egress_log("slowpath packet");
         return xmit_packet_fib_lookup(ctx, eth, iph);
@@ -199,6 +199,8 @@ int xdp_egress_prog(struct xdp_md *ctx)
         xdp_egress_log_err("tcph + 1 > data_end");
         goto err_pkt;
     }
+
+    /* End of packet parsing */
 
     /* Flow context retrieval */
 
@@ -213,19 +215,28 @@ int xdp_egress_prog(struct xdp_md *ctx)
         goto err_pkt;
     }
 
+    eth->h_proto = bpf_htons(ETH_P_IP);
+    __builtin_memcpy(eth->h_dest, c->remote_mac, ETH_ALEN);
+    __builtin_memcpy(eth->h_source, c->local_mac, ETH_ALEN);
+
+    /* CC context retrieval */
+
+    struct bpf_cc *cc = bpf_map_lookup_elem(&bpf_cc_map, &c->cc_idx);
+    if (unlikely(!cc)) {
+        xdp_log_panic("cc is NULL, BUG!!!");
+        return XDP_DROP;
+    }
+
     /* Packet blueprint retrieval */
 
     struct TCPBP *bp = NULL;
     if(!get_pkt_bp_mtp(&key, &bp) || !bp)
         return XDP_DROP;
 
-    // address and port check
-    if (unlikely(c->local_ip != key.local_ip || c->remote_ip != key.remote_ip ||
-                 c->local_port != key.local_port || c->remote_port != key.remote_port)) {
-        xdp_egress_log_err("address and port check failed");
-        goto err_pkt;
-    }
+    /* End of flow/CC context/pkt_bp retrieval */
 
+
+    /* Packet ("request") parsing */
     struct app_timer_event ev;
 
     #ifdef MTP_ON
@@ -236,8 +247,13 @@ int xdp_egress_prog(struct xdp_md *ctx)
     }
     #endif
 
-    ret = tcp_tx_process(iph, tcph, c, data_meta, data_end, &ev, bp);
+    /* End of packet ("request") parsing */
 
+
+    /* Function that contains dispatcher and rate limiting */
+    ret = tcp_tx_process(iph, tcph, c, data_meta, data_end, &ev, bp, cc);
+
+    // Drops in case any error happens or packet shouldn't be transmitted
     if (ret == XDP_DROP) {
         if (data_meta->tx.flag) {
             return XDP_EGRESS_DROP;
@@ -245,27 +261,25 @@ int xdp_egress_prog(struct xdp_md *ctx)
         xdp_egress_log_err("TCP thinks the packet is invalid");
         goto err_pkt;
     }
-    
-    eth->h_proto = bpf_htons(ETH_P_IP);
-    __builtin_memcpy(eth->h_dest, c->remote_mac, ETH_ALEN);
-    __builtin_memcpy(eth->h_source, c->local_mac, ETH_ALEN);
 
+    // Redirects the packet to be enqueued to timing wheel
     if (ret == XDP_REDIRECT) {
         kick_tw();
         return ret;
-    } else if (ret == XDP_PASS) {
+    }
+    // Redirects the packet back to userspace (dummy packet generated from timeout)
+    else if (ret == XDP_PASS) {
         goto redirect;
     }
 
+    // Transmits packet out
     return XDP_TX;
 
 redirect:
-    // make verifier happy
     if (unlikely(ctx->rx_queue_index >= MAX_NIC_QUEUES)) {
         xdp_egress_log_err("qid >= MAX_NIC_QUEUES");
         return XDP_EGRESS_DROP;
     }
-    // FIXME: fail to redirect?
     return bpf_redirect_map(&xsks_map, c->qid2xsk[ctx->rx_queue_index], XDP_DROP);
 
 err_pkt:

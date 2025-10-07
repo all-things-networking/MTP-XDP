@@ -6,7 +6,7 @@
 // TODO: fix bug when there's a bpf_printk
 // Probably some error related to the lower rate of transmitting packets
 
-// Fill TCP header excpet for ports
+// Fill TCP header except for ports
 static __always_inline void mtp_fill_tcp_hdr(struct tcphdr *tcph, struct bpf_tcp_conn *c, void *data_end, __u16 flags,
     struct TCPBP *bp)
 {
@@ -42,7 +42,11 @@ static __always_inline void mtp_pkt_gen_wrapper(bool seg_unseg, struct TCPBP *bp
     struct tcphdr *tcph, struct iphdr *iph, void *data_end, __u32 data_size, __u32 seq_num,
     __u8 ev_type, struct meta_info *data_meta) {
 
-    if(seg_unseg == SEG_DATA || (c->buf_curr_seq < seq_num)) {
+    /*
+    In case the MTP instruction segments data.
+    This situation happens when the first packet of a batch is processed in send_ep
+    */
+    if(seg_unseg == SEG_DATA/* || (c->buf_curr_seq < seq_num)*/) {
         c->buf_curr_seq += min(data_size, TCP_MSS_W_TS);
         c->tx_next_pos += min(data_size, TCP_MSS_W_TS);
         if (c->tx_next_pos >= c->tx_buf_size)
@@ -52,7 +56,13 @@ static __always_inline void mtp_pkt_gen_wrapper(bool seg_unseg, struct TCPBP *bp
 
         bp->seq_num += min(data_size, TCP_MSS_W_TS);
 
-    } else {
+    }
+    /*
+    In case the MTP instruction doesn't segment data.
+    This happens when a triple duplicate ACK appears and we trigger retransmission,
+    or when a timeout happens.
+    */
+    else {
         __u32 go_back_bytes = c->buf_curr_seq - seq_num;
         c->buf_curr_seq -= go_back_bytes;
         if (c->tx_next_pos >= go_back_bytes) {
@@ -141,12 +151,14 @@ static __always_inline struct app_timer_event parse_req_to_app_event(struct meta
     ev.type = APP_EVENT;
     //ev.data_size = data_meta->tx.plen;
     ev.data_size = data_meta->tx.tx_pending;
+    ev.timestamp = bpf_ktime_get_ns();
     return ev;
 }
 
 static __always_inline struct app_timer_event parse_req_to_timer_event(struct meta_info *data_meta) {
     struct app_timer_event ev;
     ev.type = TIMER_EVENT;
+    ev.timestamp = bpf_ktime_get_ns();
     return ev;
 }
 
@@ -172,8 +184,6 @@ static __always_inline void send_ep (struct app_timer_event *ev, struct bpf_tcp_
     bp->dest_port = c->remote_port;
     bp->seq_num = c->tx_next_seq;
     bp->is_ack = false;
-
-    // TODO: add other values to BP and add default values
     bp->ack_seq = c->rx_next_seq;
     bp->rwnd_size = c->rx_avail;
 
@@ -183,15 +193,11 @@ static __always_inline void send_ep (struct app_timer_event *ev, struct bpf_tcp_
     cc->prev_desired_tx_ts = desired_tx_ts;
     bp->ts_opt.desired_tx_ts = desired_tx_ts;
 
-    // Note: I am abstracting the seg_data and pkt_gen_instr in this function.
-    // The 5th argument is the second argument of seg_data (the length)
     mtp_pkt_gen_wrapper(SEG_DATA, bp, c, tcph, iph, data_end, ev->data_size, 0, 0, data_meta);
 
     c->tx_next_seq += ev->data_size;
 
     cc->txp = c->tx_next_seq != c->send_una;
-
-    // TODO: add functions to initialize timers
 }
 
 static __always_inline void following_pkts (struct TCPBP *bp, struct bpf_tcp_conn *c, struct meta_info *data_meta,
@@ -245,31 +251,6 @@ static __always_inline int ack_timeout_xdp_ep (struct app_timer_event *ev, struc
 
     cc->cnt_tx_drops++;
 
-    // Question IMPORTANT:
-    // In MTP, when we want to retransmit the packet with unseg_data,
-    // we specify that it should retransmit from send_una.
-    // However, in eTran we have to send the position in the TX buffer
-    // that should start retransmitting from (tx_next_pos).
-    // To get this position, we have to know how many go_back_bytes
-    // we have to decrease the position.
-    // We can obtain the go_back_bytes from send_next - send_una.
-    // But, in unseg_data/pkt_gen_instr we just specify send_una as
-    // one the arguments. So, how can we get the go_back_bytes to
-    // get tx_next_pos?
-    // (This whole thing is a problem because we want to abstract tx_next_pos)
-    // A: photo
-
-    // Question:
-    // Can we simply ignore pkt_bp when it is generated for retransmission?
-    // In the end, the userspace won't use it in any way and a pkt_bp will be
-    // generated when it regenerates the packet
-    // A: ignore for now
-
-    // Question:
-    // I would like to have this function that wraps the code that eTran uses
-    // for packet retransmission and translate from a pkt_gen_instr.
-    // But would the compiler be able to know it is for a retransmission?
-    // A: have a single wrapper and use buf_cur_seq for the decision and see if it is alligned
     struct TCPBP bp = {0};
     mtp_pkt_gen_wrapper(UNSEG_DATA, &bp, c, NULL, NULL, NULL, 0, c->send_una, TIMER_EVENT, data_meta);
     return XDP_PASS; // redirect to userspace
@@ -349,9 +330,6 @@ static __always_inline void ack_net_ep(struct net_event *ev, struct bpf_tcp_conn
         int_out->drop = 0;
         c->rx_dupack_cnt = 0;
 
-        // Question IMPORTANT:
-        // Similar to the problem before, here we also specify the go_back_pos,
-        // but in MTP we give send_una
         struct TCPBP bp = {0};
         mtp_pkt_gen_wrapper(UNSEG_DATA, &bp, c, NULL, NULL, NULL, 0, c->send_una, NET_EVENT, data_meta);
 
