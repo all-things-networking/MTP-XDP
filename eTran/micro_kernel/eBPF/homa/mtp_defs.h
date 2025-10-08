@@ -87,6 +87,7 @@ struct COMMON_HDR {
 struct HOMABP {
     struct COMMON_HDR common;
     struct DATA_HDR data;
+    __u8 priority;
 };
 
 struct GRANT_HDR {
@@ -169,8 +170,6 @@ int get_pkt_bp_mtp(struct app_event * ev, struct HOMABP **bp, bool *first_packet
     return 1;
 }
 
-// Question: if we don't use BP to fill the initial context
-// values, what should we use?
 static __always_inline
 void new_ctx_instr_wrapper(struct rpc_state *ctx, struct app_event *ev, bool client, __u32 packet_bytes) {
 
@@ -178,7 +177,6 @@ void new_ctx_instr_wrapper(struct rpc_state *ctx, struct app_event *ev, bool cli
         /* create a new RPC state */
         ctx->state = BPF_RPC_OUTGOING;
         ctx->message_length = ev->msg_len;
-        //ctx->next_xmit_offset = bpf_ntohl(bp->data.seg.segment_length);
         ctx->next_xmit_offset = packet_bytes;
         ctx->buffer_head = ev->addr;
         ctx->remote_port = bpf_ntohs(ev->dest_port);
@@ -191,7 +189,6 @@ void new_ctx_instr_wrapper(struct rpc_state *ctx, struct app_event *ev, bool cli
         /* first received response packet */
         ctx->state = BPF_RPC_OUTGOING;
         ctx->message_length = ev->msg_len;
-        //ctx->next_xmit_offset = bpf_ntohl(bp->data.seg.segment_length);
         ctx->next_xmit_offset = packet_bytes;
         ctx->buffer_head = ev->addr;
         ctx->nr_pkts_in_rl = 0;
@@ -202,8 +199,16 @@ void new_ctx_instr_wrapper(struct rpc_state *ctx, struct app_event *ev, bool cli
     }
 }
 
+/*
+Question: in this wrapper for Homa, we basically copy the values from the
+BP to the header and update the BP for the next segment arriving to XDP_EGRESS.
+Meanwhile, mtp_pkt_gen_wrapper for TCP has two possible executions, one that
+pretty much does the same, and one that will specify some information in data_meta
+to send to userspace.
+Would it make sense to split the wrapper in TCP in two separate wrappers?
+*/
 static __always_inline
-void pkt_gen_instr_data_wrapper(struct data_header *d, struct HOMABP *bp) {
+void pkt_gen_instr_data_wrapper(struct data_header *d, struct HOMABP *bp, struct iphdr *iph) {
     d->common.sport = bp->common.src_port;
     d->common.dport = bp->common.dest_port;
     d->common.doff = bp->common.doff;
@@ -223,7 +228,10 @@ void pkt_gen_instr_data_wrapper(struct data_header *d, struct HOMABP *bp) {
     d->seg.ack.sport = bp->data.seg.ack.sport;
     d->seg.ack.dport = bp->data.seg.ack.dport;
 
-    // Update BP
+    /*
+    This part is where the header fields that vary for each
+    segment are updated (seq, offset, and length)
+    */
     __u32 temp_len = bpf_ntohl(bp->data.seg.segment_length);
     __u32 temp_offset = bpf_ntohl(bp->data.seg.offset);
     temp_offset += temp_len;
@@ -232,6 +240,8 @@ void pkt_gen_instr_data_wrapper(struct data_header *d, struct HOMABP *bp) {
     __u16 temp_seq = bpf_ntohs(bp->common.seq);
     temp_seq += 1;
     bp->common.seq = bpf_htons(temp_seq);
+
+    iph->tos = bp->priority;
 }
 
 static __always_inline
@@ -246,7 +256,7 @@ void sched_instr_wrapper(__u32 bytes_remaining, struct rpc_state *ctx) {
 }*/
  
 static __always_inline
-int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_event *ev, 
+int send_req_ep(struct data_header *d, struct iphdr *iph, struct app_event *ev, 
     struct rpc_state *ctx, struct HOMABP *bp, struct interm_out *int_out, __u32 seg_len)
 {
 
@@ -259,7 +269,6 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
 
     new_ctx_instr_wrapper(ctx, ev, true, packet_bytes);
 
-    //struct HOMABP bp;
     bp->common.src_port = bpf_htons(ev->src_port);
     bp->common.dest_port = ev->dest_port;
     bp->common.doff = 40 >> 2;
@@ -287,27 +296,22 @@ int send_req_ep_client(struct data_header *d, struct iphdr *iph, struct app_even
     bp->data.incoming = bpf_htonl(cc_granted);
 
     if (likely(single_packet)) {
-        set_prio(iph, HOMA_MAX_PRIORITY - 1);
+        bp->priority = (HOMA_MAX_PRIORITY - 1) << 5;
         bp->data.incoming = bpf_htonl(message_length);
+    } else {
+        if (offset + packet_bytes < Homa_unsched_bytes)
+            bp->priority = get_prio(message_length) << 5;
+        else
+            bp->priority = atomic_read(&ctx->cc.sched_prio) << 5;
     }
 
-    // Question: the priority is set also based on the length
-    // of the segment. How should we represent that in MTP and here?
-    if (offset + packet_bytes < Homa_unsched_bytes)
-        set_prio(iph, get_prio(message_length));
-    else
-        set_prio(iph, atomic_read(&ctx->cc.sched_prio));
-
-    pkt_gen_instr_data_wrapper(d, bp);
-
-    //__u32 bytes_remaining = ev->msg_len - cc_granted;
-    //sched_instr_wrapper(bytes_remaining, ctx);
+    pkt_gen_instr_data_wrapper(d, bp, iph);
 
     return XDP_TX;
 }
 
 static __always_inline
-int send_resp_ep_server(struct data_header *d, struct iphdr *iph, struct app_event *ev, 
+int send_resp_ep(struct data_header *d, struct iphdr *iph, struct app_event *ev, 
     struct rpc_state *ctx, struct HOMABP *bp, struct interm_out *int_out, __u32 seg_len)
 {
     __u32 message_length = ev->msg_len;
@@ -342,18 +346,18 @@ int send_resp_ep_server(struct data_header *d, struct iphdr *iph, struct app_eve
 
     __u64 cc_granted = atomic_read(&ctx->cc.granted);
     bp->data.incoming = bpf_htonl(cc_granted);
-    /* optimization for single-packet case */
+    
     if (likely(single_packet)) {
-        set_prio(iph, HOMA_MAX_PRIORITY - 1);
+        bp->priority = (HOMA_MAX_PRIORITY - 1) << 5;
         bp->data.incoming = bpf_htonl(message_length);
+    } else {
+        if (offset + packet_bytes < Homa_unsched_bytes)
+            bp->priority = get_prio(message_length) << 5;
+        else
+            bp->priority = atomic_read(&ctx->cc.sched_prio) << 5;
     }
 
-    if (offset + packet_bytes < Homa_unsched_bytes)
-        set_prio(iph, get_prio(message_length));
-    else
-        set_prio(iph, atomic_read(&ctx->cc.sched_prio));
-
-    pkt_gen_instr_data_wrapper(d, bp);
+    pkt_gen_instr_data_wrapper(d, bp, iph);
     return XDP_TX;
 }
 
@@ -366,17 +370,20 @@ int fill_other_pkts(struct data_header *d, struct iphdr *iph, struct app_event *
     __u32 packet_bytes = seg_len;
     __u64 cc_granted = atomic_read(&ctx->cc.granted);
 
+    /*
+    Question: in the MTP program, shouldn't the priority vary depending
+    for each segmented packet? Maybe we should add it for the segmentation rules
+    */
     bp->data.incoming = bpf_htonl(cc_granted);
     if (offset + packet_bytes < Homa_unsched_bytes)
-        set_prio(iph, get_prio(message_length));
+        bp->priority = get_prio(message_length) << 5;
     else
-        set_prio(iph, atomic_read(&ctx->cc.sched_prio));
-
+        bp->priority = atomic_read(&ctx->cc.sched_prio) << 5;
 
     bp->data.seg.segment_length = bpf_htonl(seg_len);
-    pkt_gen_instr_data_wrapper(d, bp);
+    pkt_gen_instr_data_wrapper(d, bp, iph);
 
-    // TODO: debug here
+    // In case there's enough credit to send the current packet, it TXs it
     if (offset + packet_bytes <= cc_granted && (atomic_read(&ctx->nr_pkts_in_rl) == 0 &&
         (packet_bytes <= Homa_min_throttled_bytes || check_nic_queue(packet_bytes)))) {
             
@@ -384,12 +391,12 @@ int fill_other_pkts(struct data_header *d, struct iphdr *iph, struct app_event *
         return XDP_TX;
     }
 
+    /* Rate limiting path */
     struct rpc_state_cc *cc_node = NULL;
     struct rpc_state_cc *ref_cc_node = NULL;
 
-    /* Unfortunately, we should enqueue this packet to rate limiter */
     atomic_inc(&ctx->nr_pkts_in_rl);
-
+    
     if (unlikely(ctx->qid == MAX_BUCKET_SIZE))
     {
         /* this RPC has not been enqueued before */

@@ -234,8 +234,6 @@ static __always_inline void fill_ip_hdr(struct iphdr *iph, __u32 len)
 SEC("xdp_egress")
 int xdp_egress_prog(struct xdp_md *ctx)
 {
-    //__u32 start = bpf_ktime_get_ns();
-    struct homa_meta_info *data_meta = NULL;
     void *data_end = NULL;
     void *data = NULL;
     struct ethhdr *eth;
@@ -243,115 +241,88 @@ int xdp_egress_prog(struct xdp_md *ctx)
     struct common_header *c;
     struct data_header *d;
     int action, ret;
-    #ifndef MTP_ON
-    __u64 rpc_qid = MAX_BUCKET_SIZE;
-    bool trigger = false;
-    #endif
 
-    /* adjust data_meta to access metadata in headroom */
-    CHECK_AND_DROP_LOG(bpf_xdp_adjust_meta(ctx, -(int)sizeof(*data_meta)) != 0, "xdp_adjust_meta failed");
-    
-    /* verify after calling bpf_xdp_ajdust_meta() */
-    data_meta = (struct homa_meta_info *)(long)ctx->data_meta;
     data_end = (void *)(long)ctx->data_end;
     data = (void *)(long)ctx->data;
-    
-    
-    CHECK_AND_DROP_LOG(data_meta + 1 > data, "data_meta + 1 > data_end");
 
+    /* Parsing headers */
     eth = (struct ethhdr *)data;
     iph = (struct iphdr *)(eth + 1);
     c = (struct common_header *)(iph + 1);
     d = (struct data_header *)c;
 
-    //CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
     if(d + 1 > data_end) {
         bpf_printk("Trying retransmit");
         return XDP_DROP;
     }
 
-    #ifndef MTP_ON
+    /* End of parsing headers */
 
-    CHECK_AND_DROP_LOG(iph->protocol != IPPROTO_HOMA, "not HOMA protocol");
 
-    /* this packet is sent from control path directly */
-    if (unlikely(data_meta->tx.slowpath)) {
-        return xmit_packet(ctx, eth, iph);
-    }
+    /* Event parsing */
 
-    #ifndef MTP_ON
-    CHECK_AND_DROP_LOG(c->type != DATA, "not DATA packet");
-    #endif
-    
-    if (unlikely(d->retransmit)) {
-        // TODO: we should throttle retransmitted packets
-        return xmit_packet(ctx, eth, iph);
-    }
-    #endif
-
-    #ifdef MTP_ON
-
+    /*
+    Question: in TCP the event is parsed in the data_meta, containing
+    information passed from userspace, like the size of the batch (in the first
+    packet of batch), length of the packet's payload, etc.
+    But in Homa the event is explicitly defined in userspace and the space reserved
+    for the headers. Should we do the same in TCP?
+    */
     struct app_event *ev;
-    //struct HOMABP *bp;
-    
-    //__u32 seg_len = (data_end - data) - sizeof(*eth) - sizeof(*iph) - sizeof(*d) - sizeof(*ev) - sizeof(*bp);
-    //__u32 seg_len = (data_end - data) - sizeof(*eth) - sizeof(*iph) - sizeof(*d) - sizeof(*ev);
+
     __u32 seg_len = (data_end - data) - sizeof(*eth) - sizeof(*iph) - sizeof(*d);
     if(seg_len > DEFAULT_MTU) {
         bpf_printk("Error here 1");
         return XDP_DROP;
     }
-    /*if((void *)d + sizeof(*d) + seg_len > data_end) {
-        bpf_printk("Error here 2");
-        return XDP_DROP;
-    }
-    void *payload_end = (void *)d + sizeof(*d) + seg_len;
 
-    ev = (struct app_event *) payload_end;*/
     ev = (struct app_event *) data;
     CHECK_AND_DROP_LOG(ev + 1 > data_end, "ev + 1 > data_end");
 
-    //bp = (struct HOMABP *)(ev + 1);
-    //CHECK_AND_DROP_LOG(bp + 1 > data_end, "bp + 1 > data_end");
+    /* End of event parsing */
 
-    //CHECK_AND_DROP_LOG(bp->common.type != DATA, "not DATA packet");
 
+    /* Flow context retrieval */
     struct rpc_state *state = NULL;
     if(!get_context_mtp_egress(ev, &state) || !state)
         return XDP_DROP;
 
+    /* Packet blueprint retrieval */
     struct HOMABP *bp = NULL;
     bool first_packet = false;
     if(!get_pkt_bp_mtp(ev, &bp, &first_packet) || !bp)
         return XDP_DROP;
 
+    /* End of flow/pkt_bp retrieval */
+
+
+    /* Dispatcher */
     struct interm_out int_out = {0};
     if (rpc_is_client(ev->rpcid)) {
         if(first_packet)
-            action = send_req_ep_client(d, iph, ev, state, bp, &int_out, seg_len);
+            action = send_req_ep(d, iph, ev, state, bp, &int_out, seg_len);
         else
             action = fill_other_pkts(d, iph, ev, state, bp, &int_out, seg_len);
     } else {
         if(first_packet)
-            action = send_resp_ep_server(d, iph, ev, state, bp, &int_out, seg_len);
+            action = send_resp_ep(d, iph, ev, state, bp, &int_out, seg_len);
         else
             action = fill_other_pkts(d, iph, ev, state, bp, &int_out, seg_len);
     }
-    #endif
-    
-    #ifndef MTP_ON
-    __u64 buffer_addr = data_meta->tx.buffer_addr;
 
-    if (rpc_is_client(bpf_be64_to_cpu(d->common.sender_id)))
-        action = client_request(iph, d, buffer_addr, &rpc_qid, &trigger);
-    else
-        action = server_response(iph, d, buffer_addr, &rpc_qid, &trigger);
-    #endif
+    /* End of dispatcher */
     
     CHECK_AND_DROP_LOG(action != XDP_TX && action != XDP_REDIRECT, "action != XDP_TX && action != XDP_REDIRECT");
 
-    /* piggyback ACK in this packet to free server rpc at remote side */
+    /* Include implicit ack to packet */
 
+    /*
+    Question: enqueue_dead_crpc (the function that enqueues the RPC who needs
+    to be acked) is only called in recv_resp_pkt_ep, when the client receives
+    the last (or only) response packet of the RPC.
+    Can two nodes be the client and server for each other in different RPCs?
+    If so, we would need to move this to the end of both EPs.
+    */
     eth = (struct ethhdr *)data;
     iph = (struct iphdr *)(eth + 1);
     c = (struct common_header *)(iph + 1);
@@ -359,16 +330,16 @@ int xdp_egress_prog(struct xdp_md *ctx)
     
     CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
 
-    iph->saddr = ev->local_ip;
-    iph->daddr = ev->remote_ip;
-    iph->protocol = IPPROTO_HOMA;
-
+    /*
+    This was a field set in userspace to specify the ID of the
+    request's metadata in a list in userspace. It seems very
+    eTran-specific
+    */
     d->unused1 = ev->slot_idx;
 
     struct dead_client_rpc_info dead_crpc = {0};
-    ret = dequeue_dead_crpc(bpf_ntohl(iph->daddr), &dead_crpc);
+    ret = dequeue_dead_crpc(bpf_ntohl(ev->remote_ip), &dead_crpc);
     if (!ret) {
-        //bpf_printk("%lu", dead_crpc.rpcid);
         d->seg.ack.rpcid = bpf_cpu_to_be64(dead_crpc.rpcid);
         d->seg.ack.dport = bpf_htons(dead_crpc.remote_port);
         d->seg.ack.sport = bpf_htons(dead_crpc.local_port);
@@ -379,47 +350,36 @@ int xdp_egress_prog(struct xdp_md *ctx)
         d->seg.ack.sport = 0;
     }
 
-    //bpf_printk("%u", data_end - data);
+    /* End of including implicit ack to packet */
 
-    #ifdef MTP_ON
-    //int err = 0;
+
     data_end = (void *)(long)ctx->data_end;
     data = (void *)(long)ctx->data;
 
-    //if (unlikely(err = bpf_xdp_adjust_tail(ctx, -((int)sizeof(struct app_event) + (int)sizeof(struct HOMABP)))))
-    /*if (unlikely(err = bpf_xdp_adjust_tail(ctx, -((int)sizeof(struct app_event)))))
-    {
-        return XDP_DROP;
-    }
-    data_end = (void *)(long)ctx->data_end;
-    data = (void *)(long)ctx->data;*/
-
-    //bpf_printk("%u", data_end - data);
-    #endif
-
+    // Fills IP header with addresses and "default" values
+    iph->saddr = ev->local_ip;
+    iph->daddr = ev->remote_ip;
+    iph->protocol = IPPROTO_HOMA;
     fill_ip_hdr(iph, (data_end - data));
 
-    //__u32 end = bpf_ktime_get_ns();
-
+    // If the packet can be transmitted now
     if (action == XDP_TX) {
-        //bpf_printk("%u", end - start);
-        
         return xmit_packet(ctx, eth, iph);
     }
-    
-    #ifdef MTP_ON
+
+    /*
+    If there is not enough credit to transmit now, it enqueues the
+    packet to be sent later
+    */
     ret = enqueue_pkt_to_rl(ctx, state->qid, eth, iph);
     
+    /*
+    Triggers the execution of the thread that will send packets
+    from RPCs that now have credit
+    */
     if (int_out.trigger) {
-        //bpf_printk("HEREEEE");
         kick_pacer();
     }
-    #else
-    ret = enqueue_pkt_to_rl(ctx, rpc_qid, eth, iph);
-
-    if (trigger)
-        kick_pacer();
-    #endif
     
     return ret;
 }
