@@ -236,7 +236,7 @@ int xdp_egress_prog(struct xdp_md *ctx)
     /* End of flow/CC context/pkt_bp retrieval */
 
 
-    /* Packet ("request") parsing */
+    /* Creation of event (app or timer) */
     struct app_timer_event ev;
 
     #ifdef MTP_ON
@@ -247,7 +247,7 @@ int xdp_egress_prog(struct xdp_md *ctx)
     }
     #endif
 
-    /* End of packet ("request") parsing */
+    /* End of event creation */
 
 
     /* Function that contains dispatcher and rate limiting */
@@ -307,14 +307,12 @@ int xdp_sock_prog(struct xdp_md *ctx)
     __u32 pkt_len = ctx->data_end - ctx->data;
     __u32 cpu = bpf_get_smp_processor_id();
 
-    // make verifier happy
     if (unlikely(cpu >= MAX_CPU)) {
         xdp_log_panic("cpu >= MAX_CPU");
         return XDP_DROP;
     }
 
-    xdp_log("XDP receive pkt at Queue#%u", ctx->rx_queue_index);
-
+    /* Packet parsing */
     if (unlikely(ret = bpf_xdp_adjust_meta(ctx, -(int)sizeof(*data_meta)))) {
         xdp_log_err("xdp_adjust_meta failed: %d", ret);
         return XDP_DROP;
@@ -355,27 +353,34 @@ int xdp_sock_prog(struct xdp_md *ctx)
         return XDP_DROP;
     }
 
-    // filter out SYN, SYN-ACK, RST packets
+    // Packet from slowpath (connection stablishment)
+    // Has to bypass the XDP processing
     if (unlikely(is_tcp_syn(tcph) || is_tcp_syn_ack(tcph) || is_tcp_rst(tcph))) {
         goto slowpath;
     }
 
+    // TCP timestamp (additional TCP option)
     struct tcp_timestamp_opt *ts_opt = (struct tcp_timestamp_opt *)(tcph + 1);
     if (unlikely(ts_opt + 1 > data_end)) {
         xdp_log_err("ts_opt + 1 > data_end");
         return XDP_DROP;
     }
 
+    /* Event creation (network) */
     struct net_event ev;
     parse_pkt_to_event(&ev, tcph, iph, ts_opt);
 
-    // Question: sometimes the sender receives packets carrying 100 bytes of data (not ack).
-    // Why is that?
-
+    /*
+    Question: I added this check a long while ago to detect if an ACK
+    packet could carry data. But now if I remove it, it results in segmentation fault.
+    But it doesn't make sense, because it isn't even entering the condition.
+    */
     if(ev.data_len > 0 && ev.minor_type == NET_EVENT_ACK)
         bpf_printk("CASE HERE");
-    //bpf_printk("%u, %u, %u, %u", ev.minor_type, ev.seq_num, ev.data_len, ev.ack_seq); 
 
+    /* End of event creation (network) */
+
+    /* Flow context retrieval */
     key.local_ip = bpf_ntohl(iph->daddr);
     key.remote_ip = bpf_ntohl(iph->saddr);
     key.local_port = bpf_ntohs(tcph->dest);
@@ -387,19 +392,27 @@ int xdp_sock_prog(struct xdp_md *ctx)
         return XDP_DROP;
     }
 
-    if (prev_conn[cpu] != NULL_CONN && prev_conn[cpu] != c->cc_idx) {
-        if (enqueue_prev_ack(cpu)) {
-            xdp_log_panic("enqueue_prev_ack failed");
-        }
-        prev_conn[cpu] = NULL_CONN;
+    struct bpf_cc *cc = bpf_map_lookup_elem(&bpf_cc_map, &c->cc_idx);
+    if (unlikely(!cc)) {
+        xdp_log_panic("cc is NULL, BUG!!!");
+        return XDP_DROP;
     }
 
+    /* End of flow context retrieval */
+
+    /*
+    Question: opaque_connection is a pointer to an eTrantcp_connection instance
+    in userspace, which is stored in the connection's context when it is created.
+    This pointer is copied into the metadata and used in userspace to retrieve
+    the eTrantcp_connection struct, which is basically a context keeping track of
+    userspace-specific values, like pointers to RX/TX buffers etc.
+    How to abstract this?
+    */
     data_meta->rx.conn = c->opaque_connection;
 
-    ret = tcp_rx_process(tcph, c, pkt_len, data_meta, (iph->tos & IPTOS_ECN_CE) == IPTOS_ECN_CE, cpu, &ev);
-
-    //net_ev_dispatcher(&ev, c, data_meta, cpu);
+    ret = tcp_rx_process(tcph, c, pkt_len, data_meta, (iph->tos & IPTOS_ECN_CE) == IPTOS_ECN_CE, cpu, &ev, cc);
     
+    // It redirects the packet to userspace
     if (likely(ret == XDP_REDIRECT && qid < MAX_NIC_QUEUES)) {
         return bpf_redirect_map(&xsks_map, c->qid2xsk[qid], XDP_DROP);
     }

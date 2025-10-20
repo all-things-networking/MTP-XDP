@@ -172,6 +172,7 @@ static __always_inline void parse_pkt_to_event(struct net_event *ev, struct tcph
     ev->ecn_mark = tcph->ece;
     ev->ts_ecr = bpf_ntohl(ts_opt->ts_ecr);
     ev->ts_val = bpf_ntohl(ts_opt->ts_val);
+    ev->timestamp =  bpf_ktime_get_ns();
 }
 
 static __always_inline void send_ep (struct app_timer_event *ev, struct bpf_tcp_conn *c,
