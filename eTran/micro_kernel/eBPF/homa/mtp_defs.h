@@ -1229,7 +1229,6 @@ int first_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     int_out->last_bytes_remaining = message_length - seg_length;
     int_out->rpc_birth = bpf_ktime_get_ns();
 
-    //RPC_UNLOCK(ctx);
 
     __sync_fetch_and_add(&total_incoming, (__u64)(incoming - seg_length));
 
@@ -1238,10 +1237,6 @@ int first_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     add_rx_data_seg_wrapper(ev->segment_length, ev->offset, data_meta, ctx);
 
     if (int_out->complete) {
-        // Question: I also wanted to have some kind of wrapper for
-        // flush_and_notify, but there isn't enough space in RX metadata
-        // for the signal. Any suggestions on how to do that?
-        // flush_and_notify_wrapper();
         return XDP_REDIRECT;
     }
 
@@ -1446,18 +1441,6 @@ int recv_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     }
 
     int_out->need_schedule = message_length > ctx->cc.incoming;
-
-    //ev->flow_id.rpcid = local_id(ev->flow_id.rpcid);
-
-    /*if (int_out->need_schedule) {
-        no_ctx_sched_ep(ev, ctx, data_meta, int_out);
-        save_cached_rpc(ev, ctx, data_meta, int_out);
-    }
-
-    if (!int_out->new_state || !int_out->need_schedule)
-        return XDP_REDIRECT;
-
-    return insert_new(ev, ctx, data_meta, int_out);*/
 
     return XDP_REDIRECT;
 }

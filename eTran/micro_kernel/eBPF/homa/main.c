@@ -396,33 +396,14 @@ int xdp_sock_prog(struct xdp_md *ctx)
     struct hdr_cursor nh = {0};
     
     struct iphdr *iph;
-    #ifndef MTP_ON
-    struct common_header *homa_common_hdr;
-    struct data_header *homa_data_hdr;
-    struct grant_header *homa_grant_hdr;
-    struct busy_header *homa_busy_hdr;
-    struct resend_header *homa_resend_hdr;
-    struct unknown_header *homa_unknown_hdr;
-    struct slow_path_info *sp;
-
-    int single_packet = 0;
-    __u32 remote_ip = 0;
-    __u32 qid = ctx->rx_queue_index;
-    __u16 local_port = 0;
-    #endif
     int ret = 0;
     int proto_type;
     struct target_xsk *target_xsk;
 
-    #ifdef TEST_PACKET_LOST
-    __u32 rand = bpf_get_prandom_u32();
-    if (rand % 1000 == 500)
-        return XDP_DROP;
-    #endif
-
     unsigned int current_cpu = bpf_get_smp_processor_id();
     CHECK_AND_DROP_LOG(current_cpu >= MAX_CPU || current_cpu != ctx->rx_queue_index, "CPU Mapping");
 
+    /* Extend xdp_md metadata size to fit data_meta */
     CHECK_AND_DROP_LOG(bpf_xdp_adjust_meta(ctx, -(int)sizeof(*data_meta)) != 0, "xdp_adjust_meta failed");
 
     data_meta = (struct homa_meta_info *)(long)ctx->data_meta;
@@ -431,6 +412,7 @@ int xdp_sock_prog(struct xdp_md *ctx)
 
     CHECK_AND_DROP_LOG(data_meta + 1 > data, "data_meta + 1 > data_end");
 
+    /* Fill metadata with default values */
     data_meta->rx.reap_client_buffer_addr = POISON_64;
     data_meta->rx.reap_server_buffer_addr = POISON_64;
     data_meta->rx.qid = ctx->rx_queue_index;
@@ -438,28 +420,31 @@ int xdp_sock_prog(struct xdp_md *ctx)
     data_meta->rx.seg_len = 0;
     data_meta->rx.offset = 0;
 
-    /* Ethernet and IP header has already been parsed by the entrance program */
+
+    /* Packet parsing and event creation */
     nh.pos = data + sizeof(struct ethhdr) + sizeof(struct iphdr);
     iph = (struct iphdr *)(data + sizeof(struct ethhdr));
-
-
-
-
-
-    /*************** MTP START ****************/
 
     struct net_event ev = {0};
     proto_type = parse_packet_mtp(&nh, iph, data_end, &ev);
     CHECK_AND_DROP_LOG(proto_type < 0, "parse_packet_mtp failed");
+    /* End of packet parsing and event creation */
 
+    /* Retrieving RPC context */
     struct rpc_state *state = NULL;
     bool first_pkt_rpc = false;
     if(!get_context_mtp(ev.flow_id, &state, &first_pkt_rpc) || !state)
         return XDP_DROP;
+    /* End of Retrieving RPC context */
 
+    /* Dispatcher */
     struct interm_out int_out = {0};
     if(proto_type == DATA) {
-        // Question: should we have an EP for this? Or how can we abstract it?
+        /*
+        Question: This part is the one that parses the implicit ack and
+        frees the RPC.
+        Should we have an EP for this?
+        */ 
         struct ack_net_info ack_info = {0};
         if(!parse_ack_info(&nh, data_end, &ack_info, ev.flow_id.remote_ip))
             return XDP_DROP;
@@ -493,7 +478,9 @@ int xdp_sock_prog(struct xdp_md *ctx)
     } else if(proto_type == GRANT) {
         recv_grant_ep(&ev, state, data_meta, &int_out);
     }
+    /* End of dispatcher */
 
+    /* Send packets that don't carry data and don't need to go to userspace (e.g. resend) */
     if(ret == XDP_TX)
         return XDP_TX;
 
@@ -504,126 +491,8 @@ int xdp_sock_prog(struct xdp_md *ctx)
     socket_id = target_xsk->xsk_map_idx[current_cpu];
     CHECK_AND_DROP_LOG(socket_id < 0, "socket_id < 0");
     
+    /* Redirects to userspace */
     return bpf_redirect_map(&xsks_map, socket_id, XDP_DROP);
-
-    /*************** MTP END ****************/
-
-
-    #ifndef MTP_ON
-    proto_type = homa_parse_common_hdr(&nh, data_end, &homa_common_hdr);
-    CHECK_AND_DROP_LOG(proto_type < 0, "homa_parse_common_hdr failed");
-    
-    remote_ip = bpf_ntohl(iph->saddr);
-    local_port = bpf_ntohs(homa_common_hdr->dport);
-
-    if (unlikely(proto_type != DATA))
-        goto ctrl_pkt;
-    
-    single_packet = homa_parse_data_hdr(&nh, data_end, &homa_data_hdr);
-    CHECK_AND_DROP_LOG(single_packet < 0, "homa_parse_data_hdr failed");
-
-// load balancing
-#ifdef LB
-    unsigned int target_cpu = current_cpu;
-
-    // All short messages bypass load balancing mechanism
-    if (likely(single_packet))
-        goto bypass_lb;
-
-    set_current_active(current_cpu);
-
-    // we enforce load balancing in batch
-    // case1: use cached choice
-    if (use_cached_lb_choice[current_cpu] && lb_threshold[current_cpu] && lb_threshold[current_cpu] < LB_THRESHOLD)
-    {
-        target_cpu = lb_cache_choice[current_cpu];
-        lb_threshold[current_cpu]++;
-        // bpf_printk("Cache choice, target_cpu = %d, threshold = %d", target_cpu, lb_threshold[current_cpu]);
-        if (lb_threshold[current_cpu] == LB_THRESHOLD)
-            lb_threshold[current_cpu] = 0;
-    }
-    // case2: choose a new core
-    else if (!lb_threshold[current_cpu] || use_cached_lb_choice[current_cpu] == 0)
-    {
-        use_cached_lb_choice[current_cpu] = 1;
-        lb_threshold[current_cpu] = 1;
-        target_cpu = choose_core(current_cpu);
-        lb_cache_choice[current_cpu] = target_cpu;
-        // bpf_printk("New choice, target_cpu = %d, threshold = %d", target_cpu, lb_threshold[current_cpu]);
-    }
-
-    if (target_cpu != current_cpu)
-    {
-        // bpf_printk("CPU#%d -> CPU#%d", current_cpu, target_cpu);
-        return bpf_redirect_map(&cpumap, target_cpu, 0);
-    }
-// bpf_printk("Process at CPU#%d locally\n", current_cpu);
-#else
-    goto bypass_lb;
-#endif
-
-bypass_lb:
-
-    reclaim_rpc(homa_data_hdr, remote_ip, data_meta);
-    
-    if (rpc_is_client(local_id(bpf_be64_to_cpu(homa_data_hdr->common.sender_id))))
-        ret = client_response(homa_data_hdr, remote_ip, data_meta, single_packet);
-    else {
-        ret = server_request(homa_data_hdr, remote_ip, single_packet);
-    }
-
-    CHECK_AND_DROP_LOG(ret == XDP_DROP, "XDP_DROP for error rpc state");
-
-    target_xsk = bpf_map_lookup_elem(&port_tbl, &local_port);
-    CHECK_AND_DROP_LOG(!target_xsk, "Can't find corresponding XSK fd for this packet");
-    
-    socket_id = target_xsk->xsk_map_idx[current_cpu];
-    CHECK_AND_DROP_LOG(socket_id < 0, "socket_id < 0");
-
-    return bpf_redirect_map(&xsks_map, socket_id, XDP_DROP);
-
-ctrl_pkt:
-
-    switch (proto_type)
-    {
-        case RESEND:
-            CHECK_AND_DROP(homa_parse_resend_hdr(&nh, data_end, &homa_resend_hdr) != 0);
-            ret = resend_pkt(homa_resend_hdr, data_meta, remote_ip);
-            if (ret == UNKNOWN || ret == BUSY) {
-                return xmit_ctrl_pkt(ctx, ret);
-            }
-            goto drop;
-        case UNKNOWN:
-            CHECK_AND_DROP(homa_parse_unknown_hdr(&nh, data_end, &homa_unknown_hdr) != 0);
-            ret = unknown_pkt(ctx, homa_unknown_hdr, data_meta, data_end, remote_ip);
-            goto drop;
-        case GRANT:
-            CHECK_AND_DROP(homa_parse_grant_hdr(&nh, data_end, &homa_grant_hdr) != 0);
-            grant_pkt(homa_grant_hdr, remote_ip);
-            goto drop;
-        case BUSY:
-            CHECK_AND_DROP(homa_parse_busy_hdr(&nh, data_end, &homa_busy_hdr) != 0);
-            busy_pkt(homa_busy_hdr, remote_ip);
-            goto drop;
-        default:
-            return XDP_DROP;
-    }
-    
-    /* redirect to slow_path */
-    sp = bpf_map_lookup_elem(&slow_path_map, &qid);
-    CHECK_AND_DROP_LOG(!sp || !sp->active, "slow_path_info not found or inactive");
-    
-    return bpf_redirect_map(&xsks_map, sp->sp_xsk_map_key, XDP_DROP);
-
-drop:
-    target_xsk = bpf_map_lookup_elem(&port_tbl, &local_port);
-    CHECK_AND_DROP_LOG(!target_xsk, "Can't find corresponding XSK fd for this packet");
-    
-    socket_id = target_xsk->xsk_map_idx[current_cpu];
-    CHECK_AND_DROP_LOG(socket_id < 0, "socket_id < 0");
-    
-    return bpf_redirect_map(&xsks_map, socket_id, XDP_DROP);
-    #endif
 }
 
 SEC("xdp/cpumap")
