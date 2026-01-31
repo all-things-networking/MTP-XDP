@@ -37,18 +37,7 @@ int xdp_gen_prog(struct xdp_md *ctx)
         bpf_printk("ERROR: CPU Mapping, cpu=%d\n", cpu);
         return XDP_ABORTED;
     }
-    #ifndef MTP_ON
-    int err = 0;
-    int last_grant = 0; // if this is true, we should return XDP_ABORTED
-    int no_work = 0;
     
-    struct ret_grant_info gi = {0};
-    void *data;
-    void *data_end;
-    int send_fifo_rpc = 0;
-
-    unsigned int gi_idx;
-    #endif
     use_cached_lb_choice[cpu] = 0;
 
     if (finish_grant_choose[cpu] == 0)
@@ -56,19 +45,11 @@ int xdp_gen_prog(struct xdp_md *ctx)
         // force to clear the last cached rpc
         update_grant_for_cached_rpc(cpu);
 
-        #ifndef MTP_ON
-        bpf_tail_call(ctx, &xdp_gen_tail_call_map, XDP_GEN_CHOOSE_RPC_TO_GRANT);
-
-        // fallthrough: bpf_tail_call failed
-        return XDP_ABORTED;
-        #else
         if(choose_grants(ctx) == XDP_ABORTED)
             return XDP_ABORTED;
 
         return update_prios(ctx);
-        #endif
     }
-    #ifdef MTP_ON 
     else {
         struct interm_out int_out = {0};
         int ret;
@@ -76,143 +57,6 @@ int xdp_gen_prog(struct xdp_md *ctx)
         //ret = reset_grants_state(ctx, &int_out);
         return ret;
     }
-    #else
-
-    granting_idx[cpu]++;
-    // bpf_printk("DEBUG: granting_idx[cpu]: %d\n", granting_idx[cpu]);
-
-    if (nr_grant_ready[cpu] == 0 && !need_grant_fifo[cpu])
-    {
-        last_grant = 1;
-        no_work = 1;
-        goto reset;
-    }
-
-    // bpf_printk("need_grant_fifo[cpu]: %d", need_grant_fifo[cpu]);
-    if (need_grant_fifo[cpu] == 1)
-    {
-        // If we have RPC in the FIFO queue, we should grant it at last
-        if (granting_idx[cpu] == min(nr_grant_candidate[cpu], HOMA_OVERCOMMITMENT) + 1)
-        {
-            last_grant = 1;
-        }
-    }
-    else if (granting_idx[cpu] == min(nr_grant_candidate[cpu], HOMA_OVERCOMMITMENT))
-    {
-        // after processing the packet, we should return XDP_ABORTED to terminate
-        last_grant = 1;
-    }
-
-    if (need_grant_fifo[cpu] == 1 && last_grant == 1)
-    {
-        // it's time to grant the RPC in the FIFO queue
-        err = grant_fifo_rpc(&gi);
-        if (err)
-        {
-            no_work = 1;
-            need_grant_fifo[cpu] = 0; // error or no fifo rpc to grant
-            goto reset;
-        }
-        send_fifo_rpc = 1;
-    }
-    else
-    {
-        // grant the RPC in the Priority queue
-        gi_idx = (granting_idx[cpu] - 1);
-        gi_idx = gi_idx % HOMA_OVERCOMMITMENT;
-
-        err = grant_prio_rpc(&gi, gi_idx);
-        if (err)
-        {
-            no_work = 1;
-            goto reset;
-        }
-    }
-
-    if (unlikely(err = bpf_xdp_adjust_tail(ctx, -HOMA_GRANT_HEADER_CUTOFF)))
-    {
-        bpf_printk("ERROR: bpf_xdp_adjust_tail failed: %d\n", err);
-        return XDP_GEN_RETURN_DROP(last_grant);
-    }
-
-    data = (void *)(long)ctx->data;
-    data_end = (void *)(long)ctx->data_end;
-
-    // Ethernet header
-    struct ethhdr *eth = (struct ethhdr *)data;
-    if (unlikely(eth + 1 > data_end))
-    {
-        return XDP_GEN_RETURN_DROP(last_grant);
-    }
-
-    // IP header
-    struct iphdr *iph = (struct iphdr *)(eth + 1);
-    if (unlikely(iph + 1 > data_end))
-    {
-        return XDP_GEN_RETURN_DROP(last_grant);
-    }
-
-    iph->saddr = bpf_htonl(local_ip);
-    iph->daddr = bpf_htonl(gi.remote_ip);
-    iph->version = IPVERSION;
-    iph->protocol = IPPROTO_HOMA;
-    iph->ihl = 0x5;
-    iph->tos = gi.priority << 5;
-    iph->tot_len = bpf_htons(sizeof(struct iphdr) + sizeof(struct grant_header));
-    iph->id = 0;
-    iph->ttl = IPDEFTTL;
-    iph->check = 0;
-
-    // grant header
-    struct grant_header *gh = (struct grant_header *)(iph + 1);
-    if (unlikely(gh + 1 > data_end))
-    {
-        return XDP_GEN_RETURN_DROP(last_grant);
-    }
-
-    gh->common.type = GRANT;
-    gh->common.dport = bpf_htons(gi.dport);
-    gh->common.sport = bpf_htons(gi.sport);
-    gh->common.sender_id = bpf_cpu_to_be64(gi.rpcid);
-    gh->offset = bpf_htonl(gi.newgrant);
-    gh->priority = gi.priority;
-    gh->resend_all = 0;
-
-    //   bpf_printk("Grant to offset(%u)", gi.newgrant);
-
-reset:
-    if (last_grant)
-    {
-        granting_idx[cpu] = 0;
-        nr_grant_candidate[cpu] = 0;
-        finish_grant_choose[cpu] = 0;
-#ifdef HELP_PACER
-        help_pacer();
-#endif
-        // bpf_printk("reset granting_idx");
-    }
-
-    if (no_work)
-    {
-        // bpf_printk("no_work: last_grant: %d\n", last_grant);
-        return XDP_GEN_RETURN_DROP(last_grant);
-    }
-
-    err = fib_lookup(ctx, eth, iph);
-    if (unlikely(err))
-    {
-        bpf_printk("ERROR: bpf_fib_lookup failed in XDP_GEN, check routing table in kernel,"
-                   "last_grant = %d, need_grant_fifo[cpu] = %d\n",
-                   last_grant, need_grant_fifo[cpu]);
-        return XDP_GEN_RETURN_DROP(last_grant);
-    }
-
-    // flush the FIFO queue
-    if (send_fifo_rpc)
-        need_grant_fifo[cpu] = 0;
-
-    return XDP_TX;
-    #endif
 }
 
 // Fill IP header except for addresses

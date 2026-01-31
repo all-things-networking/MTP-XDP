@@ -615,6 +615,70 @@ void add_rx_data_seg_wrapper(__u32 seg_len, __u32 offset, struct homa_meta_info 
 }
 
 static __always_inline
+void flush_and_notify_wrapper(struct rpc_key_t fid, __u64 buffer_head, struct homa_meta_info *data_meta, struct rpc_state *ctx) {
+    if(!rpc_is_client(local_id(fid.rpcid)))
+        return;
+    /* userspace will use this metadata to free buffers */
+    data_meta->rx.reap_client_buffer_addr = buffer_head;
+
+    /* if we allocate qid for this rpc, we need to free it */
+    if (ctx->qid != MAX_BUCKET_SIZE)
+        free_qid(ctx->qid);
+
+    struct rpc_key_t hkey = {0};
+    hkey.rpcid = local_id(fid.rpcid);
+    hkey.local_port = fid.local_port;
+    hkey.remote_port = fid.remote_port;
+    hkey.remote_ip = fid.remote_ip;
+    bpf_map_delete_elem(&rpc_tbl, &hkey);
+    bpf_map_delete_elem(&pkt_bp_tbl, &hkey);
+    
+    enqueue_dead_crpc(hkey.remote_ip, hkey.remote_port, hkey.local_port, hkey.rpcid);
+}
+
+
+// Function that returns if the bit corresponding to seq is already set in the bitmap
+static __always_inline
+int is_set_bitmap(struct rpc_state *rpc_slot, __u16 seq)
+{
+    __u16 tmp = rpc_slot->bit_width;
+    if (tmp > 0)
+        tmp--;
+
+    __u8 last_round = tmp / 64;
+    __u8 round = seq / 64;
+    
+    if (unlikely(round > 11))
+        return 1;
+
+    if (round == 0 && and_bitmap(0, seq))
+        return 1;
+    else if (round == 1 && and_bitmap(1, seq))
+        return 1;
+    else if (round == 2 && and_bitmap(2, seq))
+        return 1;
+    else if (round == 3 && and_bitmap(3, seq))
+        return 1;
+    else if (round == 4 && and_bitmap(4, seq))
+        return 1;
+    else if (round == 5 && and_bitmap(5, seq))
+        return 1;
+    else if (round == 6 && and_bitmap(6, seq))
+        return 1;
+    else if (round == 7 && and_bitmap(7, seq))
+        return 1;
+    else if (round == 8 && and_bitmap(8, seq))
+        return 1;
+    else if (round == 9 && and_bitmap(9, seq))
+        return 1;
+    else if (round == 10 && and_bitmap(10, seq))
+        return 1;
+    else if (round == 11 && and_bitmap(11, seq))
+        return 1;
+    return 0;
+}
+
+static __always_inline
 int update_with_cache(struct net_event *ev, struct rpc_state *ctx,
     struct homa_meta_info *data_meta, struct interm_out *int_out) {
 
@@ -1237,6 +1301,7 @@ int first_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
     add_rx_data_seg_wrapper(ev->segment_length, ev->offset, data_meta, ctx);
 
     if (int_out->complete) {
+        //flush_and_notify_wrapper(ev->flow_id, ctx->buffer_head, data_meta, ctx);
         return XDP_REDIRECT;
     }
 
@@ -1272,7 +1337,11 @@ int next_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
         return XDP_DROP;
     }
 
-    // Question: see how we can wrap sliding window to bitmap
+    if(is_set_bitmap(ctx, seq)) {
+        RPC_UNLOCK(ctx);
+        bpf_printk("seq_num is already set in bitmap");
+        return XDP_DROP;
+    }
     int complete = set_bitmap(ctx, seq);
     if (complete == 1) {
         ctx->state = BPF_RPC_IN_SERVICE;
@@ -1300,8 +1369,10 @@ int next_req_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
 
     add_rx_data_seg_wrapper(ev->segment_length, ev->offset, data_meta, ctx);
 
-    if (int_out->complete)
+    if (int_out->complete) {
+        //flush_and_notify_wrapper(ev->flow_id, ctx->buffer_head, data_meta, ctx);
         return XDP_REDIRECT;
+    }
 
     //ev->flow_id.rpcid = local_id(ev->flow_id.rpcid);
 
@@ -1364,6 +1435,8 @@ int recv_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
             
             enqueue_dead_crpc(hkey.remote_ip, hkey.remote_port, hkey.local_port, hkey.rpcid);
 
+            //flush_and_notify_wrapper(ev->flow_id, ctx->buffer_head, data_meta, ctx);
+
             int_out->complete = true;
 
             return XDP_REDIRECT;
@@ -1393,6 +1466,11 @@ int recv_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
         if (cc_node)
             bpf_obj_drop(cc_node);
     } else {
+        if(is_set_bitmap(ctx, seq)) {
+            RPC_UNLOCK(ctx);
+            bpf_printk("seq_num is already set in bitmap");
+            return XDP_DROP;
+        }
         int complete = set_bitmap(ctx, seq);
         int_out->complete = complete;
         if (complete == -1)
@@ -1431,6 +1509,8 @@ int recv_resp_pkt_ep(struct net_event *ev, struct rpc_state *ctx,
                 */
             bpf_map_delete_elem(&rpc_tbl, &hkey);
             bpf_map_delete_elem(&pkt_bp_tbl, &hkey);
+
+            //flush_and_notify_wrapper(ev->flow_id, ctx->buffer_head, data_meta, ctx);
 
             return XDP_REDIRECT;
         }
