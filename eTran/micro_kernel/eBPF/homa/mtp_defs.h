@@ -750,22 +750,22 @@ int update_with_cache(struct net_event *ev, struct rpc_state *ctx,
             prio_elem->peer_id = elem->peer_id;
             rb_node = bpf_rbtree_lower_bound(&groot, &prio_elem->rbtree_link, srpt_less_peer);
             if(!rb_node) {
-                prio_elem = NULL;
                 GRANT_UNLOCK();
+                prio_elem = NULL;
                 goto out;
             }
             prio_elem = container_of(rb_node, struct rpc_state_cc, rbtree_link);
 
             if (unlikely(prio_elem->tree_id != 1 || prio_elem->peer_id != elem->peer_id)) {
-                prio_elem = NULL;
                 GRANT_UNLOCK();
+                prio_elem = NULL;
                 goto out;
             }
 
             rb_node = bpf_rbtree_remove(&groot, &prio_elem->rbtree_link);
             if(!rb_node) {
-                prio_elem = NULL;
                 GRANT_UNLOCK();
+                prio_elem = NULL;
                 goto out;
             }
 
@@ -1039,8 +1039,6 @@ int insert_into_tree(struct net_event *ev, struct rpc_state *ctx,
     rb_node = bpf_rbtree_lower_bound(&groot, &search_elem->rbtree_link, srpt_less_rpc);
     if (!rb_node) { /* this should never happen */
         GRANT_UNLOCK();
-        bpf_obj_drop(prio_elem);
-        prio_elem = NULL;
         search_elem = NULL;
         log_panic("update_grant_for_cached_rpc: impossible branch, seems a bug.");
         goto out;
@@ -1051,8 +1049,6 @@ int insert_into_tree(struct net_event *ev, struct rpc_state *ctx,
     {
         /* this should never happen */
         GRANT_UNLOCK();
-        bpf_obj_drop(prio_elem);
-        prio_elem = NULL;
         search_elem = NULL;
         log_panic("update_grant_for_cached_rpc: impossible branch, seems a bug.");
         goto out;
@@ -1064,8 +1060,6 @@ int insert_into_tree(struct net_event *ev, struct rpc_state *ctx,
             search_elem->hkey.remote_ip != elem->hkey.remote_ip)
     {
         GRANT_UNLOCK();
-        bpf_obj_drop(prio_elem);
-        prio_elem = NULL;
         search_elem = NULL;
         goto out;
     }
