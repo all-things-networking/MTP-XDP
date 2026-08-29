@@ -8,7 +8,8 @@
  * instantiated over TCP's own map with TCP's own key type.
  *
  * Ported so far:  the ingress flow id, its parser, the context store, and the
- *                 RX event processing (tcp_ack + tcp_data).
+ *                 RX event processing (tcp_ack + tcp_data), and the TX site
+ *                 (app_send's gen_seg, plus the two dummy-packet events).
  */
 
 #include "mtp_target_bpf.h"   /* same directory */
@@ -404,3 +405,205 @@ out:
     return s.drop ? XDP_DROP : XDP_REDIRECT;
 }
 
+
+/* ------------------------------------------------------------------ *
+ * scratchpad_t tcp_tx_scratch { ... }   -- app_send's processors share these.
+ * ------------------------------------------------------------------ */
+struct tcp_tx_scratch {
+    __u32 rx_bump;
+    __u32 payload_len;
+    __u32 tx_pending;
+    __u32 tx_pos;
+    __u64 ref_ts;
+    bool  wnd_upd;
+};
+
+/*
+ * dispatch: app_send -> { record_data, gen_seg }
+ *
+ * The XDP_EGRESS site (K2), which runs once per descriptor the application
+ * submits. It is where a frame the application has already filled with payload
+ * gets its TCP header, its sequence number, and its transmit decision -- the
+ * return value IS the decision: XDP_TX now, XDP_REDIRECT into the timing wheel,
+ * or XDP_PASS back to the application when the application has work to do.
+ *
+ * THIS SITE SERVES THREE EVENTS, not one, and the doc set does not say so. Two
+ * of them arrive as DUMMY PACKETS -- frames with no payload sent purely to make
+ * this program run, which is the mechanism the paper describes as "fake packets
+ * with the event metadata" (appendix C):
+ *
+ *   FLAG_TO    the control path's retransmission timeout  -> gen_retransmit
+ *   FLAG_SYNC  the application's window update            -> send_wnd_update
+ *   neither    an actual segment to send                  -> gen_seg
+ *
+ * So a compiler targeting this backend has to know that one execution site is
+ * the landing point for three events distinguished by a metadata flag, and that
+ * two of them carry no packet at all. Marked in place, as with the RX path.
+ */
+static __always_inline int dispatch_tcp_tx(struct iphdr *iph, struct tcphdr *tcph,
+                                           struct bpf_tcp_conn *c,
+                                           struct meta_info *data_meta, void *data_end)
+{
+    /* scratchpad_t tcp_tx_scratch -- app_send's processors share these. */
+    struct tcp_tx_scratch s = {0};
+    s.rx_bump    = data_meta->tx.rx_bump;
+    s.payload_len = data_meta->tx.plen;
+    s.tx_pending = data_meta->tx.tx_pending;
+    s.tx_pos     = data_meta->tx.tx_pos;
+    s.ref_ts     = 0;
+    s.wnd_upd    = false;
+
+    __u32 cpu = bpf_get_smp_processor_id();
+    if (unlikely(cpu >= MAX_CPU))
+        return XDP_DROP;
+    // optimization for timestamp
+    if (!has_kick[cpu])
+        s.ref_ts = bpf_ktime_get_ns();
+    else
+        s.ref_ts = tx_cached_ts[cpu];
+
+
+    struct bpf_cc *cc = bpf_map_lookup_elem(&bpf_cc_map, &c->cc_idx);
+    if (unlikely(!cc)) {
+        xdp_log_panic("cc is NULL, BUG!!!");
+        return XDP_DROP;
+    }
+
+    TCP_LOCK(c);
+
+    /* --- gen_retransmit (EVENT-TIMER-RTO 1.3): the RTO's dummy packet ----- */
+    /* Timeout packet from slowpath, process it first */
+    if (unlikely(data_meta->tx.flag & FLAG_TO)) {
+        if (!c->tx_sent) {
+            TCP_UNLOCK(c);
+            xdp_egress_log("Timeout but no data to retransmit");
+            return XDP_DROP;
+        }
+        data_meta->rx.go_back_pos = fast_retransmit(c, cc);
+        // prepare to redirect to userspace
+        data_meta->rx.qid = POISON_32;
+        data_meta->rx.conn = c->opaque_connection;
+        data_meta->rx.rx_pos = POISON_32;
+        data_meta->rx.poff = POISON_16;
+        data_meta->rx.plen = POISON_16;
+        data_meta->rx.xsk_budget_avail = xsk_budget_avail(c);
+        data_meta->rx.go_back_pos |= RECOVERY_MASK;
+        data_meta->rx.ooo_bump = POISON_32;
+        TCP_UNLOCK(c);
+        // bpf_printk("Timeout triggers fast retransmission");
+        return XDP_PASS; // redirect to userspace
+    }
+
+    /* --- send_wnd_update (EVENT-APP-RECV 1.3) ----------------------------- */
+    /* update receving buffer space */
+    if (s.rx_bump) {
+        // if ((c->rx_avail >> TCP_WND_SCALE) == 0 && c->tx_avail == 0)
+        if (c->tx_pending == 0)
+            s.wnd_upd = true;
+        c->rx_avail += s.rx_bump;
+        xdp_egress_log("Rxwnd is updated from %u to %u", min((c->rx_avail - s.rx_bump) >> TCP_WND_SCALE, 0xFFFF), c->rx_avail);
+    }
+
+    /* --- the FLAG_SYNC dummy packet: a frame with no payload sent purely to
+     *     make this site run. The paper's "fake packets with the event metadata"
+     *     (appendix C). ------------------------------------------------------ */
+    /* Pure sync packet from userspace, drop or send a extra window update */
+    if (unlikely(data_meta->tx.flag & FLAG_SYNC)) {
+        xdp_egress_log("pure ctrl signal");
+        if (s.wnd_upd) {
+            /* receive buffer freed up from empty, need to send out a window update, if
+             * we're not sending anyways. */
+            fill_tcp_hdr(iph, tcph, c, s.ref_ts, data_end, TCP_FLAG_ACK);
+            fill_ip_hdr(iph, 0, false);
+            TCP_UNLOCK(c);
+            xdp_egress_log("Rxwnd is updated from empty to %u, send extra ack", min(c->rx_avail >> TCP_WND_SCALE, 0xFFFF));
+            return XDP_TX;
+        }
+        TCP_UNLOCK(c);
+        return XDP_DROP;
+    }
+
+    // this is probably caused by fast retransmission as we reset the c->tx_next_pos
+    // but there are pending packets in the queue, simply drop them
+    if (unlikely(s.tx_pos != c->tx_next_pos)) {
+        TCP_UNLOCK(c);
+        xdp_egress_log("tx_pos(%u) != c->tx_next_pos(%u)", s.tx_pos, c->tx_next_pos);
+        // bpf_printk("tx_pos(%u) != c->tx_next_pos(%u)", s.tx_pos, c->tx_next_pos);
+        return XDP_DROP;
+    }
+
+    if (s.tx_pending)
+        c->tx_pending += s.tx_pending;
+
+    __u32 avail = tcp_txavail(c);
+
+    if (unlikely(avail < s.payload_len)) {
+        // FIXME
+        // bpf_printk("c->rx_remote_avail(%u), c->tx_sent(%u), c->tx_avail(%u), payload_len(%u)", 
+        //     c->rx_remote_avail, c->tx_sent, c->tx_avail, s.payload_len);
+        // bpf_printk("avail(%u) < payload_len(%u)", avail, s.payload_len);
+    }
+
+    __u64 desired_tx_ts = cc_get_desired_tx_ts(cc, s.ref_ts, s.payload_len);
+
+    fill_tcp_hdr(iph, tcph, c, desired_tx_ts, data_end, 0);
+
+    fill_ip_hdr(iph, s.payload_len, c->ecn_enable);
+
+    c->tx_next_seq += s.payload_len;
+    c->tx_next_pos += s.payload_len;
+    if (c->tx_next_pos >= c->tx_buf_size)
+        c->tx_next_pos -= c->tx_buf_size;
+    c->tx_sent += s.payload_len;
+    cc->txp = c->tx_sent > 0;
+    c->tx_pending -= s.payload_len;
+
+    // /*** NO CC ***/
+    // TCP_UNLOCK(c);
+    // // xdp_egress_log("Always bypass rate limiter");
+    // return XDP_TX;
+    
+    #ifdef BYPASS_RL
+    if (cc->rate >= LINK_BANDWIDTH && !nr_pkts_in_tw[cpu]) {
+        // eRPC recommends to bypass rate limiter
+        goto bypass_rl;
+    }
+    #endif
+
+    #ifdef BYPASS_RL
+    if ((!nr_pkts_in_tw[cpu] || c->tx_sent == s.payload_len) && desired_tx_ts <= s.ref_ts) {
+        goto bypass_rl;
+    }
+    #endif
+
+    TCP_UNLOCK(c);
+
+    // bpf_printk("cc->rate(%lu)", cc->rate);
+
+    __u32 key = cpu;
+    struct timing_wheel *tw_map = bpf_map_lookup_elem(&tw_outer_map, &key);
+    if (unlikely(!tw_map)) {
+        log_panic("tw_map is NULL");
+        return XDP_DROP;
+    }
+
+    __u32 idx = tw_insert(cpu, desired_tx_ts);
+    if (unlikely(idx == POISON_32)) {
+        log_panic("idx == POISON_32");
+        return XDP_DROP;
+    }
+    // bpf_printk("TW idx(%u), tx_ts(%lu), (%u)", idx, desired_tx_ts, cc->rate);
+
+    return bpf_redirect_map(tw_map, idx, 0);
+
+#ifdef BYPASS_RL
+bypass_rl:
+    TCP_UNLOCK(c);
+    xdp_egress_log("bypass rate limiter");
+    return XDP_TX;
+#endif
+}
+
+/**
+ * @brief Check if the received ACK is valid
+ */

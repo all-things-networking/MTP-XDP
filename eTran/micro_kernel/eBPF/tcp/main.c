@@ -222,7 +222,7 @@ int xdp_egress_prog(struct xdp_md *ctx)
         goto err_pkt;
     }
 
-    ret = tcp_tx_process(iph, tcph, c, data_meta, data_end);
+    ret = dispatch_tcp_tx(iph, tcph, c, data_meta, data_end);
 
     if (ret == XDP_DROP) {
         if (data_meta->tx.flag) {
