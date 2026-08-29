@@ -13,7 +13,7 @@
  * generic run-time key/value map: the compiler knows the program, so TCP's key
  * is TCP's key at compile time.
  *
- * Ported so far:  app_bind.
+ * Ported so far:  app_bind, app_listen.
  * Everything else is still eTran's original code in tcp.cc, on purpose -- one
  * event at a time, each built and measured before the next.
  */
@@ -26,6 +26,11 @@
 extern std::unordered_map<struct flow_tuple, struct tcp_connection *,
                           flow_tuple_hash, flow_tuple_equal> tcp_connections;
 extern std::mutex tcp_connections_lock;
+extern std::unordered_map<struct listen_tuple, std::vector<struct tcp_listener *>,
+                          listen_tuple_hash, listen_tuple_equal> tcp_listeners;
+extern std::mutex tcp_listeners_lock;
+extern class eTranNIC *etran_nic;
+void notify_app_tcp_status_listen(struct app_ctx_per_thread *tctx, opaque_ptr l, int fd, int32_t status);
 int alloc_port(uint16_t port);
 int record_port(struct app_ctx *actx, uint16_t local_port, uint16_t remote_port);
 /* eTran's per-context release hook; no longer static in tcp.cc so that a
@@ -92,6 +97,36 @@ static inline tcp_ctx_store &ctxs()
 }
 
 /* ------------------------------------------------------------------ *
+ * flow_id tcp_lid : (uint32, uint16)   -- the listening endpoint
+ *
+ * A SEPARATE context declaration with its own id shape, and a BAG rather than a
+ * store: SO_REUSEPORT puts several listening contexts under one id and an
+ * arriving SYN picks among them by hashing its four-tuple. MTP's model is that
+ * an id selects the instance, so this is the one place the program cannot be
+ * written as MTP describes -- recorded as [GAP: REUSEPORT].
+ * ------------------------------------------------------------------ */
+using tcp_lid = struct listen_tuple;
+
+struct tcp_listen_ctx_init {
+    void operator()(struct tcp_listener *l, const tcp_lid &id) const {
+        l->listen_port = id.local_port;
+        /* id.local_ip is not stored on the listener: eTran keys the bag by the
+         * node's single configured address and the listener carries only its
+         * port. Kept that way -- see proc_listen. */
+    }
+};
+
+using tcp_listen_bag = mtp::ctx_bag<tcp_lid, struct tcp_listener,
+                                    listen_tuple_hash, listen_tuple_equal,
+                                    tcp_listen_ctx_init>;
+
+static inline tcp_listen_bag &listen_ctxs()
+{
+    static tcp_listen_bag s(tcp_listeners, tcp_listeners_lock);
+    return s;
+}
+
+/* ------------------------------------------------------------------ *
  * The events
  * ------------------------------------------------------------------ */
 
@@ -111,8 +146,22 @@ struct app_bind : app_event {
     bool reuseport;
 };
 
+/*
+ * event app_listen : app_event { uint32 pending_cap; }
+ *
+ * The event doc gives this event local_ip and local_port and has the parser set
+ * the flow id from them. NEITHER IS IN THE CALL: appout_tcp_listen_t carries
+ * only the two handles, an fd and the backlog (common/intf/intf.h:112-117). The
+ * endpoint is recovered from the BOUND context, so the parser cannot set the
+ * listening id and the processor derives it.
+ */
+struct app_listen : app_event {
+    opaque_ptr listener_handle;   /* the app's listener object, answered to */
+    unsigned int pending_cap;     /* the backlog argument */
+};
+
 /* ------------------------------------------------------------------ *
- * app_parser socket { bind -> sock_bind; ... }
+ * app_parser socket { bind -> sock_bind; listen -> sock_listen; ... }
  *
  * Turns one socket call into one event and sets its flow id. The id is set
  * HERE, by the parser, which is what lets the processor be written against a
@@ -129,6 +178,19 @@ static inline void sock_bind(struct app_ctx_per_thread *tctx,
     ev.local_port = op->local_port;
     ev.reuseport  = op->reuseport;
     fid = tcp_fid_from_handle(ev.handle, ev.local_port);
+}
+
+static inline void sock_listen(struct app_ctx_per_thread *tctx,
+                               const struct appout_tcp_listen_t *op,
+                               app_listen &ev)
+{
+    ev.tctx            = tctx;
+    ev.handle          = op->opaque_connection;
+    ev.fd              = op->fd;
+    ev.listener_handle = op->opaque_listener;
+    ev.pending_cap     = op->backlog;
+    /* No set_flow_id here: the listening id needs the bound context's port,
+     * which this call does not carry. proc_listen derives it. */
 }
 
 /* ------------------------------------------------------------------ *
@@ -170,19 +232,20 @@ static inline int proc_bind(const app_bind &ev, const tcp_fid &fid)
         /* this port belongs to this application -- allow it */
     }
 
-    struct tcp_connection *ctx = ctxs().new_ctx(fid);
-    if (!ctx)
-        return -ENOMEM;
-
     /* A bind creates a DEGENERATE context: it holds the port and gives listen()
      * something to find. No eBPF state exists yet -- there is no four-tuple to
-     * key a bpf_tcp_conn entry on. */
-    ctx->type              = TCP_CONN_TYPE_FAKE;
-    ctx->reuseport         = ev.reuseport;
-    ctx->fd                = ev.fd;
-    ctx->tctx              = ev.tctx;
-    ctx->opaque_connection = ev.handle;
-    ctx->flags             = 0;
+     * key a bpf_tcp_conn entry on. The writes run inside new_ctx so the context
+     * is published only once complete, which is the order the donor uses. */
+    struct tcp_connection *ctx = ctxs().new_ctx(fid, [&](struct tcp_connection *c) {
+        c->type              = TCP_CONN_TYPE_FAKE;
+        c->reuseport         = ev.reuseport;
+        c->fd                = ev.fd;
+        c->tctx              = ev.tctx;
+        c->opaque_connection = ev.handle;
+        c->flags             = 0;
+    });
+    if (!ctx)
+        return -ENOMEM;
     /* ev.local_ip is parsed and discarded: every listener binds to the node's
      * one configured address. The donor reads it into a local and writes
      * `(void)_local_ip; // FIXME` (tcp.cc:1341). Kept as a discard so the
@@ -196,8 +259,52 @@ static inline int proc_bind(const app_bind &ev, const tcp_fid &fid)
     return 0;
 }
 
+/*
+ * void proc_listen(app_listen ev, tcp_listen_ctx ctx)
+ *
+ * The doc's guards are `!exists(ctx)` and `ctx.state != ST_BOUND`. The second
+ * does not exist -- nothing sets a state anywhere. The real guard is
+ * `type != TCP_CONN_TYPE_FAKE`, i.e. "this handle is a connection, not a bound
+ * socket". The doc's `ctx.state = ST_LISTEN` does not exist either: eTran never
+ * marks the bound context as listening; the listener's existence is what says so.
+ */
+static inline int proc_listen(const app_listen &ev)
+{
+    /* The bound context, by app handle -- the same scan bind uses. */
+    opaque_ptr h = ev.handle;
+    struct tcp_connection *bound = ctxs().find_if(
+        [h](const struct tcp_connection *c) { return c->opaque_connection == h; });
+    if (!bound)
+        return -1;                       /* listen() with no bind() */
+    if (bound->type != TCP_CONN_TYPE_FAKE)
+        return -1;                       /* a connection, not a listening socket */
+
+    /* The listening id uses the node's single configured address, not anything
+     * the application asked for -- consistent with bind discarding local_ip. */
+    tcp_lid lid(etran_nic->_local_ip, bound->local_port);
+
+    struct tcp_listener *l = listen_ctxs().new_ctx(lid, [&](struct tcp_listener *nl) {
+        nl->opaque_listener   = ev.listener_handle;
+        nl->tctx              = ev.tctx;
+        nl->max_backlog_size  = ev.pending_cap;
+        nl->pending_conn      = nullptr;
+        nl->c                 = bound;
+        nl->fd                = bound->fd;
+        /* The owning app thread's list, for teardown. A target ownership detail,
+         * not protocol state -- and populated before publication, as the donor
+         * does it. */
+        ev.tctx->listeners.push_back(nl);
+    });
+    if (!l)
+        return -1;
+
+    /* notify(ctx, LISTENING) -- answered on the BOUND context's fd, as eTran does. */
+    notify_app_tcp_status_listen(ev.tctx, ev.listener_handle, bound->fd, 0);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ *
- * dispatch tcp_dispatch { app_bind -> { proc_bind }; ... }
+ * dispatch tcp_dispatch { app_bind -> { proc_bind }; app_listen -> { proc_listen }; ... }
  *
  * One generated entry point per event. The processor LIST is the loop body; for
  * app_bind the list is one long. The error notify is emitted once here, which
@@ -212,6 +319,16 @@ static inline void dispatch_app_bind(struct app_ctx_per_thread *tctx,
 
     if (proc_bind(ev, fid) != 0)
         notify_app_tcp_status_bind(tctx, op->opaque_connection, op->fd, -1);
+}
+
+static inline void dispatch_app_listen(struct app_ctx_per_thread *tctx,
+                                       const struct appout_tcp_listen_t *op)
+{
+    app_listen ev;
+    sock_listen(tctx, op, ev);
+
+    if (proc_listen(ev) != 0)
+        notify_app_tcp_status_listen(tctx, op->opaque_listener, op->fd, -1);
 }
 
 } // namespace tcp_prog

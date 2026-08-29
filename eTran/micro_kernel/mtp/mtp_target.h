@@ -25,6 +25,7 @@
  */
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace mtp {
 
@@ -91,13 +92,21 @@ public:
      * MTP `new_ctx(fid)`: materialise the context for an id and register it.
      * Value-initialised, so a program that forgets a field gets zero rather
      * than whatever was on the heap.
+     *
+     * `init` runs BEFORE the context is published. It carries the processor's
+     * field writes, and taking it as a callback is not decoration: eTran
+     * registers a context only after filling it, and publishing a half-written
+     * context to a store other sites can already reach is a race waiting for a
+     * reader. The processor still reads as `ctx = new_ctx(fid); ctx.a = ...`.
      */
-    Ctx *new_ctx(const FlowId &id)
+    template <class Init>
+    Ctx *new_ctx(const FlowId &id, Init init)
     {
         Ctx *c = new Ctx();
         if (!c)
             return nullptr;
         CtxInit{}(c, id);
+        init(c);
         std::lock_guard<std::mutex> g(_lock);
         _m.insert(std::make_pair(KeyOf{}(c), c));
         return c;
@@ -109,6 +118,55 @@ public:
     {
         std::lock_guard<std::mutex> g(_lock);
         _m.erase(KeyOf{}(c));
+    }
+
+private:
+    map_t &_m;
+    std::mutex &_lock;
+};
+
+/*
+ * ctx_bag -- a context declaration whose id may select SEVERAL live instances.
+ *
+ * MTP has no such thing: §4.1 is that a context id selects *the* instance, and
+ * `exists(ctx)` has one answer. A target still has to provide it, because
+ * SO_REUSEPORT lets several sockets share one listening endpoint and an
+ * arriving packet picks among them by a rule the target chose. Programs that
+ * need it say so; programs that do not never instantiate this.
+ *
+ * Kept deliberately separate from ctx_store rather than generalising that to
+ * "zero or more", so that a program using the single-instance store cannot
+ * quietly acquire multi-instance semantics.
+ */
+template <class FlowId, class Ctx, class Hash, class Eq, class CtxInit>
+class ctx_bag
+{
+public:
+    using map_t = std::unordered_map<FlowId, std::vector<Ctx *>, Hash, Eq>;
+
+    ctx_bag(map_t &m, std::mutex &lock) : _m(m), _lock(lock) {}
+
+    /* Every instance under this id, or nullptr. The CALLER picks among them --
+     * which one is protocol policy, not storage. */
+    std::vector<Ctx *> *get_all(const FlowId &id)
+    {
+        std::lock_guard<std::mutex> g(_lock);
+        auto it = _m.find(id);
+        return it == _m.end() ? nullptr : &it->second;
+    }
+
+    /* As ctx_store::new_ctx, including init-before-publish. */
+    template <class Init>
+    Ctx *new_ctx(const FlowId &id, Init init)
+    {
+        Ctx *c = new Ctx();
+        if (!c)
+            return nullptr;
+        CtxInit{}(c, id);
+        init(c);
+        std::lock_guard<std::mutex> g(_lock);
+        _m[id].push_back(c);
+        return c;
     }
 
 private:

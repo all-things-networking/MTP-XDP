@@ -1132,61 +1132,9 @@ int poll_tcp_handshake_events(void)
 }
 
 // external functions
-int tcp_listen(struct app_ctx_per_thread *tctx, struct appout_tcp_listen_t *tcp_listen_msg_in)
-{
-    struct tcp_connection *c;
-    struct tcp_listener *listener;
-    uint16_t port;
-    opaque_ptr opaque_connection = tcp_listen_msg_in->opaque_connection;
-    opaque_ptr opaque_listener = tcp_listen_msg_in->opaque_listener;
-    unsigned int backlog = tcp_listen_msg_in->backlog;
-
-    c = find_tcp_conn_slowpath(opaque_connection);
-
-    // it seems that no bind() for it
-    if (!c)
-        return -1;
-
-    // not a connection used for listen
-    if (c->type != TCP_CONN_TYPE_FAKE)
-        return -1;
-
-    port = c->local_port;
-
-    listener = new tcp_listener();
-    if (!listener)
-        return -1;
-
-    listener->opaque_listener = opaque_listener;
-    listener->tctx = tctx;
-    listener->max_backlog_size = backlog;
-    listener->listen_port = port;
-    listener->pending_conn = nullptr;
-    listener->c = c;
-    listener->fd = c->fd;
-
-    tctx->listeners.push_back(listener);
-
-    tcp_listeners_lock.lock();
-    auto it = tcp_listeners.find(listen_tuple(etran_nic->_local_ip, port));
-    if (it != tcp_listeners.end())
-    {
-        std::vector<tcp_listener *> &listener_list = it->second;
-        listener_list.push_back(listener);
-    }
-    else
-    {
-        // first listen() on this socket, create a new listener list
-        std::vector<tcp_listener *> listener_list = std::vector<tcp_listener *>();
-        listener_list.push_back(listener);
-        tcp_listeners.insert(std::make_pair(listen_tuple(etran_nic->_local_ip, port), listener_list));
-    }
-    tcp_listeners_lock.unlock();
-
-    notify_app_tcp_status_listen(tctx, opaque_listener, c->fd, 0);
-
-    return 0;
-}
+/*
+ * tcp_listen() is GONE -- ported to MTP shape in mtp/tcp_program.h, event 2.
+ */
 
 int tcp_accept(struct app_ctx_per_thread *tctx, struct appout_tcp_accept_t *tcp_accept_msg_in)
 {
@@ -1482,9 +1430,9 @@ void process_tcp_cmd(struct app_ctx_per_thread *tctx, lrpc_msg *msg_in)
         tcp_prog::dispatch_app_bind(tctx, tcp_bind_msg_in);
         break;
     case APPOUT_TCP_LISTEN:
+        /* ported: mtp/tcp_program.h */
         tcp_listen_msg_in = (struct appout_tcp_listen_t *)msg_in->data;
-        if (tcp_listen(tctx, tcp_listen_msg_in))
-            notify_app_tcp_status_listen(tctx, tcp_listen_msg_in->opaque_listener, tcp_listen_msg_in->fd, -1);
+        tcp_prog::dispatch_app_listen(tctx, tcp_listen_msg_in);
         break;
     case APPOUT_TCP_ACCEPT:
         tcp_accept_msg_in = (struct appout_tcp_accept_t *)msg_in->data;
