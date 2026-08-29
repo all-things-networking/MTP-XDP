@@ -1,0 +1,872 @@
+/*
+ * tcp.mtp -- the TCP transport program, for the eTran/XDP target.
+ *
+ * Written against MTP.g4 on MTP-compiler @ mtp-dpdk-backend (9e7c7d6). The
+ * grammar is the authority for what PARSES; examples/tcp-etran.mtp is
+ * superseded and must not be read as a reference.
+ *
+ * INSTRUCTION SPELLING. The grammar's tokens carry an `_instr` suffix
+ * (NEW_CTX : 'new_ctx_instr'), but the backends implement the UNSUFFIXED names
+ * -- new_ctx, del_ctx, pkt_gen, timer_start, timer_stop -- and emit
+ * "no emission for builtin 'new_ctx_instr'" for the suffixed ones. Both parse:
+ * the suffixed form as the grammar token, the unsuffixed as an ordinary call
+ * that the generator then recognises by name. This program uses the spellings
+ * that GENERATE, and the discrepancy is worth closing in one direction or the
+ * other, because right now the grammar and the backends disagree and only one
+ * of them tells you.
+ *
+ * WHAT THIS PROGRAM DESCRIBES. eTran (NSDI'25), as it actually behaves, not as
+ * TCP is usually described. Every departure from ordinary TCP below is the
+ * donor's and is marked; a compiler that "corrects" one of them produces a
+ * different protocol. The behaviour was established by porting all fifteen
+ * events into the eTran backend one at a time and reading the code at every
+ * step -- see docs/EVENT-PORT-LOG.md in minmit/tmp-mtp-pass, which cites the
+ * file and line for each claim.
+ *
+ * THE FOUR-WAY SPLIT IS IN THE PROGRAM, via @placement. eTran keeps one
+ * connection's state in four structures across three address spaces: an eBPF
+ * map, a shared mmapped array, the control path's own heap, and the
+ * application's. MTP declares ONE context; @placement is how the program says
+ * where a group of fields lives without pretending they are four contexts.
+ */
+
+/**************************** constants ****************************/
+
+const uint8  FLAG_FIN = 0x01;
+const uint8  FLAG_SYN = 0x02;
+const uint8  FLAG_RST = 0x04;
+const uint8  FLAG_PSH = 0x08;
+const uint8  FLAG_ACK = 0x10;
+const uint8  FLAG_ECE = 0x40;
+const uint8  FLAG_CWR = 0x80;
+
+/*
+ * eTran's connection states. CONN_WAIT_RX_SYN is the state of a connection
+ * accept() has created but no SYN has yet claimed -- the one state whose
+ * contexts are deliberately NOT in the connection map.
+ */
+const uint8  CONN_WAIT_RX_SYN    = 0;
+const uint8  CONN_WAIT_TX_SYNACK = 1;
+const uint8  CONN_WAIT_RX_SYNACK = 2;
+const uint8  CONN_WAIT_TX_SYN    = 3;
+const uint8  CONN_OPEN           = 4;
+const uint8  CONN_CLOSED         = 5;
+
+/*
+ * The KIND of a context, which eTran keeps separately from its state. A bound
+ * socket is TYPE_FAKE: it holds a port and gives listen() something to find,
+ * and it is never a connection. bind() and listen() write no state at all --
+ * ST_BOUND and ST_LISTEN do not exist in the donor, and earlier versions of the
+ * event documents invented them for exactly the two events that have none.
+ */
+const uint8  TYPE_FAKE   = 0;
+const uint8  TYPE_NORMAL = 1;
+
+/* PARITY: both initial sequence numbers are constants and neither is
+ * randomised. The active open sends 0, the passive open sends 1. Reproduce,
+ * do not correct. */
+const uint32 PARITY_ISN_ACTIVE  = 0;
+const uint32 PARITY_ISN_PASSIVE = 1;
+
+/* PARITY: the advertised window is a constant in every control segment the
+ * control path builds. */
+const uint16 PARITY_CTRL_WINDOW = 11680;
+
+const uint16 PARITY_MSS         = 1460;
+const uint16 PARITY_MSS_W_TS    = 1448;   /* mss minus the timestamp option */
+
+/* The compile-time bound on one listener's held SYNs. A SYN arriving with the
+ * backlog full is DROPPED, silently -- not reset. */
+const uint32 PROG_MAX_BACKLOG   = 512;
+
+/* eTran offers ECN on every SYN unconditionally: there is no socket option and
+ * no configuration for it. The two sides then test DIFFERENT things, and both
+ * are right -- see proc_synack and proc_passive_open. */
+const bool   PARITY_ALWAYS_OFFER_ECN = true;
+
+const uint8  TRANSPORT_IP_PROTO = 6;
+
+/**************************** parameters ****************************/
+
+param uint32 tcp_handshake_timeout(50);    /* ms */
+param uint32 tcp_close_timeout(100);       /* ms */
+
+/**************************** flow ids ****************************/
+
+/*
+ * A connection is named by its four-tuple, remote half first, which is the
+ * order the donor's key constructor uses.
+ */
+flow_id tcp_fid : (uint32, uint16, uint32, uint16);
+
+/* A listening endpoint. */
+flow_id tcp_lid : (uint32, uint16);
+
+/**************************** events ****************************/
+
+event app_bind : app_event {
+    uint32 local_ip;        /* PARSED AND DISCARDED -- see proc_bind */
+    uint16 local_port;
+    bool   reuseport;
+}
+
+/*
+ * app_listen carries ONLY the backlog. The call has no address of any kind:
+ * appout_tcp_listen_t is {opaque_connection, opaque_listener, fd, backlog}, so
+ * the listening endpoint cannot be set by the parser and proc_listen recovers
+ * it from the bound context.
+ */
+event app_listen : app_event {
+    uint32 pending_cap;
+}
+
+event app_accept : app_event {
+    uint16 local_port;      /* which listening endpoint, from the app */
+}
+
+/* Likewise: the call carries the REMOTE endpoint only. */
+event app_connect : app_event {
+    uint32 remote_ip;
+    uint16 remote_port;
+}
+
+event app_send : app_event {
+    uint32 len;
+}
+
+event app_recv : app_event {
+    uint32 len;
+}
+
+event app_close : app_event { }
+
+event tcp_syn : net_event {
+    uint32 seq;
+    uint16 sport, dport, window;
+    uint32 local_ip, remote_ip;
+    uint32 ts_val;
+    bool   has_ts, has_mss;
+    bool   ece, cwr;
+    uint32 qid;             /* the NIC queue it arrived on -- state, not
+                             * bookkeeping: the eBPF half is keyed to it */
+}
+
+event tcp_synack : net_event {
+    uint32 seq, ack;
+    uint16 window;
+    uint32 ts_val;
+    bool   has_ts;
+    bool   ece, cwr;
+    uint32 qid;
+}
+
+event tcp_ack : net_event {
+    uint32 seq, ack;
+    uint16 window, flags;
+    uint32 ts_val, ts_ecr;
+    uint32 payload_len;
+    bool   ecn_ce;
+}
+
+event tcp_data : net_event {
+    uint32 seq, ack;
+    uint16 window;
+    uint32 ts_val, ts_ecr;
+    uint32 payload_len;
+    bool   ecn_ce;
+}
+
+event tcp_rst : net_event {
+    uint32 seq, ack;
+}
+
+/*
+ * tcp_fin EXISTS. eTran never SENDS a FIN and has no teardown handshake --
+ * close() emits a RST -- but a FIN arriving on a closed connection is answered
+ * with a bare ACK. An earlier README said eTran "neither sends nor processes a
+ * FIN"; a program written from that sentence drops an arm the donor has.
+ */
+event tcp_fin : net_event {
+    uint32 seq, ack;
+}
+
+event handshake_timeout : timer_event { }
+event cc_interval_timeout : timer_event { }
+event rto_timeout : timer_event { }
+
+/**************************** packet shape ****************************/
+
+pkt_bp TCPBP {
+    uint16 src_port, dst_port;
+    uint32 seq_no, ack_seq;
+    /* data_off and checksum are fields the COMPILER fills: the program cannot
+     * do arithmetic over the compiler's own option layout, which is the one
+     * thing it does not know. */
+    hdrlen4_t data_off;
+    uint8  flags;
+    uint16 window;
+    checksum16_t checksum;
+    uint16 urg_ptr;
+    tcp_options opts;
+    data_t data;
+}
+
+net_header ipv4 { uint32 saddr, daddr; uint8 protocol; }
+
+opt_t opt_mss    { uint8 kind = 2; uint8 opt_len = 4;  uint16 mss; }
+opt_t opt_nop    { uint8 kind = 1; }
+opt_t opt_ts     { uint8 kind = 8; uint8 opt_len = 10; uint32 ts_val, ts_ecr; }
+opt_union tcp_opt { opt_mss, opt_nop, opt_ts }
+opt_list  tcp_options { list<tcp_opt> opts; }
+
+/**************************** contexts ****************************/
+
+/*
+ * ONE context. The @placement groups are eTran's four storage classes, and the
+ * split is the target's arrangement for this backend -- a target with one
+ * address space would place the same program's fields once.
+ */
+context tcp_ctx {
+    tcp_fid key;
+
+    /*
+     * (c) the control path's own heap. Everything connection setup and teardown
+     * touches, and nothing the data path reads per packet.
+     */
+    @placement("control") {
+        uint8  type = TYPE_FAKE;
+        uint8  state = CONN_WAIT_RX_SYN;
+        bool   reuseport;
+        uint16 local_port, remote_port;
+        uint32 local_ip, remote_ip;
+        uint32 syn_ts;
+        uint32 syn_attempts;
+        uint32 next_timeout;
+        uint32 qid;
+        bool   ecn_enable;
+        uint32 rx_buf_size, tx_buf_size;
+    }
+
+    /*
+     * (a) the eBPF map, written by XDP and XDP_EGRESS under a spin lock. The
+     * control path only creates and destroys these entries; per-packet
+     * arithmetic happens here.
+     */
+    @placement("ebpf") {
+        uint32 rx_avail, rx_remote_avail;
+        uint32 rx_next_pos, rx_next_seq;
+        uint32 rx_dupack_cnt;
+        uint32 rx_ooo_start, rx_ooo_len;
+        uint32 tx_pending, tx_sent;
+        uint32 tx_next_pos, tx_next_seq;
+        uint32 tx_next_ts;
+    }
+
+    /*
+     * (b) shared between the eBPF sites and the control loop, lock-free because
+     * each variable has exactly one writer.
+     */
+    @placement("cc_shared") {
+        uint32 cnt_tx_drops, cnt_rx_acks;
+        uint32 cnt_rx_ack_bytes, cnt_rx_ecn_bytes;
+        uint32 rtt_est;
+        uint32 rate;
+        bool   txp;
+    }
+
+    /*
+     * (d) the application's own address space. The micro kernel never touches
+     * these; the app thread does its own segmentation and ring bookkeeping.
+     */
+    @placement("app") {
+        uint32 rxb_head, rxb_used, rxb_bump;
+        uint32 txb_head, txb_sent, txb_allocated;
+        bool   force_rx_bump, in_rx_bump_pending;
+    }
+
+    timer_t handshake_timer;
+    timer_t rto_timer;
+}
+
+/*
+ * The listening endpoint. ONE ID SELECTS SEVERAL INSTANCES here: SO_REUSEPORT
+ * puts one listener per socket under one endpoint and an arriving SYN picks
+ * among them by hashing its four-tuple. MTP's model is that an id selects THE
+ * instance, so this is the one place the program cannot be written as the
+ * language describes. [GAP: REUSEPORT]
+ */
+context tcp_listen_ctx {
+    tcp_lid key;
+
+    uint32 local_ip;
+    uint16 local_port;
+
+    uint32 pending_cap;         /* the backlog argument. It bounds the queue of
+                                 * held SYNs -- NOT the queue of completed
+                                 * connections, which holds exactly one. */
+    uint32 pending_n;
+    tcp_fid pending[PROG_MAX_BACKLOG];
+
+    /* The completed connection waiting for accept(). Capacity ONE, whatever
+     * pending_cap says. */
+    tcp_fid accepted;
+    bool    has_accepted;
+}
+
+/**************************** scratchpad ****************************/
+
+scratchpad_t tcp_scratch {
+    uint32 acked;
+    uint32 rx_bump;
+    uint32 go_back_pos;
+    bool   trigger_ack;
+    bool   seg_ok;
+}
+
+/**************************** the app parser ****************************/
+
+app_parser socket {
+    bind    -> sock_bind;
+    listen  -> sock_listen;
+    accept  -> sock_accept;
+    connect -> sock_connect;
+    send    -> sock_send;
+    recv    -> sock_recv;
+    close   -> sock_close;
+}
+
+/*
+ * THE ID A BOUND SOCKET IS FILED UNDER IS NOT ITS ENDPOINT.
+ *
+ * With no peer there is no four-tuple, so eTran fabricates one out of the
+ * application's socket handle: three quarters of the key are slices of a
+ * pointer. MTP permits it -- a context id is a tuple the program builds -- but
+ * it means a bound socket's identity is an address. [GAP: SYNTHETIC-ID]
+ *
+ * The same fabrication has to be reproduced by listen(), accept() and close(),
+ * because that is how they find the context again.
+ */
+list<event_t> sock_bind(bind op) {
+    list<event_t> out;
+    app_bind ev;
+
+    ev.local_ip   = op.local.ip;
+    ev.local_port = op.local.port;
+    ev.reuseport  = op.reuseport;
+    set_ctx_lookup_info(ev, tcp_ctx,
+                        tcp_fid(uint32(op.handle >> 16), uint16(op.handle),
+                                uint32(op.handle >> 32), op.local.port));
+    out.add(ev);
+    return out;
+}
+
+list<event_t> sock_listen(listen op) {
+    list<event_t> out;
+    app_listen ev;
+
+    ev.pending_cap = op.len;
+    /* The BOUND context, by the same fabricated id. The listening endpoint is
+     * not knowable here -- the call carries no address -- so proc_listen
+     * derives it from the context this resolves to. */
+    set_ctx_lookup_info(ev, tcp_ctx,
+                        tcp_fid(uint32(op.handle >> 16), uint16(op.handle),
+                                uint32(op.handle >> 32), op.local.port));
+    out.add(ev);
+    return out;
+}
+
+list<event_t> sock_accept(accept op) {
+    list<event_t> out;
+    app_accept ev;
+
+    ev.local_port = op.local.port;
+    set_ctx_lookup_info(ev, tcp_listen_ctx, tcp_lid(op.local.ip, op.local.port));
+    out.add(ev);
+    return out;
+}
+
+list<event_t> sock_connect(connect op) {
+    list<event_t> out;
+    app_connect ev;
+
+    ev.remote_ip   = op.remote.ip;
+    ev.remote_port = op.remote.port;
+    set_ctx_lookup_info(ev, tcp_ctx,
+                        tcp_fid(uint32(op.handle >> 16), uint16(op.handle),
+                                uint32(op.handle >> 32), op.local.port));
+    out.add(ev);
+    return out;
+}
+
+list<event_t> sock_send(send op) {
+    list<event_t> out;
+    app_send ev;
+
+    ev.len = op.len;
+    set_ctx_lookup_info(ev, tcp_ctx,
+                        tcp_fid(op.remote.ip, op.remote.port,
+                                op.local.ip, op.local.port));
+    out.add(ev);
+    return out;
+}
+
+list<event_t> sock_recv(recv op) {
+    list<event_t> out;
+    app_recv ev;
+
+    ev.len = op.len;
+    set_ctx_lookup_info(ev, tcp_ctx,
+                        tcp_fid(op.remote.ip, op.remote.port,
+                                op.local.ip, op.local.port));
+    out.add(ev);
+    return out;
+}
+
+/* The close call carries the four-tuple and eTran ignores every field of it:
+ * the context is found by handle like every other socket call. */
+list<event_t> sock_close(close op) {
+    list<event_t> out;
+    app_close ev;
+
+    set_ctx_lookup_info(ev, tcp_ctx,
+                        tcp_fid(op.remote.ip, op.remote.port,
+                                op.local.ip, op.local.port));
+    out.add(ev);
+    return out;
+}
+
+/**************************** the net parser ****************************/
+
+/*
+ * The parser classifies and extracts. It does NOT look contexts up: it names
+ * the context type and the id, and the target resolves them (D-33).
+ *
+ * eTran splits the work between two sites, and the split is visible here as
+ * which events exist at all. SYN, SYN-ACK and RST are redirected out of XDP to
+ * the control path; everything else is handled in eBPF and never reaches
+ * userspace. One program, two execution sites, one parser.
+ */
+list<event_t> parse_tcp(pkt_t p, ipv4 h) {
+    list<event_t> out;
+
+    TCPBP  bp = extract(p);
+    uint32 payload_len;
+
+    if (p.len < 20 || bp.data_off * 4 < 20 || bp.data_off * 4 > p.len)
+        return out;
+    payload_len = p.len - bp.data_off * 4;
+
+    tcp_fid fid = tcp_fid(h.saddr, bp.src_port, h.daddr, bp.dst_port);
+    tcp_lid lid = tcp_lid(h.daddr, bp.dst_port);
+
+    /* A SYN with no ACK is answered from the LISTENER: no connection exists for
+     * it to name yet, so it is the one segment keying a different context. */
+    if ((bp.flags & FLAG_SYN) != 0 && (bp.flags & FLAG_ACK) == 0) {
+        tcp_syn s;
+        s.seq = bp.seq_no;
+        s.sport = bp.src_port;  s.dport = bp.dst_port;
+        s.window = bp.window;
+        s.local_ip = h.daddr;   s.remote_ip = h.saddr;
+        s.ts_val = bp.opts.ts_val;
+        s.has_ts = bp.opts.has_ts;
+        s.has_mss = bp.opts.has_mss;
+        s.ece = (bp.flags & FLAG_ECE) != 0;
+        s.cwr = (bp.flags & FLAG_CWR) != 0;
+        s.qid = p.qid;
+        set_ctx_lookup_info(s, tcp_listen_ctx, lid);
+        out.add(s);
+        return out;
+    }
+
+    if ((bp.flags & FLAG_SYN) != 0) {
+        tcp_synack sa;
+        sa.seq = bp.seq_no;  sa.ack = bp.ack_seq;  sa.window = bp.window;
+        sa.ts_val = bp.opts.ts_val;
+        sa.has_ts = bp.opts.has_ts;
+        sa.ece = (bp.flags & FLAG_ECE) != 0;
+        sa.cwr = (bp.flags & FLAG_CWR) != 0;
+        sa.qid = p.qid;
+        set_ctx_lookup_info(sa, tcp_ctx, fid);
+        out.add(sa);
+        return out;
+    }
+
+    if ((bp.flags & FLAG_RST) != 0) {
+        tcp_rst r;
+        r.seq = bp.seq_no;  r.ack = bp.ack_seq;
+        set_ctx_lookup_info(r, tcp_ctx, fid);
+        out.add(r);
+        return out;
+    }
+
+    if ((bp.flags & FLAG_FIN) != 0) {
+        tcp_fin f;
+        f.seq = bp.seq_no;  f.ack = bp.ack_seq;
+        set_ctx_lookup_info(f, tcp_ctx, fid);
+        out.add(f);
+        return out;
+    }
+
+    /*
+     * EVERY REMAINING SEGMENT RAISES tcp_ack, AND A SEGMENT WITH PAYLOAD ALSO
+     * RAISES tcp_data. The two chains INTERLEAVE in the donor -- tcp_ack's
+     * window and RTT updates run AFTER tcp_data's sequence validation and are
+     * skipped by its early exits, so a segment with a bad sequence number never
+     * updates the receive window even though the window is ACK state.
+     *
+     * The dispatch below states the braid explicitly. Running the two lists one
+     * after the other would be a different program.
+     */
+    tcp_ack a;
+    a.seq = bp.seq_no;  a.ack = bp.ack_seq;
+    a.window = bp.window;  a.flags = bp.flags;
+    a.ts_val = bp.opts.ts_val;  a.ts_ecr = bp.opts.ts_ecr;
+    a.payload_len = payload_len;
+    a.ecn_ce = h.ecn_ce;
+    set_ctx_lookup_info(a, tcp_ctx, fid);
+    out.add(a);
+
+    if (payload_len > 0) {
+        tcp_data d;
+        d.seq = bp.seq_no;  d.ack = bp.ack_seq;
+        d.window = bp.window;
+        d.ts_val = bp.opts.ts_val;  d.ts_ecr = bp.opts.ts_ecr;
+        d.payload_len = payload_len;
+        d.ecn_ce = h.ecn_ce;
+        set_ctx_lookup_info(d, tcp_ctx, fid);
+        out.add(d);
+    }
+
+    return out;
+}
+
+/**************************** processors ****************************/
+
+/*
+ * proc_bind. Creates a DEGENERATE context: it holds the port and gives listen()
+ * something to find. No eBPF state exists yet -- there is no four-tuple to key
+ * an entry on.
+ *
+ * TODO(error handling): eTran refuses a second bind on this handle, and refuses
+ * a port another application owns unless SO_REUSEPORT is set. Both need to know
+ * whether the context is already present, which the PROGRAM does not know --
+ * that is the target's knowledge. MTP has no presence test and error-handling
+ * primitives are future work.
+ *
+ * ORDER NOTE: the donor allocates the context BEFORE testing the port and frees
+ * it again on failure. Written with new_ctx after the guards, which is
+ * behaviour-preserving because nothing can observe an unregistered context.
+ */
+void proc_bind(app_bind ev, tcp_ctx ctx) {
+    tcp_fid fid = ctx.key;
+    new_ctx(fid);
+
+    ctx.type      = TYPE_FAKE;
+    ctx.reuseport = ev.reuseport;
+    ctx.local_port = ev.local_port;
+
+    /* ev.local_ip IS DISCARDED. Every bind takes the node's single configured
+     * address; the donor reads the field into a local and writes
+     * `(void)_local_ip; // FIXME`. Binding to a specific address is not
+     * implemented, and a program that honoured the field would not be eTran. */
+
+    notify(ctx, BOUND);
+}
+
+/*
+ * proc_listen. The guard is the context's KIND, not a state: "this handle is a
+ * bound socket, not a connection". Nothing marks the bound context as
+ * listening -- the listener's existence is what says so.
+ */
+void proc_listen(app_listen ev, tcp_ctx bound, tcp_listen_ctx lst) {
+    if (bound.type != TYPE_FAKE)
+        return;
+
+    tcp_lid lid = tcp_lid(bound.local_ip, bound.local_port);
+    new_ctx(lid);
+
+    lst.local_ip    = bound.local_ip;
+    lst.local_port  = bound.local_port;
+    lst.pending_cap = ev.pending_cap;
+    lst.pending_n   = 0;
+    lst.has_accepted = false;
+
+    notify(lst, LISTENING);
+}
+
+/*
+ * proc_accept. THE CONTEXT IS CREATED BEFORE ITS IDENTITY EXISTS: this is the
+ * connection that will receive the NEXT SYN, so its remote address -- three
+ * quarters of its id -- is still zero. eTran keeps it off the connection map
+ * entirely until a SYN supplies one.
+ *
+ * MTP's new_ctx takes the id, because a context and its identity normally
+ * arrive together. Here they do not, and the target has to allow a context that
+ * is not yet addressable. [GAP: UNIDENTIFIED-CTX]
+ *
+ * There is no notify on this path. The application is told when the SYN-ACK
+ * goes out, from gen_synack.
+ */
+void proc_accept(app_accept ev, tcp_listen_ctx lst) {
+    /* Exactly ONE completed connection may wait, whatever pending_cap says --
+     * that cap governs the queue of held SYNs, which is a different queue. */
+    if (lst.has_accepted)
+        return;
+
+    lst.has_accepted = true;
+}
+
+/*
+ * proc_connect. The local address is the node's configured one and the local
+ * port is the bound context's, or the allocator's if no bind ran -- neither is
+ * in the call.
+ *
+ * THE CONTEXT'S IDENTITY CHANGES HERE. If bind() ran, this context is already
+ * filed under the fabricated id of sock_bind; connect overwrites its address
+ * fields with the real four-tuple and eTran files it AGAIN, keeping both. Close
+ * then removes only one. MTP has no instruction for an identity change; the
+ * target reproduces the donor rather than tidying it, because tidying it is a
+ * protocol change. [GAP: ID-CHANGE]
+ */
+void proc_connect(app_connect ev, tcp_ctx ctx) {
+    ctx.type        = TYPE_NORMAL;
+    ctx.remote_ip   = ev.remote_ip;
+    ctx.remote_port = ev.remote_port;
+    ctx.state       = CONN_WAIT_TX_SYN;
+    ctx.rx_next_seq = 0;
+    ctx.tx_next_seq = PARITY_ISN_ACTIVE;
+    ctx.syn_attempts = 0;
+
+    tcp_fid fid = ctx.key;
+    new_ctx(fid);
+
+    /* status 0 means "in progress". The application is notified a SECOND time
+     * when the SYN-ACK lands, and connect() polls for that one. Two
+     * notifications for one call has no MTP form. */
+    notify(ctx, CONNECTING);
+}
+
+/*
+ * gen_syn. DEFERRED: the donor does not emit a SYN inside connect(). The
+ * context is parked and the control loop drains it on its next pass, which is
+ * why this is a separate processor rather than the tail of proc_connect.
+ */
+void gen_syn(app_connect ev, tcp_ctx ctx) {
+    if (ctx.state != CONN_WAIT_TX_SYN)
+        return;
+
+    ctx.state = CONN_WAIT_RX_SYNACK;
+    timer_start(ctx.handshake_timer, millisecond(tcp_handshake_timeout));
+
+    TCPBP bp;
+    bp.src_port = ctx.local_port;
+    bp.dst_port = ctx.remote_port;
+    bp.seq_no   = ctx.tx_next_seq;
+    bp.ack_seq  = 0;
+    bp.window   = PARITY_CTRL_WINDOW;
+    /* PARITY: always ECN-capable. No socket option, no configuration. */
+    bp.flags    = FLAG_SYN | FLAG_ECE | FLAG_CWR;
+    bp.opts.add(opt_mss(PARITY_MSS));
+    bp.opts.add(opt_ts(0, 0));
+    pkt_gen(bp, PRIO_CONTROL, false);
+}
+
+/*
+ * proc_passive_open -- the SUFFIX tcp_syn AND app_accept SHARE. Either the SYN
+ * arrives while an accept waits, or an accept arrives while the SYN is queued.
+ * MTP has no way to say two events share a tail; both dispatch entries name it.
+ *
+ * This is where the context accept() created without an identity gets one.
+ */
+void proc_passive_open(tcp_syn ev, tcp_listen_ctx lst, tcp_ctx ctx) {
+    if (!lst.has_accepted) {
+        /* No accept waiting: hold the SYN. A backlog that is full DROPS it --
+         * silently, and not with a reset. */
+        if (lst.pending_n >= lst.pending_cap)
+            return;
+        lst.pending[lst.pending_n] = tcp_fid(ev.remote_ip, ev.sport,
+                                             ev.local_ip, ev.dport);
+        lst.pending_n = lst.pending_n + 1;
+        notify(lst, NEW_CONN);
+        return;
+    }
+
+    /* The options are re-parsed HERE, not when the SYN arrived: the donor
+     * copies 256 raw bytes into the backlog and decodes them at this point,
+     * which is why MSS and the timestamp are read later than received. */
+    if (!ev.has_ts || !ev.has_mss)
+        return;
+
+    ctx.qid         = ev.qid;
+    ctx.type        = TYPE_NORMAL;
+    ctx.local_ip    = ev.local_ip;
+    ctx.local_port  = ev.dport;
+    ctx.remote_ip   = ev.remote_ip;
+    ctx.remote_port = ev.sport;
+    ctx.rx_next_seq = ev.seq + 1;
+    ctx.tx_next_seq = PARITY_ISN_PASSIVE;
+    ctx.syn_ts      = ev.ts_val;
+
+    /* The OFFER is ECE and CWR together. The active side treats ECE ALONE as
+     * the acceptance -- the two sides test different things and both are
+     * right. */
+    if (ev.ece && ev.cwr)
+        ctx.ecn_enable = true;
+
+    /* Only now is the context addressable by its id. */
+    tcp_fid fid = ctx.key;
+    new_ctx(fid);
+
+    ctx.state = CONN_WAIT_TX_SYNACK;
+    lst.has_accepted = false;
+}
+
+/*
+ * gen_synack. DEFERRED, like gen_syn. Marks the connection OPEN *before* the
+ * SYN-ACK is emitted and NEVER WAITS FOR THE THIRD ACK: the passive side is
+ * live from this moment, which is why a retransmitted SYN later cannot be told
+ * from a new one.
+ */
+void gen_synack(tcp_syn ev, tcp_ctx ctx) {
+    if (ctx.state != CONN_WAIT_TX_SYNACK)
+        return;
+
+    ctx.state = CONN_OPEN;
+
+    TCPBP bp;
+    bp.src_port = ctx.local_port;
+    bp.dst_port = ctx.remote_port;
+    bp.seq_no   = ctx.tx_next_seq;
+    bp.ack_seq  = ctx.rx_next_seq;
+    bp.window   = PARITY_CTRL_WINDOW;
+    bp.flags    = FLAG_SYN | FLAG_ACK;
+    if (ctx.ecn_enable)
+        bp.flags = bp.flags | FLAG_ECE;
+    bp.opts.add(opt_mss(PARITY_MSS));
+    bp.opts.add(opt_ts(0, ctx.syn_ts));
+    pkt_gen(bp, PRIO_CONTROL, false);
+
+    /* accept() returns from HERE, not from proc_accept. */
+    notify(ctx, ACCEPTED);
+}
+
+/*
+ * proc_synack. The ORDER is the unusual part and is the donor's: the eBPF half
+ * of the context is created and the application is told the connection is open
+ * BEFORE the third ACK is emitted. By the time that ACK leaves, connect() has
+ * returned and the fast path is running.
+ */
+void proc_synack(tcp_synack ev, tcp_ctx ctx) {
+    if (ctx.state != CONN_WAIT_RX_SYNACK)
+        return;
+
+    /* The NIC queue this connection's eBPF half will be keyed to. A state
+     * write, not bookkeeping. */
+    ctx.qid = ev.qid;
+    timer_stop(ctx.handshake_timer);
+
+    if (!ev.has_ts) {
+        /* Restore every field this processor would have written and retry the
+         * SYN -- the donor rewinds rather than tearing down. */
+        ctx.rx_next_seq = 0;
+        ctx.tx_next_seq = 0;
+        ctx.syn_ts      = 0;
+        ctx.ecn_enable  = false;
+        timer_start(ctx.handshake_timer, millisecond(tcp_handshake_timeout));
+        return;
+    }
+
+    ctx.rx_next_seq = ev.seq + 1;
+    /* NOT +1: the SYN's octet is already counted in the peer's acknowledgement. */
+    ctx.tx_next_seq = ev.ack;
+    ctx.syn_ts      = ev.ts_val;
+
+    /* ECE ALONE is the acceptance. ECE|CWR is the offer. */
+    if (ev.ece && !ev.cwr)
+        ctx.ecn_enable = true;
+
+    ctx.state = CONN_OPEN;
+    notify(ctx, CONN_OPEN_OK);
+
+    TCPBP bp;
+    bp.src_port = ctx.local_port;
+    bp.dst_port = ctx.remote_port;
+    bp.seq_no   = ctx.tx_next_seq;
+    bp.ack_seq  = ctx.rx_next_seq;
+    bp.window   = PARITY_CTRL_WINDOW;
+    bp.flags    = FLAG_ACK;
+    bp.opts.add(opt_ts(0, ctx.syn_ts));
+    pkt_gen(bp, PRIO_ACK, false);
+}
+
+/*
+ * proc_rst. notify_close then teardown. eTran ANSWERS A RST WITH A RST: the
+ * teardown path emits one unconditionally, which is the donor's behaviour and
+ * not a mistake in transcription.
+ */
+void proc_rst(tcp_rst ev, tcp_ctx ctx) {
+    notify(ctx, PEER_RESET);
+    tcp_fid dead = ctx.key;
+    del_ctx(dead);
+}
+
+/*
+ * proc_fin. A FIN on an already-closed connection, answered with a bare ACK.
+ * The donor's own comment is "TODO figure out why necessary"; kept, including
+ * the puzzlement. No FIN ever advances a connection here.
+ */
+void proc_fin(tcp_fin ev, tcp_ctx ctx) {
+    if (ctx.state != CONN_CLOSED)
+        return;
+
+    TCPBP bp;
+    bp.src_port = ctx.local_port;
+    bp.dst_port = ctx.remote_port;
+    bp.seq_no   = ctx.tx_next_seq;
+    bp.ack_seq  = ctx.rx_next_seq;
+    bp.window   = PARITY_CTRL_WINDOW;
+    bp.flags    = FLAG_ACK;
+    pkt_gen(bp, PRIO_ACK, false);
+}
+
+/*
+ * proc_close. mark_closed and gen_rst are ONE step in the donor: the teardown
+ * emits the RST itself. eTran has no FIN and no teardown handshake -- close()
+ * resets the connection.
+ */
+void proc_close(app_close ev, tcp_ctx ctx) {
+    ctx.state = CONN_CLOSED;
+
+    TCPBP bp;
+    bp.src_port = ctx.local_port;
+    bp.dst_port = ctx.remote_port;
+    bp.seq_no   = ctx.tx_next_seq;
+    bp.ack_seq  = ctx.rx_next_seq;
+    bp.flags    = FLAG_RST;
+    pkt_gen(bp, PRIO_CONTROL, false);
+
+    tcp_fid dead = ctx.key;
+    del_ctx(dead);
+    notify(ctx, CLOSED);
+}
+
+/**************************** the dispatch ****************************/
+
+/*
+ * THE tcp_ack AND tcp_data CHAINS INTERLEAVE, and the braid is written out
+ * rather than implied. proc_window and proc_rtt are tcp_ack processors that run
+ * AFTER tcp_data's sequence validation, and are skipped by its early exits.
+ * Declaring them as two independent chains would be a different program.
+ */
+dispatch tcp_dispatch {
+    app_bind    -> { proc_bind };
+    app_listen  -> { proc_listen };
+    app_accept  -> { proc_accept, proc_passive_open, gen_synack };
+    app_connect -> { proc_connect, gen_syn };
+    app_close   -> { proc_close };
+
+    tcp_syn     -> { proc_passive_open, gen_synack };
+    tcp_synack  -> { proc_synack };
+    tcp_rst     -> { proc_rst };
+    tcp_fin     -> { proc_fin };
+}
