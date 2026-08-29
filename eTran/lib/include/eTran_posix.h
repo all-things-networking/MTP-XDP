@@ -82,23 +82,14 @@ static inline size_t txb_bytes_avail(struct eTrantcp_connection *conn)
  */
 static inline int eTran_tcp_tx_submit_zc(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, const void *buf, size_t len)
 {
-    if (unlikely(conn->status != CONN_OPEN))
-    {
-        fprintf(stderr, "eTran_tcp_tx_submit_zc(): conn->status != CONN_OPEN\n");
-        return -EINVAL;
-    }
+    /* ported: mtp/tcp_program_app.h, app_send -> { record_data, gen_seg } */
+    int ret = tcp_prog_app::record_data(conn, len);
+    if (ret)
+        return ret;
 
-    if (unlikely(conn->txb_allocated < len))
-    {
-        fprintf(stderr, "eTran_tcp_tx_submit_zc(): (%p), txb_allocated(%u) < len(%lu)\n", conn, conn->txb_allocated, len);
-        return -EINVAL;
-    }
+    tcp_flow_tx_segmentation_zc(tctx, conn, buf, len);   /* gen_seg: the target's */
 
-    tcp_flow_tx_segmentation_zc(tctx, conn, buf, len);
-
-    conn->txb_allocated -= len;
-    conn->txb_sent += len;
-
+    tcp_prog_app::record_data_sent(conn, len);
     return 0;
 }
 

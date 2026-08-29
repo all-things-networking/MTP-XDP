@@ -13,7 +13,8 @@
  * that the split is real rather than an arrangement that happens to suit one
  * of them.
  *
- * Ported so far:  app_recv's proc_drain and the enqueue half of send_wnd_update.
+ * Ported so far:  app_recv's proc_drain and the enqueue half of send_wnd_update,
+ *                 app_send's record_data.
  */
 
 #include <algorithm>
@@ -96,6 +97,44 @@ static inline int proc_drain(struct app_ctx_per_thread *tctx, tcp_ctx_app *ctx, 
 
     ctx->force_rx_bump = false;
     return 0;
+}
+
+/* ------------------------------------------------------------------ *
+ * app_send -> { record_data, gen_seg }
+ * ------------------------------------------------------------------ */
+
+/*
+ * void record_data(app_send ev, tcp_ctx ctx)
+ *
+ * The send-side ring bookkeeping: bytes the application reserved become bytes in
+ * flight. gen_seg -- cutting them into MSS-sized AF_XDP frames -- is the target's
+ * job and stays in tcp_flow_tx_segmentation_zc, for the same reason
+ * send_wnd_update's frame does: the program says what happens, and how a frame
+ * reaches the wire is the target's business.
+ *
+ * NOTE the guard order. eTran validates BEFORE segmenting and updates the ring
+ * AFTER, so a failed guard leaves the ring untouched -- but a segmentation that
+ * partially completes does not, because it cannot report that. Preserved.
+ */
+static inline int record_data(tcp_ctx_app *ctx, size_t len)
+{
+    if (unlikely(ctx->status != CONN_OPEN)) {
+        fprintf(stderr, "record_data: conn->status != CONN_OPEN\n");
+        return -EINVAL;
+    }
+    if (unlikely(ctx->txb_allocated < len)) {
+        fprintf(stderr, "record_data: (%p), txb_allocated(%u) < len(%lu)\n",
+                ctx, ctx->txb_allocated, len);
+        return -EINVAL;
+    }
+    return 0;
+}
+
+/* The half that runs after gen_seg: what was allocated is now sent. */
+static inline void record_data_sent(tcp_ctx_app *ctx, size_t len)
+{
+    ctx->txb_allocated -= len;
+    ctx->txb_sent      += len;
 }
 
 } // namespace tcp_prog_app
