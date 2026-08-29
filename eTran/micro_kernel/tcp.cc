@@ -11,6 +11,9 @@
 #include "trans_ebpf.h"
 #include "nic.h"
 
+/* The ported events, in generated shape. See docs/PORT-PLAN.md. */
+#include "mtp/tcp_program.h"
+
 // mirco_kernel.cc
 extern class eTranNIC *etran_nic;
 
@@ -108,7 +111,9 @@ static inline void unreg_tcp_conn_slowpath(struct tcp_connection *c)
     }
 }
 static void _tcp_connection_close(struct tcp_connection *c, enum connection_status status, bool send_rst);
-static void tcp_connection_close(struct kref *ref);
+/* not static: mtp/tcp_program.h installs this as the per-context release
+ * hook, the way the donor's tcp_bind did inline. */
+void tcp_connection_close(struct kref *ref);
 
 static int tcp_synack_pkt(struct tcp_connection *c, struct pkt_tcp *p, struct tcp_opts *opts);
 
@@ -1329,69 +1334,11 @@ int tcp_open(struct app_ctx_per_thread *tctx, struct appout_tcp_open_t *tcp_open
     return 0;
 }
 
-int tcp_bind(struct app_ctx_per_thread *tctx, struct appout_tcp_bind_t *tcp_bind_msg_in)
-{
-    struct tcp_connection *c;
-
-    opaque_ptr opaque_connection = tcp_bind_msg_in->opaque_connection;
-    uint32_t _local_ip = tcp_bind_msg_in->local_ip;
-    uint16_t local_port = tcp_bind_msg_in->local_port;
-    bool reuseport = tcp_bind_msg_in->reuseport;
-
-    // FIXME
-    (void)_local_ip;
-
-    c = find_tcp_conn_slowpath(opaque_connection);
-    if (c)
-        return -EADDRINUSE;
-
-    c = new tcp_connection();
-    if (!c)
-        return -ENOMEM;
-    c->release = tcp_connection_close;
-
-    if (alloc_port(local_port))
-    {
-        if (reuseport)
-        {
-            if (tctx->actx->ports.find(local_port) != tctx->actx->ports.end())
-            {
-                // ok, this port belongs to this application
-            }
-            else
-            {
-                // this port is in use by other applications
-                delete c;
-                return -EADDRINUSE;
-            }
-        }
-        else
-        {
-            delete c;
-            return -EADDRINUSE;
-        }
-    }
-
-    c->type = TCP_CONN_TYPE_FAKE;
-    c->reuseport = reuseport;
-    c->fd = tcp_bind_msg_in->fd;
-    /* update owner thread */
-    c->tctx = tctx;
-    c->local_port = local_port;
-    c->remote_port = (uint16_t)opaque_connection;
-    c->local_ip = (uint16_t)(opaque_connection >> 32);
-    c->remote_ip = (uint16_t)(opaque_connection >> 16);
-    c->opaque_connection = opaque_connection;
-    c->flags = 0;
-
-    record_port(c->tctx->actx, c->local_port, 0);
-
-    reg_tcp_conn_slowpath(c);
-
-    notify_app_tcp_status_bind(tctx, c->opaque_connection, c->fd, 0);
-
-    return 0;
-}
+/*
+ * tcp_bind() is GONE. app_bind is the first event ported to MTP shape: its
+ * event, parser, processor and dispatch entry are generated code in
+ * mtp/tcp_program.h, and the case below calls that dispatch.
+ */
 
 int tcp_packet(struct app_ctx *actx, struct pkt_tcp *p, uint32_t qid)
 {
@@ -1529,9 +1476,10 @@ void process_tcp_cmd(struct app_ctx_per_thread *tctx, lrpc_msg *msg_in)
             notify_app_tcp_conn_open(tctx, tcp_open_msg_in->opaque_connection, tcp_open_msg_in->fd, -1, nullptr);
         break;
     case APPOUT_TCP_BIND:
+        /* ported: mtp/tcp_program.h. The error notify moved INTO the generated
+         * dispatch, which is where MTP's `notify(ctx, ERROR)` belongs. */
         tcp_bind_msg_in = (struct appout_tcp_bind_t *)msg_in->data;
-        if (tcp_bind(tctx, tcp_bind_msg_in))
-            notify_app_tcp_status_bind(tctx, tcp_bind_msg_in->opaque_connection, tcp_bind_msg_in->fd, -1);
+        tcp_prog::dispatch_app_bind(tctx, tcp_bind_msg_in);
         break;
     case APPOUT_TCP_LISTEN:
         tcp_listen_msg_in = (struct appout_tcp_listen_t *)msg_in->data;
