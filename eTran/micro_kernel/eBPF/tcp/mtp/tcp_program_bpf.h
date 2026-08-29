@@ -505,37 +505,26 @@ struct tcp_tx_scratch {
  * the landing point for three events distinguished by a metadata flag, and that
  * two of them carry no packet at all. Marked in place, as with the RX path.
  */
-static __always_inline int dispatch_tcp_tx(struct iphdr *iph, struct tcphdr *tcph,
-                                           struct bpf_tcp_conn *c,
-                                           struct meta_info *data_meta, void *data_end)
+/*
+ * The three events this site serves, as three processors.
+ *
+ * A processor returns an XDP verdict, or MTP_TX_NEXT to say "not my event, try
+ * the next one". That is the dispatch's selector: eTran distinguishes the three
+ * by a metadata flag, and the flag tests stay inside the processors they select.
+ *
+ * THE LOCK IS NOT THE TARGET'S HERE, and that is deliberate. eTran acquires the
+ * connection lock in the dispatch and each processor releases it -- but gen_seg
+ * releases it PARTWAY THROUGH, before the timing-wheel insert, because that work
+ * does not need the connection. MTP leaves state consistency to the target
+ * (paper 4.1), and a target that owned locking uniformly would hold this lock
+ * across the timing wheel and lengthen it on the hot send path. So the unlocks
+ * stay exactly where the donor put them.
+ */
+#define MTP_TX_NEXT (-1)
+
+static __always_inline int gen_retransmit(struct bpf_tcp_conn *c, struct bpf_cc *cc,
+                                          struct meta_info *data_meta, struct tcp_tx_scratch *s)
 {
-    /* scratchpad_t tcp_tx_scratch -- app_send's processors share these. */
-    struct tcp_tx_scratch s = {0};
-    s.rx_bump    = data_meta->tx.rx_bump;
-    s.payload_len = data_meta->tx.plen;
-    s.tx_pending = data_meta->tx.tx_pending;
-    s.tx_pos     = data_meta->tx.tx_pos;
-    s.ref_ts     = 0;
-    s.wnd_upd    = false;
-
-    __u32 cpu = bpf_get_smp_processor_id();
-    if (unlikely(cpu >= MAX_CPU))
-        return XDP_DROP;
-    // optimization for timestamp
-    if (!has_kick[cpu])
-        s.ref_ts = bpf_ktime_get_ns();
-    else
-        s.ref_ts = tx_cached_ts[cpu];
-
-
-    struct bpf_cc *cc = bpf_map_lookup_elem(&bpf_cc_map, &c->cc_idx);
-    if (unlikely(!cc)) {
-        xdp_log_panic("cc is NULL, BUG!!!");
-        return XDP_DROP;
-    }
-
-    TCP_LOCK(c);
-
     /* --- gen_retransmit (EVENT-TIMER-RTO 1.3): the RTO's dummy packet ----- */
     /* Timeout packet from slowpath, process it first */
     if (unlikely(data_meta->tx.flag & FLAG_TO)) {
@@ -559,14 +548,22 @@ static __always_inline int dispatch_tcp_tx(struct iphdr *iph, struct tcphdr *tcp
         return XDP_PASS; // redirect to userspace
     }
 
+    return MTP_TX_NEXT;
+}
+
+static __always_inline int send_wnd_update(struct iphdr *iph, struct tcphdr *tcph,
+                                           struct bpf_tcp_conn *c, void *data_end,
+                                           struct meta_info *data_meta,
+                                           struct tcp_tx_scratch *s)
+{
     /* --- send_wnd_update (EVENT-APP-RECV 1.3) ----------------------------- */
     /* update receving buffer space */
-    if (s.rx_bump) {
+    if (s->rx_bump) {
         // if ((c->rx_avail >> TCP_WND_SCALE) == 0 && c->tx_avail == 0)
         if (c->tx_pending == 0)
-            s.wnd_upd = true;
-        c->rx_avail += s.rx_bump;
-        xdp_egress_log("Rxwnd is updated from %u to %u", min((c->rx_avail - s.rx_bump) >> TCP_WND_SCALE, 0xFFFF), c->rx_avail);
+            s->wnd_upd = true;
+        c->rx_avail += s->rx_bump;
+        xdp_egress_log("Rxwnd is updated from %u to %u", min((c->rx_avail - s->rx_bump) >> TCP_WND_SCALE, 0xFFFF), c->rx_avail);
     }
 
     /* --- the FLAG_SYNC dummy packet: a frame with no payload sent purely to
@@ -575,10 +572,10 @@ static __always_inline int dispatch_tcp_tx(struct iphdr *iph, struct tcphdr *tcp
     /* Pure sync packet from userspace, drop or send a extra window update */
     if (unlikely(data_meta->tx.flag & FLAG_SYNC)) {
         xdp_egress_log("pure ctrl signal");
-        if (s.wnd_upd) {
+        if (s->wnd_upd) {
             /* receive buffer freed up from empty, need to send out a window update, if
              * we're not sending anyways. */
-            fill_tcp_hdr(iph, tcph, c, s.ref_ts, data_end, TCP_FLAG_ACK);
+            fill_tcp_hdr(iph, tcph, c, s->ref_ts, data_end, TCP_FLAG_ACK);
             fill_ip_hdr(iph, 0, false);
             TCP_UNLOCK(c);
             xdp_egress_log("Rxwnd is updated from empty to %u, send extra ack", min(c->rx_avail >> TCP_WND_SCALE, 0xFFFF));
@@ -587,41 +584,49 @@ static __always_inline int dispatch_tcp_tx(struct iphdr *iph, struct tcphdr *tcp
         TCP_UNLOCK(c);
         return XDP_DROP;
     }
+    return MTP_TX_NEXT;
+}
+
+static __always_inline int gen_seg(struct iphdr *iph, struct tcphdr *tcph,
+                                   struct bpf_tcp_conn *c, struct bpf_cc *cc,
+                                   void *data_end, struct meta_info *data_meta,
+                                   struct tcp_tx_scratch *s, __u32 cpu)
+{
 
     // this is probably caused by fast retransmission as we reset the c->tx_next_pos
     // but there are pending packets in the queue, simply drop them
-    if (unlikely(s.tx_pos != c->tx_next_pos)) {
+    if (unlikely(s->tx_pos != c->tx_next_pos)) {
         TCP_UNLOCK(c);
-        xdp_egress_log("tx_pos(%u) != c->tx_next_pos(%u)", s.tx_pos, c->tx_next_pos);
-        // bpf_printk("tx_pos(%u) != c->tx_next_pos(%u)", s.tx_pos, c->tx_next_pos);
+        xdp_egress_log("tx_pos(%u) != c->tx_next_pos(%u)", s->tx_pos, c->tx_next_pos);
+        // bpf_printk("tx_pos(%u) != c->tx_next_pos(%u)", s->tx_pos, c->tx_next_pos);
         return XDP_DROP;
     }
 
-    if (s.tx_pending)
-        c->tx_pending += s.tx_pending;
+    if (s->tx_pending)
+        c->tx_pending += s->tx_pending;
 
     __u32 avail = tcp_txavail(c);
 
-    if (unlikely(avail < s.payload_len)) {
+    if (unlikely(avail < s->payload_len)) {
         // FIXME
         // bpf_printk("c->rx_remote_avail(%u), c->tx_sent(%u), c->tx_avail(%u), payload_len(%u)", 
-        //     c->rx_remote_avail, c->tx_sent, c->tx_avail, s.payload_len);
-        // bpf_printk("avail(%u) < payload_len(%u)", avail, s.payload_len);
+        //     c->rx_remote_avail, c->tx_sent, c->tx_avail, s->payload_len);
+        // bpf_printk("avail(%u) < payload_len(%u)", avail, s->payload_len);
     }
 
-    __u64 desired_tx_ts = cc_get_desired_tx_ts(cc, s.ref_ts, s.payload_len);
+    __u64 desired_tx_ts = cc_get_desired_tx_ts(cc, s->ref_ts, s->payload_len);
 
     fill_tcp_hdr(iph, tcph, c, desired_tx_ts, data_end, 0);
 
-    fill_ip_hdr(iph, s.payload_len, c->ecn_enable);
+    fill_ip_hdr(iph, s->payload_len, c->ecn_enable);
 
-    c->tx_next_seq += s.payload_len;
-    c->tx_next_pos += s.payload_len;
+    c->tx_next_seq += s->payload_len;
+    c->tx_next_pos += s->payload_len;
     if (c->tx_next_pos >= c->tx_buf_size)
         c->tx_next_pos -= c->tx_buf_size;
-    c->tx_sent += s.payload_len;
+    c->tx_sent += s->payload_len;
     cc->txp = c->tx_sent > 0;
-    c->tx_pending -= s.payload_len;
+    c->tx_pending -= s->payload_len;
 
     // /*** NO CC ***/
     // TCP_UNLOCK(c);
@@ -636,7 +641,7 @@ static __always_inline int dispatch_tcp_tx(struct iphdr *iph, struct tcphdr *tcp
     #endif
 
     #ifdef BYPASS_RL
-    if ((!nr_pkts_in_tw[cpu] || c->tx_sent == s.payload_len) && desired_tx_ts <= s.ref_ts) {
+    if ((!nr_pkts_in_tw[cpu] || c->tx_sent == s->payload_len) && desired_tx_ts <= s->ref_ts) {
         goto bypass_rl;
     }
     #endif
@@ -669,6 +674,52 @@ bypass_rl:
 #endif
 }
 
-/**
- * @brief Check if the received ACK is valid
- */
+static __always_inline int dispatch_tcp_tx(struct iphdr *iph, struct tcphdr *tcph,
+                                           struct bpf_tcp_conn *c,
+                                           struct meta_info *data_meta, void *data_end)
+{
+    /* scratchpad_t tcp_tx_scratch -- app_send's processors share these. */
+    struct tcp_tx_scratch s = {0};
+    s.rx_bump    = data_meta->tx.rx_bump;
+    s.payload_len = data_meta->tx.plen;
+    s.tx_pending = data_meta->tx.tx_pending;
+    s.tx_pos     = data_meta->tx.tx_pos;
+    s.ref_ts     = 0;
+    s.wnd_upd    = false;
+
+    __u32 cpu = bpf_get_smp_processor_id();
+    if (unlikely(cpu >= MAX_CPU))
+        return XDP_DROP;
+    // optimization for timestamp
+    if (!has_kick[cpu])
+        s.ref_ts = bpf_ktime_get_ns();
+    else
+        s.ref_ts = tx_cached_ts[cpu];
+
+
+    struct bpf_cc *cc = bpf_map_lookup_elem(&bpf_cc_map, &c->cc_idx);
+    if (unlikely(!cc)) {
+        xdp_log_panic("cc is NULL, BUG!!!");
+        return XDP_DROP;
+    }
+
+    TCP_LOCK(c);
+
+
+    /*
+     * The selector. Each processor tests the flag that selects it and returns
+     * MTP_TX_NEXT if it is not the one. gen_seg is last and always answers.
+     *
+     * Every one of them releases the lock this dispatch took -- see the note on
+     * the processors above; gen_seg drops it partway through on purpose.
+     */
+    int v = gen_retransmit(c, cc, data_meta, &s);          /* FLAG_TO   */
+    if (v != MTP_TX_NEXT)
+        return v;
+
+    v = send_wnd_update(iph, tcph, c, data_end, data_meta, &s);   /* FLAG_SYNC */
+    if (v != MTP_TX_NEXT)
+        return v;
+
+    return gen_seg(iph, tcph, c, cc, data_end, data_meta, &s, cpu);
+}
