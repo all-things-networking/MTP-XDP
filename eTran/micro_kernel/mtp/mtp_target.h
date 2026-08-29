@@ -122,6 +122,24 @@ public:
     }
 
     /*
+     * Visit every live context, under the lock.
+     *
+     * MTP declares timers inside a context and starts them with timer_start
+     * (§5.3). This target has no timer: the control loop sweeps every context
+     * once per pass and compares elapsed cycles, so a "timer expiry" is a
+     * predicate evaluated during a sweep. That is a target realisation of the
+     * construct, not a protocol decision -- a target with real timers would
+     * implement the same program without this.
+     */
+    template <class Fn>
+    void sweep(Fn fn)
+    {
+        std::lock_guard<std::mutex> g(_lock);
+        for (auto &kv : _m)
+            fn(kv.second);
+    }
+
+    /*
      * Create a context that is NOT yet addressable by an id.
      *
      * MTP's new_ctx takes the id, because in MTP a context and its identity

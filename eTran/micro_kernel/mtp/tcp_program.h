@@ -16,7 +16,7 @@
  * Ported so far:  app_bind, app_listen, app_connect, app_accept, tcp_syn
  *                 (and with it the network demux), tcp_synack,
  *                 tcp_rst, gen_syn / gen_synack (the deferred generation),
- *                 app_close.
+ *                 app_close, and the three timer events.
  * Everything else is still eTran's original code in tcp.cc, on purpose -- one
  * event at a time, each built and measured before the next.
  */
@@ -45,6 +45,13 @@ void notify_app_tcp_conn_open(struct app_ctx_per_thread *tctx, opaque_ptr c, int
 int alloc_port(void);
 extern class eTranTCP *etran_tcp;
 extern std::list<struct tcp_connection *> tcp_handshake_list;
+extern uint64_t next_tcp_cc_to_tsc;
+void snapshot_cc(struct bpf_cc_snapshot *stats, uint32_t cc_idx);
+void set_cc_rate(uint32_t cc_idx, uint32_t rate);
+void timely_cc(struct tcp_connection *c, struct bpf_cc_snapshot *stats, uint64_t curr_tsc);
+void dctcp_wnd_cc(struct tcp_connection *c, struct bpf_cc_snapshot *stats, uint64_t curr_tsc);
+void dctcp_rate_cc(struct tcp_connection *c, struct bpf_cc_snapshot *stats, uint64_t curr_tsc);
+void handle_retransmission(struct tcp_connection *c, struct bpf_cc_snapshot *stats, uint64_t curr_tsc);
 /* Declared to match the DEFINITION at tcp.cc:554, which takes 12 arguments.
  * Note tcp.cc:67 forward-declares an 11-argument overload of the same name, with
  * no `newfd`, that is never defined -- a pre-existing inconsistency in the donor.
@@ -934,6 +941,130 @@ static inline int drain_deferred_gen(void)
 {
     return gen_queue().drain(run_deferred_gen);
 }
+
+/* ------------------------------------------------------------------ *
+ * The three timer events:
+ *   handshake_timeout  -> { proc_syn_retry }
+ *   cc_interval_timeout -> { proc_congestion, set_tx_rate }
+ *   rto_timeout        -> { proc_rto, gen_retransmit }
+ *
+ * MTP declares timers inside a context and starts them with timer_start (§5.3).
+ * THIS TARGET HAS NO TIMER. The control loop sweeps every context once per pass
+ * and compares elapsed cycles, so an "expiry" is a predicate evaluated during a
+ * sweep -- which is why all three events are raised from one function and why
+ * their granularity is the sweep interval rather than the timeout. That is a
+ * target realisation of the construct, not a protocol decision: a target with
+ * real timers would run the same program without this shape.
+ *
+ * gen_retransmit does not emit anything here. handle_retransmission sends a
+ * DUMMY PACKET carrying FLAG_TO, which makes XDP_EGRESS run and does the actual
+ * retransmission there -- see dispatch_tcp_tx in the eBPF program.
+ * ------------------------------------------------------------------ */
+static inline void dispatch_timers(void)
+{
+    struct bpf_cc_snapshot stats;
+    uint32_t last;
+    uint64_t curr_tsc = get_cycles();
+
+    std::list<struct tcp_connection *> to_put;
+
+    next_tcp_cc_to_tsc = UINT64_MAX;
+
+    /* The sweep IS the timer. See mtp::ctx_store::sweep. */
+    ctxs().sweep([&](struct tcp_connection *c) {
+        
+        /* skip tcp_connection created for listener */
+        if (unlikely(c->type == TCP_CONN_TYPE_FAKE)) {
+            return;
+        }
+
+        /* --- proc_syn_retry (EVENT-TIMER-HANDSHAKE 1.3) -------------------- */
+        /* handshake timeout */
+        if (unlikely(c->status != CONN_OPEN))
+        {
+            if (c->next_timeout_tsc && c->next_timeout_tsc <= get_cycles()) {
+                if (c->status == CONN_WAIT_RX_SYNACK && c->syn_attempts <= 3)
+                {
+                    c->status = CONN_WAIT_TX_SYN;
+                    c->syn_attempts++;
+                    /* add to tcp_handshake_list again */
+                    tcp_handshake_list.push_back(c);
+                }
+                else
+                {
+                    if (c->syn_attempts > 3)
+                    {
+                        printf("Handshake timeout for connection (%p), %d\n", c, c->syn_attempts);
+                        to_put.push_back(c);
+                    }
+                }
+            }
+            return;
+        }
+
+        next_tcp_cc_to_tsc = std::min(next_tcp_cc_to_tsc, c->cc_last_tsc + us_to_cycles(c->cc_last_rtt * CC_INTERVAL_RTT));
+
+        __u32 t_us = cycles_to_us((curr_tsc - c->cc_last_tsc));
+        if (t_us < c->cc_last_rtt * CC_INTERVAL_RTT)
+        {
+            /* we handle CC event every CC_INTERVAL_RTT RTTs */
+            return;
+        }
+
+        /* --- proc_congestion + set_tx_rate (EVENT-TIMER-CC 1.3) ------------ */
+        /* snapshot cc */
+        snapshot_cc(&stats, c->cc_idx);
+
+        /* calculate difference to last time */
+        last = c->cc_last_drops;
+        c->cc_last_drops = stats.c_drops;
+        stats.c_drops -= last;
+
+        last = c->cc_last_acks;
+        c->cc_last_acks = stats.c_acks;
+        stats.c_acks -= last;
+
+        last = c->cc_last_ackb;
+        c->cc_last_ackb = stats.c_ackb;
+        stats.c_ackb -= last;
+
+        last = c->cc_last_ecnb;
+        c->cc_last_ecnb = stats.c_ecnb;
+        stats.c_ecnb -= last;
+
+        /* run congestion control algorithm */
+        if (c->algorithm == CC_TIMELY)
+        {
+            timely_cc(c, &stats, curr_tsc);
+            set_cc_rate(c->cc_idx, c->cc_rate);
+        }
+        else if (c->algorithm == CC_DCTCP_WND)
+        {
+            dctcp_wnd_cc(c, &stats, curr_tsc);
+            set_cc_rate(c->cc_idx, c->cc_rate);
+        }
+        else if (c->algorithm == CC_DCTCP_RATE)
+        {
+            dctcp_rate_cc(c, &stats, curr_tsc);
+            set_cc_rate(c->cc_idx, c->cc_rate);
+        }
+
+        /* --- proc_rto + gen_retransmit (EVENT-TIMER-RTO 1.3) --------------- */
+        handle_retransmission(c, &stats, curr_tsc);
+
+        c->cc_last_tsc = curr_tsc;
+    });
+
+    /* release references for handshake failed connections */
+    while (!to_put.empty())
+    {
+        struct tcp_connection *c = to_put.front();
+        to_put.pop_front();
+        kref_put(&c->ref, c->release);   /* del_ctx */
+    }
+
+}
+
 
 /*
  * The network dispatch.

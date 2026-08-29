@@ -762,7 +762,7 @@ void tcp_connection_pkt(struct tcp_connection *c, struct pkt_tcp *p, uint32_t qi
  * event 5 (tcp_syn).
  */
 
-static inline void snapshot_cc(struct bpf_cc_snapshot *stats, uint32_t cc_idx)
+void snapshot_cc(struct bpf_cc_snapshot *stats, uint32_t cc_idx)
 {
     stats->c_drops = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_tx_drops;
     stats->c_acks = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_rx_acks;
@@ -776,7 +776,7 @@ static inline void snapshot_cc(struct bpf_cc_snapshot *stats, uint32_t cc_idx)
 }
 
 // convert kbps to Bps
-static inline void set_cc_rate(uint32_t cc_idx, uint32_t new_rate)
+void set_cc_rate(uint32_t cc_idx, uint32_t new_rate)
 {
     uint32_t v = new_rate * 1e3 / 8;
     if (v > 3125000000)
@@ -821,7 +821,8 @@ static inline int issue_retransmit(struct tcp_connection *c)
     return 0;
 }
 
-static inline void handle_retransmission(struct tcp_connection *c, struct bpf_cc_snapshot *stats, uint64_t curr_tsc)
+/* not static: the generated timer dispatch calls it (proc_rto + gen_retransmit). */
+void handle_retransmission(struct tcp_connection *c, struct bpf_cc_snapshot *stats, uint64_t curr_tsc)
 {
     uint32_t cur_ts = cycles_to_us(curr_tsc);
     uint32_t rtt = (stats->rtt ? stats->rtt : TCP_RTT_INIT);
@@ -855,121 +856,15 @@ static inline void handle_retransmission(struct tcp_connection *c, struct bpf_cc
 /**
  * @brief Poll congestion control and timeout events for TCP
  */
+/*
+ * The timer sweep is now generated: mtp/tcp_program.h's dispatch_timers, over
+ * the target's ctx_store::sweep. This remains as the control loop's entry point.
+ */
 void poll_tcp_cc_to(void)
 {
-    struct tcp_connection *c;
-    struct bpf_cc_snapshot stats;
-    uint32_t last;
-    uint64_t curr_tsc = get_cycles();
-
-    std::list<struct tcp_connection *> to_put;
-
-    next_tcp_cc_to_tsc = UINT64_MAX;
-    
-    tcp_connections_lock.lock();
-    for (auto it = tcp_connections.begin(); it != tcp_connections.end();)
-    {
-        c = it->second;
-        
-        /* skip tcp_connection created for listener */
-        if (unlikely(c->type == TCP_CONN_TYPE_FAKE)) {
-            it++;
-            continue;
-        }
-
-        /* handshake timeout */
-        if (unlikely(c->status != CONN_OPEN))
-        {
-            if (c->next_timeout_tsc && c->next_timeout_tsc <= get_cycles()) {
-                if (c->status == CONN_WAIT_RX_SYNACK && c->syn_attempts <= 3)
-                {
-                    c->status = CONN_WAIT_TX_SYN;
-                    c->syn_attempts++;
-                    /* add to tcp_handshake_list again */
-                    tcp_handshake_list.push_back(c);
-                }
-                else
-                {
-                    if (c->syn_attempts > 3)
-                    {
-                        printf("Handshake timeout for connection (%p), %d\n", c, c->syn_attempts);
-                        to_put.push_back(c);
-                    }
-                }
-            }
-            it++;
-            continue;
-        }
-
-        next_tcp_cc_to_tsc = std::min(next_tcp_cc_to_tsc, c->cc_last_tsc + us_to_cycles(c->cc_last_rtt * CC_INTERVAL_RTT));
-
-        __u32 t_us = cycles_to_us((curr_tsc - c->cc_last_tsc));
-        if (t_us < c->cc_last_rtt * CC_INTERVAL_RTT)
-        {
-            /* we handle CC event every CC_INTERVAL_RTT RTTs */
-            it++;
-            continue;
-        }
-        
-        /* snapshot cc */
-        snapshot_cc(&stats, c->cc_idx);
-
-        /* calculate difference to last time */
-        last = c->cc_last_drops;
-        c->cc_last_drops = stats.c_drops;
-        stats.c_drops -= last;
-
-        last = c->cc_last_acks;
-        c->cc_last_acks = stats.c_acks;
-        stats.c_acks -= last;
-
-        last = c->cc_last_ackb;
-        c->cc_last_ackb = stats.c_ackb;
-        stats.c_ackb -= last;
-
-        last = c->cc_last_ecnb;
-        c->cc_last_ecnb = stats.c_ecnb;
-        stats.c_ecnb -= last;
-
-        /* run congestion control algorithm */
-        if (c->algorithm == CC_TIMELY)
-        {
-            timely_cc(c, &stats, curr_tsc);
-            set_cc_rate(c->cc_idx, c->cc_rate);
-        }
-        else if (c->algorithm == CC_DCTCP_WND)
-        {
-            dctcp_wnd_cc(c, &stats, curr_tsc);
-            set_cc_rate(c->cc_idx, c->cc_rate);
-        }
-        else if (c->algorithm == CC_DCTCP_RATE)
-        {
-            dctcp_rate_cc(c, &stats, curr_tsc);
-            set_cc_rate(c->cc_idx, c->cc_rate);
-        }
-
-        handle_retransmission(c, &stats, curr_tsc);
-
-        c->cc_last_tsc = curr_tsc;
-        it++;
-    }
-    tcp_connections_lock.unlock();
-
-    /* release references for handshake failed connections */
-    while (!to_put.empty())
-    {
-        struct tcp_connection *c = to_put.front();
-        to_put.pop_front();
-        tcp_conn_put(c);
-    }
-
+    tcp_prog::dispatch_timers();
 }
 
-/*
- * The generation processors are now generated: mtp/tcp_program.h's gen_syn and
- * gen_synack, drained through the target's work_queue. This remains as the entry
- * point the control loop already calls.
- */
 int poll_tcp_handshake_events(void)
 {
     return tcp_prog::drain_deferred_gen();
