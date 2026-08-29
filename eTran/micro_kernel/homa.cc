@@ -2,6 +2,10 @@
 
 #include <mutex>
 #include <unordered_map>
+
+/* The ported Homa event, in generated shape -- the protocol-independence test.
+ * See docs/BACKEND-DESIGN.md. */
+#include "mtp/homa_program.h"
 #include <set>
 
 #include <linux/if_ether.h>
@@ -623,7 +627,8 @@ int poll_homa_to(void)
     return 0;
 }
 
-static int reg_homa_socket_ebpf(struct app_ctx_per_thread *tctx, uint16_t port)
+/* not static: the generated Homa program calls it. */
+int reg_homa_socket_ebpf(struct app_ctx_per_thread *tctx, uint16_t port)
 {
     uint16_t key = port;
     struct target_xsk v;
@@ -714,54 +719,10 @@ static inline void unreg_homa_socket_slowpath(struct homa_socket *s)
     }
 }
 
-int homa_bind(struct app_ctx_per_thread *tctx, struct appout_homa_bind_t *homa_bind_msg_in)
-{
-    struct homa_socket *hs;
-    opaque_ptr opaque_socket = homa_bind_msg_in->opaque_socket;
-    int fd = homa_bind_msg_in->fd;
-    uint32_t _local_ip = homa_bind_msg_in->local_ip;
-    uint16_t local_port = homa_bind_msg_in->local_port;
-
-    // FIXME
-    (void)_local_ip;
-
-    hs = find_homa_socket_slowpath(opaque_socket);
-
-    if (hs)
-        return -EADDRINUSE;
-
-    hs = new homa_socket();
-    if (!hs)
-        return -ENOMEM;
-
-    if (alloc_port(local_port))
-    {
-        delete hs;
-        return -EADDRINUSE;
-    }
-
-    hs->tctx = tctx;
-    hs->opaque_socket = opaque_socket;
-    hs->fd = fd;
-    hs->local_ip = etran_nic->_local_ip;
-    hs->local_port = local_port;
-
-    record_port(tctx->actx, hs->local_port, 0);
-
-    if (reg_homa_socket_ebpf(tctx, hs->local_port))
-    {
-        unrecord_port(tctx->actx, hs->local_port);
-        free_port(hs->local_port);
-        delete hs;
-        return -1;
-    }
-
-    reg_homa_socket_slowpath(hs);
-
-    notify_app_homa_status_bind(tctx, hs->opaque_socket, hs->fd, 0);
-
-    return 0;
-}
+/*
+ * homa_bind() is GONE -- ported to MTP shape in mtp/homa_program.h, against the
+ * SAME target the TCP program uses.
+ */
 
 int homa_close(struct app_ctx_per_thread *tctx, opaque_ptr opaque_socket)
 {
@@ -795,10 +756,9 @@ void process_homa_cmd(struct app_ctx_per_thread *tctx, lrpc_msg *msg_in)
     {
     case APPOUT_HOMA_BIND:
         homa_bind_msg_in = (struct appout_homa_bind_t *)msg_in->data;
-        if (homa_bind(tctx, homa_bind_msg_in))
-        {
-            notify_app_homa_status_bind(tctx, homa_bind_msg_in->opaque_socket, homa_bind_msg_in->fd, -1);
-        }
+        /* ported: mtp/homa_program.h. The error notify moved into the generated
+         * dispatch, as it did for TCP. */
+        homa_prog::dispatch_app_bind(tctx, homa_bind_msg_in);
         break;
     case APPOUT_HOMA_CLOSE:
         homa_close_msg_in = (struct appout_homa_close_t *)msg_in->data;

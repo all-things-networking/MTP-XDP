@@ -24,7 +24,7 @@ struct homa_socket
     homa_socket() {}
 };
 
-int homa_bind(struct app_ctx_per_thread *tctx, struct appout_homa_bind_t *homa_bind_msg_in);
+/* homa_bind() is gone -- ported as homa_prog::dispatch_app_bind. */
 int homa_close(struct app_ctx_per_thread *tctx, opaque_ptr opaque_socket);
 
 void free_homa_resources(struct app_ctx *actx);
