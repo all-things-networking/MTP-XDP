@@ -1091,23 +1091,9 @@ int tcp_packet(struct app_ctx *actx, struct pkt_tcp *p, uint32_t qid)
     return tcp_prog::dispatch_net(actx, p, qid);
 }
 
-int tcp_close(struct app_ctx_per_thread *tctx, struct appout_tcp_close_t *tcp_close_msg_in)
-{
-    struct tcp_connection *c = nullptr;
-
-    opaque_ptr opaque_connection = tcp_close_msg_in->opaque_connection;
-    int fd = tcp_close_msg_in->fd;
-
-    c = find_tcp_conn_slowpath(opaque_connection);
-    if (!c)
-        return -1;
-
-    tcp_conn_put(c);
-
-    notify_app_tcp_status_close(tctx, opaque_connection, fd, 1);
-
-    return 0;
-}
+/*
+ * tcp_close() is GONE -- ported as app_close in mtp/tcp_program.h, event 9.
+ */
 
 void slow_path_send_tcp(struct app_ctx *actx, struct pkt_tcp *tcphdr, uint16_t len, bool to, uint32_t qid)
 {
@@ -1197,9 +1183,9 @@ void process_tcp_cmd(struct app_ctx_per_thread *tctx, lrpc_msg *msg_in)
         tcp_prog::dispatch_app_accept(tctx, tcp_accept_msg_in);
         break;
     case APPOUT_TCP_CLOSE:
+        /* ported: mtp/tcp_program.h */
         tcp_close_msg_in = (struct appout_tcp_close_t *)msg_in->data;
-        if (tcp_close(tctx, tcp_close_msg_in))
-            notify_app_tcp_status_close(tctx, tcp_close_msg_in->opaque_connection, tcp_close_msg_in->fd, -1);
+        tcp_prog::dispatch_app_close(tctx, tcp_close_msg_in);
         break;
     }
 }

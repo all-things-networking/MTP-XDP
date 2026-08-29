@@ -15,7 +15,8 @@
  *
  * Ported so far:  app_bind, app_listen, app_connect, app_accept, tcp_syn
  *                 (and with it the network demux), tcp_synack,
- *                 tcp_rst, gen_syn / gen_synack (the deferred generation).
+ *                 tcp_rst, gen_syn / gen_synack (the deferred generation),
+ *                 app_close.
  * Everything else is still eTran's original code in tcp.cc, on purpose -- one
  * event at a time, each built and measured before the next.
  */
@@ -231,6 +232,12 @@ struct app_bind : app_event {
     bool reuseport;
 };
 
+/* event app_close : app_event { }
+ *
+ * Carries nothing beyond the app-side handles. appout_tcp_close_t also has the
+ * four-tuple and eTran ignores every field of it. */
+struct app_close : app_event {};
+
 /*
  * event app_listen : app_event { uint32 pending_cap; }
  *
@@ -319,6 +326,17 @@ static inline void sock_connect(struct app_ctx_per_thread *tctx,
     ev.remote_port = op->remote_port;
     /* No set_flow_id: the local port is not known until the processor has
      * looked for a bound context or asked the allocator. */
+}
+
+static inline void sock_close(struct app_ctx_per_thread *tctx,
+                              const struct appout_tcp_close_t *op,
+                              app_close &ev)
+{
+    ev.tctx   = tctx;
+    ev.handle = op->opaque_connection;
+    ev.fd     = op->fd;
+    /* appout_tcp_close_t also carries the four-tuple, and eTran ignores every
+     * field of it: the context is found by handle like every other socket call. */
 }
 
 static inline void sock_accept(struct app_ctx_per_thread *tctx,
@@ -778,6 +796,34 @@ static inline void proc_rst(const tcp_rst &ev, struct tcp_connection *ctx)
     kref_put(&ctx->ref, ctx->release);
 }
 
+/*
+ * void proc_close(app_close ev, tcp_ctx ctx)
+ *
+ * mark_closed and gen_rst, the doc's two processors -- but neither is written
+ * here, because both are inside the release hook. del_ctx drops the reference
+ * and the hook does the whole teardown: unbind, delete the eBPF state, free the
+ * port, and EMIT A RST. eTran has no FIN and no teardown handshake; close()
+ * resets the connection.
+ *
+ * The notify carries status 1 here where the peer-reset path carries 0. Same
+ * message, two meanings, distinguished only by which processor sent it.
+ */
+static inline int proc_close(const app_close &ev)
+{
+    opaque_ptr h = ev.handle;
+    struct tcp_connection *ctx = ctxs().find_if(
+        [h](const struct tcp_connection *c) { return c->opaque_connection == h; });
+    if (!ctx)
+        return -1;
+
+    /* del_ctx -- mark_closed and gen_rst both happen in the release hook. */
+    kref_put(&ctx->ref, ctx->release);
+
+    /* notify(ctx, CLOSED) */
+    notify_app_tcp_status_close(ev.tctx, ev.handle, ev.fd, 1);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ *
  * dispatch tcp_dispatch { app_bind -> { proc_bind }; app_listen -> { proc_listen };
  *                         app_connect -> { proc_connect, gen_syn };
@@ -808,6 +854,16 @@ static inline void dispatch_app_listen(struct app_ctx_per_thread *tctx,
 
     if (proc_listen(ev) != 0)
         notify_app_tcp_status_listen(tctx, op->opaque_listener, op->fd, -1);
+}
+
+static inline void dispatch_app_close(struct app_ctx_per_thread *tctx,
+                                      const struct appout_tcp_close_t *op)
+{
+    app_close ev;
+    sock_close(tctx, op, ev);
+
+    if (proc_close(ev) != 0)
+        notify_app_tcp_status_close(tctx, op->opaque_connection, op->fd, -1);
 }
 
 static inline void dispatch_app_accept(struct app_ctx_per_thread *tctx,
