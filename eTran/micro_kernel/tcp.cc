@@ -127,7 +127,9 @@ static void unreg_tcp_conn_ebpf(struct tcp_connection *c);
 static struct tcp_connection *tcp_conn_lookup(struct pkt_tcp *p);
 
 static struct tcp_listener *tcp_listener_lookup(struct pkt_tcp *p);
-static void tcp_listener_accept(struct tcp_listener *l);
+/* not static: mtp/tcp_program.h's proc_accept calls it, as the donor's
+ * tcp_accept did. It is the shared suffix of tcp_syn and app_accept. */
+void tcp_listener_accept(struct tcp_listener *l);
 
 static void tcp_connection_pkt(struct tcp_connection *c, struct pkt_tcp *p, uint32_t qid, struct tcp_opts *opts);
 
@@ -716,7 +718,7 @@ static struct tcp_listener *tcp_listener_lookup(struct pkt_tcp *p)
     return listener_list[hash_idx];
 }
 
-static void tcp_listener_accept(struct tcp_listener *l)
+void tcp_listener_accept(struct tcp_listener *l)
 {
     struct tcp_connection *c;
     struct backlog_slot *slot;
@@ -1136,6 +1138,14 @@ int poll_tcp_handshake_events(void)
  * tcp_listen() is GONE -- ported to MTP shape in mtp/tcp_program.h, event 2.
  */
 
+/*
+ * tcp_accept() is GONE -- ported to MTP shape in mtp/tcp_program.h, event 4.
+ */
+
+/*
+ * tcp_listen() is GONE -- ported to MTP shape in mtp/tcp_program.h, event 2.
+ */
+
 int tcp_accept(struct app_ctx_per_thread *tctx, struct appout_tcp_accept_t *tcp_accept_msg_in)
 {
     struct tcp_connection *c;
@@ -1377,9 +1387,9 @@ void process_tcp_cmd(struct app_ctx_per_thread *tctx, lrpc_msg *msg_in)
         tcp_prog::dispatch_app_listen(tctx, tcp_listen_msg_in);
         break;
     case APPOUT_TCP_ACCEPT:
+        /* ported: mtp/tcp_program.h */
         tcp_accept_msg_in = (struct appout_tcp_accept_t *)msg_in->data;
-        if (tcp_accept(tctx, tcp_accept_msg_in))
-            notify_app_tcp_event_accept(tctx, tcp_accept_msg_in->opaque_connection, tcp_accept_msg_in->fd, tcp_accept_msg_in->newfd, -1, 0, 0, 0, 0, 0, 0, 0);
+        tcp_prog::dispatch_app_accept(tctx, tcp_accept_msg_in);
         break;
     case APPOUT_TCP_CLOSE:
         tcp_close_msg_in = (struct appout_tcp_close_t *)msg_in->data;

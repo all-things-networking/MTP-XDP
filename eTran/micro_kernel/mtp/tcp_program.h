@@ -13,7 +13,7 @@
  * generic run-time key/value map: the compiler knows the program, so TCP's key
  * is TCP's key at compile time.
  *
- * Ported so far:  app_bind, app_listen, app_connect.
+ * Ported so far:  app_bind, app_listen, app_connect, app_accept.
  * Everything else is still eTran's original code in tcp.cc, on purpose -- one
  * event at a time, each built and measured before the next.
  */
@@ -36,6 +36,14 @@ void notify_app_tcp_conn_open(struct app_ctx_per_thread *tctx, opaque_ptr c, int
 int alloc_port(void);
 extern class eTranTCP *etran_tcp;
 extern std::list<struct tcp_connection *> tcp_handshake_list;
+void notify_app_tcp_event_accept(struct app_ctx_per_thread *tctx, opaque_ptr c, int fd, int newfd,
+                                 int32_t status, uint32_t remote_ip, uint16_t remote_port,
+                                 uint32_t local_ip, uint16_t local_port, uint32_t qid,
+                                 uint64_t rx_base, uint64_t tx_base);
+/* The shared suffix of tcp_syn and app_accept: matches a queued SYN against a
+ * waiting accept. NOT ported yet -- it belongs with the handshake events -- so it
+ * is called here as the donor calls it, and lost its `static` to allow that. */
+void tcp_listener_accept(struct tcp_listener *l);
 int alloc_port(uint16_t port);
 int record_port(struct app_ctx *actx, uint16_t local_port, uint16_t remote_port);
 /* eTran's per-context release hook; no longer static in tcp.cc so that a
@@ -179,9 +187,24 @@ struct app_connect : app_event {
     uint16_t remote_port;
 };
 
+/*
+ * event app_accept : app_event { uint16 local_port; }
+ *
+ * Carries the listening endpoint's port and the app's handles. The listener is
+ * found by scanning the OWNING THREAD's listener list on (port, handle) --
+ * tcp.cc:1195-1202 -- not the tcp_listeners bag. A third access path into
+ * listening state, and the reason accept is per-thread: a listener registered by
+ * one app thread is not acceptable on another.
+ */
+struct app_accept : app_event {
+    opaque_ptr listener_handle;
+    uint16_t local_port;
+    int newfd;
+};
+
 /* ------------------------------------------------------------------ *
  * app_parser socket { bind -> sock_bind; listen -> sock_listen;
- *                     connect -> sock_connect; ... }
+ *                     connect -> sock_connect; accept -> sock_accept; ... }
  *
  * Turns one socket call into one event and sets its flow id. The id is set
  * HERE, by the parser, which is what lets the processor be written against a
@@ -224,6 +247,18 @@ static inline void sock_connect(struct app_ctx_per_thread *tctx,
     ev.remote_port = op->remote_port;
     /* No set_flow_id: the local port is not known until the processor has
      * looked for a bound context or asked the allocator. */
+}
+
+static inline void sock_accept(struct app_ctx_per_thread *tctx,
+                               const struct appout_tcp_accept_t *op,
+                               app_accept &ev)
+{
+    ev.tctx            = tctx;
+    ev.handle          = op->opaque_connection;
+    ev.fd              = op->fd;
+    ev.listener_handle = op->opaque_listener;
+    ev.local_port      = op->local_port;
+    ev.newfd           = op->newfd;
 }
 
 /* ------------------------------------------------------------------ *
@@ -414,9 +449,88 @@ static inline int proc_connect(const app_connect &ev)
     return 0;
 }
 
+/*
+ * void proc_accept(app_accept ev, tcp_listen_ctx lst, tcp_ctx ctx)
+ *
+ * Creates the connection that will receive the NEXT SYN. Its remote address is
+ * still zero, so it has no flow id yet and is deliberately NOT published --
+ * eTran's connection map "includes all TCP connections of all states except for
+ * CONN_WAIT_RX_SYN". It lives on the listening context until a SYN gives it an
+ * identity. That is `alloc` rather than `new_ctx`, and it is the clearest case
+ * in this program of a context existing before its id does.
+ */
+static inline int proc_accept(const app_accept &ev)
+{
+    /* The listener, from the owning thread's own list. */
+    struct tcp_listener *lst = nullptr;
+    for (auto it = ev.tctx->listeners.begin(); it != ev.tctx->listeners.end(); it++) {
+        if ((*it)->listen_port == ev.local_port &&
+            (*it)->opaque_listener == ev.listener_handle) {
+            lst = *it;
+            break;
+        }
+    }
+    if (!lst)
+        return -1;                      /* no such listener on this thread */
+    if (lst->pending_conn)
+        return -1;                      /* one waiting accept at a time -- see below */
+    if (ctxs().size() > MAX_NR_CONN)
+        return -1;
+
+    struct tcp_connection *ctx = ctxs().alloc([&](struct tcp_connection *c) {
+        c->type              = TCP_CONN_TYPE_NORMAL;
+        c->tctx              = ev.tctx;
+        c->listener          = lst;
+        c->opaque_connection = ev.handle;
+        c->fd                = ev.newfd;
+        /* No peer yet: three quarters of the id are zero until a SYN arrives. */
+        c->remote_ip         = 0;
+        c->remote_port       = 0;
+        c->local_ip          = etran_nic->_local_ip;
+        c->local_port        = lst->listen_port;
+        c->rx_buf_size       = etran_tcp->_trans_params.tcp.rx_buf_size;
+        c->tx_buf_size       = etran_tcp->_trans_params.tcp.tx_buf_size;
+        c->remote_seq        = 0;
+        c->local_seq         = 0;
+        c->status            = CONN_WAIT_RX_SYN;
+        c->syn_ts            = 0;
+        c->syn_attempts      = 0;
+        c->algorithm         = CC_NONE;
+        c->cc_idx            = 0;
+        c->cc_last_tsc       = 0;
+        c->cc_last_rtt       = TCP_RTT_INIT;
+        c->cc_last_drops     = 0;
+        c->cc_last_acks      = 0;
+        c->cc_last_ackb      = 0;
+        c->cc_last_ecnb      = 0;
+        c->cc_rate           = CC_TIMELY_INIT_RATE;
+        c->cc_rexmits        = 0;
+        c->cc_data           = {0};
+        c->cnt_tx_pending    = 0;
+        c->ts_tx_pending     = 0;
+        c->qid               = POISON_32;
+        c->flags             = 0;
+    });
+    if (!ctx)
+        return -1;
+
+    /* The listening context's `pending` slot holds EXACTLY ONE completed
+     * connection, whatever max_backlog_size says -- that cap governs the queue
+     * of held SYNs, not this. */
+    lst->pending_conn = ctx;
+
+    /* If a SYN is already queued, the shared suffix runs now. There is no
+     * notify here: the application is told once the SYN-ACK goes out. */
+    if (lst->backlog.size() > 0)
+        tcp_listener_accept(lst);
+
+    return 0;
+}
+
 /* ------------------------------------------------------------------ *
  * dispatch tcp_dispatch { app_bind -> { proc_bind }; app_listen -> { proc_listen };
- *                         app_connect -> { proc_connect, gen_syn }; ... }
+ *                         app_connect -> { proc_connect, gen_syn };
+ *                         app_accept -> { proc_accept }; ... }
  *
  * One generated entry point per event. The processor LIST is the loop body; for
  * app_bind the list is one long. The error notify is emitted once here, which
@@ -441,6 +555,17 @@ static inline void dispatch_app_listen(struct app_ctx_per_thread *tctx,
 
     if (proc_listen(ev) != 0)
         notify_app_tcp_status_listen(tctx, op->opaque_listener, op->fd, -1);
+}
+
+static inline void dispatch_app_accept(struct app_ctx_per_thread *tctx,
+                                       const struct appout_tcp_accept_t *op)
+{
+    app_accept ev;
+    sock_accept(tctx, op, ev);
+
+    if (proc_accept(ev) != 0)
+        notify_app_tcp_event_accept(tctx, op->opaque_connection, op->fd, op->newfd,
+                                    -1, 0, 0, 0, 0, 0, 0, 0);
 }
 
 static inline void dispatch_app_connect(struct app_ctx_per_thread *tctx,

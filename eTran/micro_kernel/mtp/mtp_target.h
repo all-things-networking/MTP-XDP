@@ -70,6 +70,14 @@ public:
 
     bool exists(const FlowId &id) { return get_ctx(id) != nullptr; }
 
+    /* Live instance count. A program may cap how many contexts it will hold;
+     * eTran's accept refuses past MAX_NR_CONN. */
+    std::size_t size()
+    {
+        std::lock_guard<std::mutex> g(_lock);
+        return _m.size();
+    }
+
     /*
      * Lookup by something that is NOT the flow id -- an application handle, a
      * file descriptor. MTP has no such instruction and does not need one: the
@@ -109,6 +117,29 @@ public:
         init(c);
         std::lock_guard<std::mutex> g(_lock);
         _m.insert(std::make_pair(KeyOf{}(c), c));
+        return c;
+    }
+
+    /*
+     * Create a context that is NOT yet addressable by an id.
+     *
+     * MTP's new_ctx takes the id, because in MTP a context and its identity
+     * arrive together. eTran has a case where they do not: accept() builds the
+     * connection that will receive the next SYN before that SYN exists, so its
+     * remote address -- three quarters of its id -- is still zero. The donor
+     * keeps it off the map entirely (tcp.cc's map "includes all TCP connections
+     * of all states except for CONN_WAIT_RX_SYN") and hangs it on the listening
+     * context until a SYN gives it an identity, at which point publish() adds
+     * it. Modelled as it is rather than given a placeholder id, because a
+     * placeholder would be reachable and eTran's is not.
+     */
+    template <class Init>
+    Ctx *alloc(Init init)
+    {
+        Ctx *c = new Ctx();
+        if (!c)
+            return nullptr;
+        init(c);
         return c;
     }
 
