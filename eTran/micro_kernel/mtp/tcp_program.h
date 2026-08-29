@@ -18,6 +18,12 @@
  * event at a time, each built and measured before the next.
  */
 #include <runtime/tcp.h>
+/* Complete types, not just the extern declarations below: proc_connect and
+ * proc_accept read etran_tcp->_trans_params and etran_nic->_local_ip. Included
+ * here rather than relying on tcp.cc's include order, so the header stands on
+ * its own. Both are guarded. */
+#include "trans_ebpf.h"
+#include "nic.h"
 #include "mtp/mtp_target.h"
 
 /* eTran's own control-path services, used by the processors below. These are
