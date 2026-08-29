@@ -16,7 +16,7 @@
  * Ported so far:  app_bind, app_listen, app_connect, app_accept, tcp_syn
  *                 (and with it the network demux), tcp_synack,
  *                 tcp_rst, gen_syn / gen_synack (the deferred generation),
- *                 app_close, and the three timer events.
+ *                 app_close, the three timer events, and proc_passive_open.
  * Everything else is still eTran's original code in tcp.cc, on purpose -- one
  * event at a time, each built and measured before the next.
  */
@@ -60,10 +60,7 @@ void notify_app_tcp_event_accept(struct app_ctx_per_thread *tctx, opaque_ptr c, 
                                  int32_t status, uint32_t rx_buf_size, uint32_t tx_buf_size,
                                  uint32_t local_ip, uint32_t remote_ip, uint16_t remote_port,
                                  uint32_t qid, bool backlog);
-/* The shared suffix of tcp_syn and app_accept: matches a queued SYN against a
- * waiting accept. NOT ported yet -- it belongs with the handshake events -- so it
- * is called here as the donor calls it, and lost its `static` to allow that. */
-void tcp_listener_accept(struct tcp_listener *l);
+
 void notify_app_tcp_event_newconn(struct app_ctx_per_thread *tctx, opaque_ptr l, int fd,
                                   uint32_t remote_ip, uint16_t remote_port);
 /* Still eTran's, both un-static'd so the generated demux can reach them: the
@@ -397,6 +394,10 @@ static inline struct tcp_listener *select_listen_ctx(const struct pkt_tcp *p)
  * Processors
  * ------------------------------------------------------------------ */
 
+/* proc_passive_open is the tail that tcp_syn and app_accept share, so both of
+ * their processors reach it and it is declared ahead of both. */
+static inline void proc_passive_open(struct tcp_listener *lst);
+
 /*
  * void proc_bind(app_bind ev, tcp_ctx ctx)
  *
@@ -654,9 +655,87 @@ static inline int proc_accept(const app_accept &ev)
     /* If a SYN is already queued, the shared suffix runs now. There is no
      * notify here: the application is told once the SYN-ACK goes out. */
     if (lst->backlog.size() > 0)
-        tcp_listener_accept(lst);
+        proc_passive_open(lst);
 
     return 0;
+}
+
+/*
+ * void proc_passive_open(tcp_syn ev, tcp_listen_ctx lst, tcp_ctx ctx)
+ *
+ * The suffix that tcp_syn and app_accept SHARE: either the SYN arrives while an
+ * accept() is already waiting, or an accept() arrives while the SYN is queued.
+ * MTP has no way to say "these two events share a tail", so it is one processor
+ * that both dispatch entries call -- which is what eTran does too.
+ *
+ * This is where the context created by proc_accept finally acquires an identity.
+ * It was made with alloc(), deliberately unpublished, because accept() ran before
+ * any peer existed; the SYN supplies the remote half of the flow id and publish()
+ * makes it addressable. alloc + publish, the pair, doing the thing they were
+ * added for.
+ *
+ * Two protocol facts the code states plainly:
+ *   - local_seq = 1, a CONSTANT initial sequence number. The active side uses 0.
+ *     Neither is randomised.
+ *   - ECN is enabled only when the SYN carried ECE *and* CWR -- the offer. The
+ *     active side treats ECE alone as the acceptance (proc_synack).
+ */
+static inline void proc_passive_open(struct tcp_listener *lst)
+{
+    struct tcp_opts opts = {0};
+
+    if (!lst->pending_conn)
+        return;                       /* no accept() waiting: the SYN stays queued */
+
+    struct tcp_connection *ctx = lst->pending_conn;
+
+    /* The queued SYN, re-parsed now rather than when it arrived -- eTran stores
+     * 256 raw bytes and decodes them here. */
+    struct backlog_slot *slot = &lst->backlog.front();
+    struct pkt_tcp *pkt = (struct pkt_tcp *)slot->pkt;
+    int ret = parse_tcp_opts(pkt, &opts);
+    lst->backlog.pop_front();
+
+    if (ret || opts.ts == nullptr || opts.mss == nullptr) {
+        fprintf(stderr, "proc_passive_open: failed to parse TCP options\n");
+        /* NOTE: the donor returns here too, having already popped the slot and
+         * WITHOUT clearing pending_conn -- so the SYN is dropped and the waiting
+         * accept() stays waiting. Preserved; it is not this port's to fix. */
+        return;
+    }
+
+    ctx->qid = slot->qid;
+
+    /* The flow id, from the SYN. */
+    const tcp_fid fid(ntohl(pkt->ip.src), ntohs(pkt->tcp.src),
+                      etran_nic->_local_ip, lst->listen_port);
+    tcp_ctx_init{}(ctx, fid);
+
+    memcpy(ctx->local_mac, (uint8_t *)pkt->eth.dest.addr, ETH_ALEN);
+    memcpy(ctx->remote_mac, (uint8_t *)pkt->eth.src.addr, ETH_ALEN);
+
+    ctx->remote_seq = ntohl(pkt->tcp.seqno) + 1;
+    ctx->local_seq  = 1;
+    ctx->syn_ts     = ntohl(opts.ts->ts_val);
+
+    if ((TCPH_FLAGS(&pkt->tcp) & (TCP_ECE | TCP_CWR)) == (TCP_ECE | TCP_CWR))
+        ctx->flags |= ECN_ENABLE;
+
+    /* open_ctx: the eBPF halves, with listen=true. */
+    if (reg_tcp_conn_ebpf(ctx, true)) {
+        fprintf(stderr, "proc_passive_open: failed to register connection\n");
+        return;
+    }
+
+    /* The context becomes addressable by its id -- it was not, until now. */
+    ctxs().publish(ctx);
+
+    ctx->status    = CONN_WAIT_TX_SYNACK;
+    ctx->listen_fd = lst->fd;
+    lst->pending_conn = nullptr;
+
+    /* Parks the context for gen_synack. */
+    gen_queue().push(ctx);
 }
 
 /*
@@ -700,7 +779,7 @@ static inline void proc_backlog(const tcp_syn &ev, struct tcp_listener *lst)
     /* proc_passive_open runs only if an accept() is already waiting. It is the
      * suffix shared with app_accept, and is not ported yet. */
     if (lst->pending_conn)
-        tcp_listener_accept(lst);
+        proc_passive_open(lst);
 }
 
 /*

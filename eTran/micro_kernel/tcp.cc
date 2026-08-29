@@ -130,9 +130,6 @@ int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen);
 static void unreg_tcp_conn_ebpf(struct tcp_connection *c);
 
 
-/* not static: mtp/tcp_program.h's proc_accept calls it, as the donor's
- * tcp_accept did. It is the shared suffix of tcp_syn and app_accept. */
-void tcp_listener_accept(struct tcp_listener *l);
 
 /* not static: called by the generated network dispatch until tcp_ack/tcp_data
  * are ported. */
@@ -643,74 +640,11 @@ void notify_app_tcp_status_close(struct app_ctx_per_thread *tctx, opaque_ptr c, 
  * policy and not something the target should decide.
  */
 
-void tcp_listener_accept(struct tcp_listener *l)
-{
-    struct tcp_connection *c;
-    struct backlog_slot *slot;
-    struct pkt_tcp *pkt;
-    struct tcp_opts opts = {0};
-    uint32_t ecn_flags;
-    int ret;
-
-    if (!l->pending_conn)
-        return;
-
-    c = l->pending_conn;
-
-    assert(l->backlog.size() > 0);
-
-    slot = &l->backlog.front();
-    l->backlog.pop_front();
-
-    pkt = (struct pkt_tcp *)slot->pkt;
-
-    ret = parse_tcp_opts(pkt, &opts);
-
-    if (ret || opts.ts == nullptr || opts.mss == nullptr)
-    {
-        fprintf(stderr, "tcp_listener_accept: failed to parse TCP options\n");
-        return;
-    }
-
-    c->qid = slot->qid;
-
-    memcpy(c->local_mac, (uint8_t *)pkt->eth.dest.addr, ETH_ALEN);
-    memcpy(c->remote_mac, (uint8_t *)pkt->eth.src.addr, ETH_ALEN);
-    c->remote_ip = ntohl(pkt->ip.src);
-    c->remote_port = ntohs(pkt->tcp.src);
-    c->local_ip = etran_nic->_local_ip;
-    c->local_port = l->listen_port;
-
-    c->remote_seq = ntohl(pkt->tcp.seqno) + 1;
-    c->local_seq = 1;
-    c->syn_ts = ntohl(opts.ts->ts_val);
-
-    ecn_flags = TCPH_FLAGS(&pkt->tcp) & (TCP_ECE | TCP_CWR);
-    if (ecn_flags == (TCP_ECE | TCP_CWR))
-    {
-        c->flags |= ECN_ENABLE;
-    }
-
-    if (reg_tcp_conn_ebpf(c, true))
-    {
-        fprintf(stderr, "tcp_listener_accept: failed to register connection\n");
-        return;
-    }
-
-    reg_tcp_conn_slowpath(c);
-
-    c->status = CONN_WAIT_TX_SYNACK;
-    c->listen_fd = l->fd;
-    l->pending_conn = nullptr;
-
-    tcp_handshake_list.push_back(c);
-
-#ifdef DEBUG_TCP
-    fprintf(stdout, "connection is set to CONN_WAIT_TX_SYNACK\n");
-#endif
-
-    return;
-}
+/*
+ * tcp_listener_accept() is GONE -- ported as proc_passive_open in
+ * mtp/tcp_program.h. It is the suffix tcp_syn and app_accept share, and the
+ * place where the context accept() created without an identity finally gets one.
+ */
 
 void tcp_connection_pkt(struct tcp_connection *c, struct pkt_tcp *p, uint32_t qid, struct tcp_opts *opts)
 {
@@ -878,93 +812,6 @@ int poll_tcp_handshake_events(void)
 /*
  * tcp_accept() is GONE -- ported to MTP shape in mtp/tcp_program.h, event 4.
  */
-
-/*
- * tcp_listen() is GONE -- ported to MTP shape in mtp/tcp_program.h, event 2.
- */
-
-int tcp_accept(struct app_ctx_per_thread *tctx, struct appout_tcp_accept_t *tcp_accept_msg_in)
-{
-    struct tcp_connection *c;
-    struct tcp_listener *listener = nullptr;
-
-    opaque_ptr opaque_listener = tcp_accept_msg_in->opaque_listener;
-    opaque_ptr opaque_connection = tcp_accept_msg_in->opaque_connection;
-    uint16_t local_port = tcp_accept_msg_in->local_port;
-    int newfd = tcp_accept_msg_in->newfd;
-
-    for (auto it = tctx->listeners.begin(); it != tctx->listeners.end(); it++)
-    {
-        if ((*it)->listen_port == local_port && (*it)->opaque_listener == opaque_listener)
-        {
-            listener = *it;
-            break;
-        }
-    }
-
-    // no listener found
-    if (!listener)
-        return -1;
-
-    // already have a pending connection
-    if (listener->pending_conn)
-        return -1;
-
-    // exceeded max number of connections
-    if (tcp_connections.size() > MAX_NR_CONN)
-        return -1;
-
-    c = new tcp_connection();
-    if (!c)
-        return -1;
-    c->release = tcp_connection_close;
-
-    c->type = TCP_CONN_TYPE_NORMAL;
-    c->tctx = tctx;
-    c->listener = listener;
-    c->opaque_connection = opaque_connection;
-    c->remote_ip = 0;
-    c->remote_port = 0;
-    c->local_ip = etran_nic->_local_ip;
-    c->local_port = listener->listen_port;
-    c->rx_buf_size = etran_tcp->_trans_params.tcp.rx_buf_size;
-    c->tx_buf_size = etran_tcp->_trans_params.tcp.tx_buf_size;
-    c->remote_seq = 0;
-    c->local_seq = 0;
-    c->status = CONN_WAIT_RX_SYN;
-    c->syn_ts = 0;
-    c->syn_attempts = 0;
-    c->algorithm = CC_NONE;
-    c->cc_idx = 0;
-    c->cc_last_tsc = 0;
-    c->cc_last_rtt = TCP_RTT_INIT;
-    c->cc_last_drops = 0;
-    c->cc_last_acks = 0;
-    c->cc_last_ackb = 0;
-    c->cc_last_ecnb = 0;
-    c->cc_rate = CC_TIMELY_INIT_RATE;
-    c->cc_rexmits = 0;
-    c->cc_data = {0};
-    c->cnt_tx_pending = 0;
-    c->ts_tx_pending = 0;
-    c->qid = POISON_32;
-    c->flags = 0;
-    c->fd = newfd;
-
-    listener->pending_conn = c;
-
-    if (listener->backlog.size() > 0)
-    {
-#ifdef DEBUG_TCP
-        fprintf(stdout, "tcp_accept() calls tcp_listener_accept()\n");
-#endif
-        tcp_listener_accept(listener);
-    }
-
-    // notify application after sending SYN-ACK
-
-    return 0;
-}
 
 /*
  * tcp_open() is GONE -- ported to MTP shape in mtp/tcp_program.h as app_connect,
