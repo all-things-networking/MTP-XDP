@@ -87,6 +87,29 @@ either way: `proc_window`/`proc_rtt` update the send window and the RTT estimate
 where the generated RX fast path would not be instruction-for-instruction the
 path measured at 101%.
 
+## The `@placement` split, checked rather than claimed
+
+The generated `struct tcp_ctx_ebpf` holds exactly twelve fields, and they are
+exactly the twelve protocol-state fields of eTran's own `struct bpf_tcp_conn`
+(`common/intf/intf_ebpf.h`):
+
+```
+rx_avail  rx_remote_avail  rx_next_pos  rx_next_seq  rx_dupack_cnt
+rx_ooo_start  rx_ooo_len  tx_pending  tx_sent  tx_next_pos  tx_next_seq
+tx_next_ts
+```
+
+eTran's map carries seventeen more. Every one is target machinery or identity
+rather than protocol state — `cc_idx`, `lock`, `opaque_connection`, `qid`,
+`qid2xsk[]`, the MACs, the four-tuple, the buffer sizes — which is why the
+program does not place them there and could not.
+
+One of those needs saying out loud: **the four-tuple is `@placement("control")`
+in the program, and eTran keeps a copy in the map.** That is not a contradiction.
+No processor the program declares reads an address on the eBPF side; what reads
+`c->local_ip` there is eTran's ACK-coalescing path, which is the target's code
+and not generated from anything.
+
 ## A second program, to check the backend is not shaped to this one
 
 `check-xdp.sh <program>` compiles whatever it is given. Run against the
