@@ -118,24 +118,24 @@ void tcp_connection_close(struct kref *ref);
 static int tcp_synack_pkt(struct tcp_connection *c, struct pkt_tcp *p, struct tcp_opts *opts);
 
 // This function is called when connection is not established
-static void send_tcp_reset(struct app_ctx *actx, const struct pkt_tcp *orig_p);
+/* not static: the generated network dispatch replies with it. */
+void send_tcp_reset(struct app_ctx *actx, const struct pkt_tcp *orig_p);
 static void send_tcp_control(struct tcp_connection *c, uint8_t flags, int ts_opt, uint32_t ts_echo, uint16_t mss_opt);
 
 static int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen);
 static void unreg_tcp_conn_ebpf(struct tcp_connection *c);
 
-static struct tcp_connection *tcp_conn_lookup(struct pkt_tcp *p);
 
-static struct tcp_listener *tcp_listener_lookup(struct pkt_tcp *p);
 /* not static: mtp/tcp_program.h's proc_accept calls it, as the donor's
  * tcp_accept did. It is the shared suffix of tcp_syn and app_accept. */
 void tcp_listener_accept(struct tcp_listener *l);
 
-static void tcp_connection_pkt(struct tcp_connection *c, struct pkt_tcp *p, uint32_t qid, struct tcp_opts *opts);
+/* not static: called by the generated network dispatch until tcp_ack/tcp_data
+ * are ported. */
+void tcp_connection_pkt(struct tcp_connection *c, struct pkt_tcp *p, uint32_t qid, struct tcp_opts *opts);
 
-static void tcp_listener_pkt(struct tcp_listener *l, struct pkt_tcp *p, uint32_t qid, struct tcp_opts *opts);
 
-static inline int parse_tcp_opts(struct pkt_tcp *p, struct tcp_opts *opts)
+int parse_tcp_opts(struct pkt_tcp *p, struct tcp_opts *opts)
 {
     uint8_t *opt = (uint8_t *)(p + 1);
     uint16_t opts_len = TCPH_HDRLEN(&p->tcp) * 4 - TCP_HLEN;
@@ -310,7 +310,7 @@ fail:
     return -1;
 }
 
-static void send_tcp_reset(struct app_ctx *actx, const struct pkt_tcp *orig_p)
+void send_tcp_reset(struct app_ctx *actx, const struct pkt_tcp *orig_p)
 {
     struct pkt_tcp *p;
     struct tcp_hdr *tcp;
@@ -689,34 +689,14 @@ void notify_app_tcp_status_close(struct app_ctx_per_thread *tctx, opaque_ptr c, 
     kick_evfd(tctx->evfd);
 }
 
-static struct tcp_connection *tcp_conn_lookup(struct pkt_tcp *p)
-{
-    std::lock_guard<std::mutex> lock(tcp_connections_lock);
-    struct flow_tuple key(ntohl(p->ip.src), ntohs(p->tcp.src), ntohl(p->ip.dest), ntohs(p->tcp.dest));
-    auto it = tcp_connections.find(key);
-
-    return it == tcp_connections.end() ? nullptr : it->second;
-}
-
-static struct tcp_listener *tcp_listener_lookup(struct pkt_tcp *p)
-{
-    std::lock_guard<std::mutex> lock(tcp_listeners_lock);
-    struct listen_tuple key(ntohl(p->ip.dest), ntohs(p->tcp.dest));
-
-    auto it = tcp_listeners.find(key);
-
-    if (it == tcp_listeners.end())
-        return nullptr;
-
-    std::vector<struct tcp_listener *> &listener_list = it->second;
-
-    if (listener_list.empty())
-        return nullptr;
-
-    // hash p's 4-tuple to get a index
-    uint32_t hash_idx = (ntohl(p->ip.src) ^ ntohl(p->ip.dest) ^ ntohs(p->tcp.src) ^ ntohs(p->tcp.dest)) % listener_list.size();
-    return listener_list[hash_idx];
-}
+/*
+ * tcp_conn_lookup() and tcp_listener_lookup() are GONE. Both were context
+ * lookups keyed by fields of the packet, which is exactly what a context store
+ * is for: mtp/tcp_program.h derives the ids in its parser (tcp_fid_of_pkt,
+ * tcp_lid_of_pkt) and asks the stores. The SO_REUSEPORT hash-select moved with
+ * them into select_listen_ctx, because choosing among instances is protocol
+ * policy and not something the target should decide.
+ */
 
 void tcp_listener_accept(struct tcp_listener *l)
 {
@@ -787,7 +767,7 @@ void tcp_listener_accept(struct tcp_listener *l)
     return;
 }
 
-static void tcp_connection_pkt(struct tcp_connection *c, struct pkt_tcp *p, uint32_t qid, struct tcp_opts *opts)
+void tcp_connection_pkt(struct tcp_connection *c, struct pkt_tcp *p, uint32_t qid, struct tcp_opts *opts)
 {
     uint32_t ecn_flags = 0;
     if (c->status == CONN_WAIT_RX_SYNACK)
@@ -849,49 +829,10 @@ static void tcp_connection_pkt(struct tcp_connection *c, struct pkt_tcp *p, uint
     }
 }
 
-static void tcp_listener_pkt(struct tcp_listener *l, struct pkt_tcp *p, uint32_t qid, struct tcp_opts *opts)
-{
-    struct backlog_slot *slot;
-    struct pkt_tcp *pkt;
-    uint16_t len;
-
-    len = sizeof(p->eth) + ntohs(p->ip.len);
-
-    if ((TCPH_FLAGS(&p->tcp) & ~(TCP_ECE | TCP_CWR)) != TCP_SYN)
-    {
-        fprintf(stderr, "tcp_listener_pkt: Not a SYN (flags %x)\n", TCPH_FLAGS(&p->tcp));
-        // send_tcp_reset(l->tctx->actx, p);
-        return;
-    }
-
-    if (l->backlog.size() >= l->max_backlog_size)
-        return;
-
-    /* make sure we don't already have this 4-tuple */
-    for (auto it = l->backlog.begin(); it != l->backlog.end(); it++)
-    {
-        slot = &(*it);
-        pkt = (struct pkt_tcp *)slot->pkt;
-        if (ntohl(pkt->ip.src) == ntohl(p->ip.src) && ntohs(pkt->tcp.src) == ntohs(p->tcp.src) &&
-            ntohl(pkt->ip.dest) == ntohl(p->ip.dest) && ntohs(pkt->tcp.dest) == ntohs(p->tcp.dest))
-        {
-            return;
-        }
-    }
-
-    l->backlog.push_back(backlog_slot((char *)p, len, qid));
-
-    // notify application
-    notify_app_tcp_event_newconn(l->tctx, l->opaque_listener, l->fd, ntohl(p->ip.src), ntohs(p->tcp.src));
-
-    if (l->pending_conn)
-    {
-#ifdef DEBUG_TCP
-        fprintf(stdout, "tcp_listener_pkt() calls tcp_listener_accept()\n");
-#endif
-        tcp_listener_accept(l);
-    }
-}
+/*
+ * tcp_listener_pkt() is GONE -- ported as proc_backlog in mtp/tcp_program.h,
+ * event 5 (tcp_syn).
+ */
 
 static inline void snapshot_cc(struct bpf_cc_snapshot *stats, uint32_t cc_idx)
 {
@@ -1240,50 +1181,13 @@ int tcp_accept(struct app_ctx_per_thread *tctx, struct appout_tcp_accept_t *tcp_
  * mtp/tcp_program.h, and the case below calls that dispatch.
  */
 
+/*
+ * The network demux is now generated: mtp/tcp_program.h's dispatch_net. This
+ * stays as the entry point the control loop already calls.
+ */
 int tcp_packet(struct app_ctx *actx, struct pkt_tcp *p, uint32_t qid)
 {
-    struct tcp_connection *c;
-    struct tcp_listener *l;
-    struct tcp_opts opts = {0};
-    int ret = 0;
-
-#ifdef DEBUG_TCP
-    fprintf(stdout, "tcp_packet()\n");
-#endif
-    // fprintf(stdout, "tcp_packet()\n");
-
-    if (parse_tcp_opts(p, &opts))
-        return -1;
-
-    if ((c = tcp_conn_lookup(p)))
-    {
-#ifdef DEBUG_TCP
-        fprintf(stdout, "A corresponding connection is found\n");
-#endif
-        tcp_connection_pkt(c, p, qid, &opts);
-    }
-    else
-    {
-        if ((l = tcp_listener_lookup(p)))
-        {
-#ifdef DEBUG_TCP
-            fprintf(stdout, "A corresponding listener is found\n");
-#endif
-            tcp_listener_pkt(l, p, qid, &opts);
-        }
-        else
-        {
-#ifdef DEBUG_TCP
-            fprintf(stdout, "No connection and listener are found, send RST back\n");
-#endif
-            fprintf(stdout, "No connection and listener are found, send RST back, %u, %d\n", htons(p->tcp.dest), (TCPH_FLAGS(&p->tcp)));
-            ret = -1;
-            /* send reset if the packet received wasn't a reset */
-            if (!(TCPH_FLAGS(&p->tcp) & TCP_RST))
-                send_tcp_reset(actx, p);
-        }
-    }
-    return ret;
+    return tcp_prog::dispatch_net(actx, p, qid);
 }
 
 int tcp_close(struct app_ctx_per_thread *tctx, struct appout_tcp_close_t *tcp_close_msg_in)

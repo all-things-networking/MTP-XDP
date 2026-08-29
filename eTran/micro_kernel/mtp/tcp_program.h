@@ -13,7 +13,8 @@
  * generic run-time key/value map: the compiler knows the program, so TCP's key
  * is TCP's key at compile time.
  *
- * Ported so far:  app_bind, app_listen, app_connect, app_accept.
+ * Ported so far:  app_bind, app_listen, app_connect, app_accept, tcp_syn
+ *                 (and with it the network demux).
  * Everything else is still eTran's original code in tcp.cc, on purpose -- one
  * event at a time, each built and measured before the next.
  */
@@ -54,6 +55,14 @@ void notify_app_tcp_event_accept(struct app_ctx_per_thread *tctx, opaque_ptr c, 
  * waiting accept. NOT ported yet -- it belongs with the handshake events -- so it
  * is called here as the donor calls it, and lost its `static` to allow that. */
 void tcp_listener_accept(struct tcp_listener *l);
+void notify_app_tcp_event_newconn(struct app_ctx_per_thread *tctx, opaque_ptr l, int fd,
+                                  uint32_t remote_ip, uint16_t remote_port);
+/* Still eTran's, both un-static'd so the generated demux can reach them: the
+ * established-connection path and the RST reply are later events. */
+void tcp_connection_pkt(struct tcp_connection *c, struct pkt_tcp *p, uint32_t qid,
+                        struct tcp_opts *opts);
+void send_tcp_reset(struct app_ctx *actx, const struct pkt_tcp *orig_p);
+int parse_tcp_opts(struct pkt_tcp *p, struct tcp_opts *opts);
 int alloc_port(uint16_t port);
 int record_port(struct app_ctx *actx, uint16_t local_port, uint16_t remote_port);
 /* eTran's per-context release hook; no longer static in tcp.cc so that a
@@ -152,6 +161,23 @@ static inline tcp_listen_bag &listen_ctxs()
 /* ------------------------------------------------------------------ *
  * The events
  * ------------------------------------------------------------------ */
+
+/*
+ * event tcp_syn : net_event { ... }
+ *
+ * Carries the packet rather than its parsed fields. eTran does not decode a SYN
+ * when it arrives: it copies the first 256 bytes into the backlog and re-parses
+ * them at accept time (runtime/tcp.h:129-139), which is why the MSS and
+ * timestamp options are read later than they are received. A blueprint-shaped
+ * event with seq/window/opts fields would describe a different program.
+ */
+struct net_event {
+    struct pkt_tcp *pkt;
+    struct tcp_opts *opts;
+    uint32_t qid;
+};
+
+struct tcp_syn : net_event {};
 
 /* The target's app_event base: which application thread made the call, and the
  * handles it will be answered on. Not protocol state -- MTP has no type for a
@@ -269,6 +295,41 @@ static inline void sock_accept(struct app_ctx_per_thread *tctx,
     ev.listener_handle = op->opaque_listener;
     ev.local_port      = op->local_port;
     ev.newfd           = op->newfd;
+}
+
+/* ------------------------------------------------------------------ *
+ * net_parser tcp { ... }
+ *
+ * The packet's flow id, as seen from THIS host: the sender's address is the
+ * remote half. eTran writes the same expression inline in tcp_conn_lookup
+ * (tcp.cc:688).
+ * ------------------------------------------------------------------ */
+static inline tcp_fid tcp_fid_of_pkt(const struct pkt_tcp *p)
+{
+    return tcp_fid(ntohl(p->ip.src), ntohs(p->tcp.src),
+                   ntohl(p->ip.dest), ntohs(p->tcp.dest));
+}
+
+static inline tcp_lid tcp_lid_of_pkt(const struct pkt_tcp *p)
+{
+    return tcp_lid(ntohl(p->ip.dest), ntohs(p->tcp.dest));
+}
+
+/*
+ * Which listening context receives this packet, when several share the id.
+ * The choice is eTran's: hash the four-tuple modulo the number of instances
+ * (tcp.cc:710). This is the selection MTP cannot express -- [GAP: REUSEPORT] --
+ * and it is protocol POLICY, which is why the target's ctx_bag returns all the
+ * instances and lets the program choose.
+ */
+static inline struct tcp_listener *select_listen_ctx(const struct pkt_tcp *p)
+{
+    std::vector<struct tcp_listener *> *all = listen_ctxs().get_all(tcp_lid_of_pkt(p));
+    if (!all || all->empty())
+        return nullptr;
+    uint32_t h = (ntohl(p->ip.src) ^ ntohl(p->ip.dest) ^
+                  ntohs(p->tcp.src) ^ ntohs(p->tcp.dest)) % all->size();
+    return (*all)[h];
 }
 
 /* ------------------------------------------------------------------ *
@@ -537,10 +598,56 @@ static inline int proc_accept(const app_accept &ev)
     return 0;
 }
 
+/*
+ * void proc_backlog(tcp_syn ev, tcp_listen_ctx lst)
+ *
+ * Holds the SYN. Every rejection is silent except the flags check, which the
+ * donor logs -- a SYN that is dropped for a full backlog or as a duplicate looks
+ * identical to one that never arrived.
+ */
+static inline void proc_backlog(const tcp_syn &ev, struct tcp_listener *lst)
+{
+    struct pkt_tcp *p = ev.pkt;
+
+    /* Exactly a SYN. ECE and CWR are permitted because the active opener always
+     * sets them; anything else is not this event. */
+    if ((TCPH_FLAGS(&p->tcp) & ~(TCP_ECE | TCP_CWR)) != TCP_SYN) {
+        fprintf(stderr, "proc_backlog: Not a SYN (flags %x)\n", TCPH_FLAGS(&p->tcp));
+        return;
+    }
+
+    if (lst->backlog.size() >= lst->max_backlog_size)
+        return;                                  /* dropped, silently */
+
+    /* Already holding this four-tuple: a retransmitted SYN. */
+    for (auto it = lst->backlog.begin(); it != lst->backlog.end(); it++) {
+        struct pkt_tcp *q = (struct pkt_tcp *)it->pkt;
+        if (ntohl(q->ip.src) == ntohl(p->ip.src) && ntohs(q->tcp.src) == ntohs(p->tcp.src) &&
+            ntohl(q->ip.dest) == ntohl(p->ip.dest) && ntohs(q->tcp.dest) == ntohs(p->tcp.dest))
+            return;
+    }
+
+    /* The raw bytes, not the decoded fields -- see the event declaration. */
+    uint16_t len = sizeof(p->eth) + ntohs(p->ip.len);
+    lst->backlog.push_back(backlog_slot((char *)p, len, ev.qid));
+
+    /* notify(lst, LISTEN_NEWCONN) -- proc_backlog and notify_newconn are one
+     * function in the donor; kept adjacent so the order is unambiguous. */
+    notify_app_tcp_event_newconn(lst->tctx, lst->opaque_listener, lst->fd,
+                                 ntohl(p->ip.src), ntohs(p->tcp.src));
+
+    /* proc_passive_open runs only if an accept() is already waiting. It is the
+     * suffix shared with app_accept, and is not ported yet. */
+    if (lst->pending_conn)
+        tcp_listener_accept(lst);
+}
+
 /* ------------------------------------------------------------------ *
  * dispatch tcp_dispatch { app_bind -> { proc_bind }; app_listen -> { proc_listen };
  *                         app_connect -> { proc_connect, gen_syn };
- *                         app_accept -> { proc_accept }; ... }
+ *                         app_accept -> { proc_accept };
+ *                         tcp_syn -> { proc_backlog, notify_newconn,
+ *                                      proc_passive_open, gen_synack, notify_accept }; }
  *
  * One generated entry point per event. The processor LIST is the loop body; for
  * app_bind the list is one long. The error notify is emitted once here, which
@@ -588,6 +695,50 @@ static inline void dispatch_app_connect(struct app_ctx_per_thread *tctx,
      * runs off tcp_handshake_list in the control loop. */
     if (proc_connect(ev) != 0)
         notify_app_tcp_conn_open(tctx, op->opaque_connection, op->fd, -1, nullptr);
+}
+
+/*
+ * The network dispatch.
+ *
+ * THE SHAPE IS INVERTED FROM THE DONOR, and this is the substantive change.
+ * eTran demuxes context-first: find a connection, and if there is none find a
+ * listener, and only then look at the flags. MTP is event-first -- the parser
+ * decides WHICH event a packet is, and the context is then found by the event's
+ * flow id.
+ *
+ * What is written here is the honest middle: the context lookups are expressed
+ * as the two stores' own operations, keyed by the ids the parser derives, and
+ * the listening branch raises a real tcp_syn event. The connection branch still
+ * calls eTran's tcp_connection_pkt, which does its own flag dispatch, because
+ * tcp_ack / tcp_data / tcp_synack / tcp_rst are not ported yet. When they are,
+ * that call disappears and the parser raises those events directly.
+ */
+static inline int dispatch_net(struct app_ctx *actx, struct pkt_tcp *p, uint32_t qid)
+{
+    struct tcp_opts opts = {0};
+    if (parse_tcp_opts(p, &opts))
+        return -1;
+
+    /* An established connection owns the packet if one exists under its id. */
+    if (struct tcp_connection *ctx = ctxs().get_ctx(tcp_fid_of_pkt(p))) {
+        tcp_connection_pkt(ctx, p, qid, &opts);   /* not ported yet */
+        return 0;
+    }
+
+    /* Otherwise a listening context may. */
+    if (struct tcp_listener *lst = select_listen_ctx(p)) {
+        tcp_syn ev;
+        ev.pkt = p; ev.opts = &opts; ev.qid = qid;
+        proc_backlog(ev, lst);
+        return 0;
+    }
+
+    /* Neither: reply with a RST unless this already is one. */
+    fprintf(stdout, "No connection and listener are found, send RST back, %u, %d\n",
+            htons(p->tcp.dest), (TCPH_FLAGS(&p->tcp)));
+    if (!(TCPH_FLAGS(&p->tcp) & TCP_RST))
+        send_tcp_reset(actx, p);
+    return -1;
 }
 
 } // namespace tcp_prog
