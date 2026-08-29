@@ -43,3 +43,61 @@ changing.
 - the **processor bodies** are reproduced for everything the program can say;
 - what is left is what the language cannot say, and it clusters almost entirely
   on refusal.
+
+---
+
+## The dispatch differs in one way the program cannot express
+
+Generated (`prog_dispatch.c`), which is the program read literally:
+
+```c
+mtp_dispatch_tcp_ack:   proc_ack, proc_fast_retransmit, proc_window, proc_rtt
+mtp_dispatch_tcp_data:  proc_seq, proc_ooo, proc_recv
+```
+
+Hand-written (`eBPF/tcp/mtp/tcp_program_bpf.h:460`), which is what runs and what
+was measured:
+
+```c
+proc_ack        /* tcp_ack  */
+proc_seq_ooo    /* tcp_data */
+proc_window_rtt /* tcp_ack  */
+proc_recv       /* tcp_data */
+```
+
+Two differences, and they are different in kind.
+
+**Fusion** (`proc_seq`+`proc_ooo`, `proc_window`+`proc_rtt`) is a target
+decision and needs no permission from the program: the two processors share
+every value they read, and the eBPF verifier is happier with one straight-line
+body than two. A compiler is free to do this and the result is the same
+program.
+
+**Interleaving is not.** One segment carries an acknowledgement *and* payload,
+so it raises `tcp_ack` and `tcp_data` together, and eTran walks the header once
+— it runs half of one chain, then half of the other. **The program does not say
+that.** It declares two chains and says nothing about how a target that gets
+both at once should schedule them, so the generated code runs one and then the
+other.
+
+Whether that reordering is observable is untested and should not be assumed
+either way: `proc_window`/`proc_rtt` update the send window and the RTT estimate,
+`proc_seq`/`proc_recv` the receive side, and they are believed disjoint — but
+"believed disjoint" is a hypothesis, and rule 4 applies. It is the one place
+where the generated RX fast path would not be instruction-for-instruction the
+path measured at 101%.
+
+## A second program, to check the backend is not shaped to this one
+
+`check-xdp.sh <program>` compiles whatever it is given. Run against the
+mTCP/DPDK reference program — a different transport program, written for a
+different backend, by a different session — the XDP backend emits code that
+compiles clean. That found five contract errors and four generator defects that
+`tcp.mtp` cannot reach, because it never uses the instructions involved
+(ordered data, segmentation, `ctx_addrs`, a generic `event_t` parameter, a
+processor calling a sibling declared later).
+
+Its placement is the honest one: **control 41, ebpf 0, app 0**, because that
+program carries no `@placement` at all. One address space is the right answer
+for a program that never asks for more, and the backend gets there from the
+program rather than from a default it was born with.
