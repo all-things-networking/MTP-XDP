@@ -15,6 +15,9 @@
 #include "eTran_defs.h"
 #include "tcp.h"
 
+/* The ported eBPF-side program, in generated shape. */
+#include "mtp/tcp_program_bpf.h"
+
 char LICENSE[] SEC("license") = "GPL";
 
 #define XDP_EGRESS_DROP XDP_DROP
@@ -330,8 +333,10 @@ int xdp_sock_prog(struct xdp_md *ctx)
         return XDP_DROP;
     }
 
-    // filter out SYN, SYN-ACK, RST packets
-    if (unlikely(is_tcp_syn(tcph) || is_tcp_syn_ack(tcph) || is_tcp_rst(tcph))) {
+    // The parser classifies first: SYN, SYN-ACK and RST are not fast-path events.
+    // They are redirected to the control path, where the ported tcp_syn,
+    // tcp_synack and tcp_rst processors handle them.
+    if (unlikely(tcp_is_slow_path_event(tcph))) {
         goto slowpath;
     }
 
@@ -341,12 +346,10 @@ int xdp_sock_prog(struct xdp_md *ctx)
         return XDP_DROP;
     }
 
-    key.local_ip = bpf_ntohl(iph->daddr);
-    key.remote_ip = bpf_ntohl(iph->saddr);
-    key.local_port = bpf_ntohs(tcph->dest);
-    key.remote_port = bpf_ntohs(tcph->source);
+    // set_flow_id(ev, tcp_fid(...)), then the context it names.
+    tcp_fid_of_pkt_bpf(iph, tcph, &key);
 
-    c = bpf_map_lookup_elem(&bpf_tcp_conn_map, &key);
+    c = tcp_bpf_get_ctx(&key);
     if (unlikely(!c)) {
         xdp_log_err("bpf_tcp_conn not found");
         return XDP_DROP;
