@@ -86,6 +86,15 @@ const uint32 PROG_MAX_BACKLOG   = 512;
 const bool   PARITY_ALWAYS_OFFER_ECN = true;
 
 const uint8  TRANSPORT_IP_PROTO = 6;
+const uint8  IP_ECN_CE          = 0x03;   /* the low two bits of tos */
+
+/*
+ * Transmit priority. A segment that holds no position in the data stream must
+ * not queue behind one that does, or a handshake waits on a full send buffer.
+ */
+const uint8  PRIO_CONTROL = 2;    /* SYN, SYN-ACK, RST: hold no data position */
+const uint8  PRIO_ACK     = 1;    /* pure acknowledgements */
+const uint8  PRIO_DATA    = 0;    /* payload */
 
 /**************************** parameters ****************************/
 
@@ -212,7 +221,10 @@ pkt_bp TCPBP {
     data_t data;
 }
 
-net_header ipv4 { uint32 saddr, daddr; uint8 protocol; }
+/* tos is read for its low two bits: eTran tests (iph->tos & IPTOS_ECN_CE) ==
+ * IPTOS_ECN_CE on every segment, so congestion experienced is an L3 fact the
+ * transport reads rather than a field of its own. */
+net_header ipv4 { uint32 saddr, daddr; uint8 protocol; uint8 tos; }
 
 opt_t opt_mss    { uint8 kind = 2; uint8 opt_len = 4;  uint16 mss; }
 opt_t opt_nop    { uint8 kind = 1; }
@@ -523,7 +535,7 @@ list<event_t> parse_tcp(pkt_t p, ipv4 h) {
     a.window = bp.window;  a.flags = bp.flags;
     a.ts_val = bp.opts.ts_val;  a.ts_ecr = bp.opts.ts_ecr;
     a.payload_len = payload_len;
-    a.ecn_ce = h.ecn_ce;
+    a.ecn_ce = (h.tos & IP_ECN_CE) == IP_ECN_CE;
     set_ctx_lookup_info(a, tcp_ctx, fid);
     out.add(a);
 
@@ -533,7 +545,7 @@ list<event_t> parse_tcp(pkt_t p, ipv4 h) {
         d.window = bp.window;
         d.ts_val = bp.opts.ts_val;  d.ts_ecr = bp.opts.ts_ecr;
         d.payload_len = payload_len;
-        d.ecn_ce = h.ecn_ce;
+        d.ecn_ce = (h.tos & IP_ECN_CE) == IP_ECN_CE;
         set_ctx_lookup_info(d, tcp_ctx, fid);
         out.add(d);
     }
