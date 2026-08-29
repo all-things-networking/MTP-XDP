@@ -1219,68 +1219,10 @@ int tcp_accept(struct app_ctx_per_thread *tctx, struct appout_tcp_accept_t *tcp_
     return 0;
 }
 
-int tcp_open(struct app_ctx_per_thread *tctx, struct appout_tcp_open_t *tcp_open_msg_in)
-{
-    struct tcp_connection *c;
-    uint16_t local_port = 0;
-    int ret;
-
-    opaque_ptr opaque_connection = tcp_open_msg_in->opaque_connection;
-    int fd = tcp_open_msg_in->fd;
-    uint32_t remote_ip = tcp_open_msg_in->remote_ip;
-    uint16_t remote_port = tcp_open_msg_in->remote_port;
-
-    c = find_tcp_conn_slowpath(opaque_connection);
-
-    /* no bind() called for this connection before */
-    if (!c)
-    {
-        c = new tcp_connection();
-        if (!c)
-            return -1;
-        c->release = tcp_connection_close;
-        ret = alloc_port();
-        if (ret == -1)
-        {
-            delete c;
-            return -1;
-        }
-        local_port = ret;
-        record_port(tctx->actx, local_port, remote_port);
-    }
-    c->release = tcp_connection_close;
-
-    c->type = TCP_CONN_TYPE_NORMAL;
-    c->tctx = tctx;
-    c->listener = nullptr;
-    c->reuseport = false;
-    c->opaque_connection = opaque_connection;
-    c->fd = fd;
-    c->remote_ip = remote_ip;
-    c->remote_port = remote_port;
-    c->local_ip = etran_nic->_local_ip;
-    if (local_port)
-        c->local_port = local_port;
-    c->rx_buf_size = etran_tcp->_trans_params.tcp.rx_buf_size;
-    c->tx_buf_size = etran_tcp->_trans_params.tcp.tx_buf_size;
-    c->status = CONN_WAIT_TX_SYN;
-    c->algorithm = CC_NONE;
-    c->cc_idx = POISON_32;
-    c->cc_last_rtt = TCP_RTT_INIT;
-    c->cc_rate = CC_TIMELY_INIT_RATE;
-    c->qid = POISON_32;
-    c->flags = 0;
-    c->remote_seq = 0;
-    c->local_seq = 0;
-
-    reg_tcp_conn_slowpath(c);
-
-    tcp_handshake_list.push_back(c);
-
-    notify_app_tcp_conn_open(tctx, c->opaque_connection, c->fd, 0, c);
-
-    return 0;
-}
+/*
+ * tcp_open() is GONE -- ported to MTP shape in mtp/tcp_program.h as app_connect,
+ * event 3.
+ */
 
 /*
  * tcp_bind() is GONE. app_bind is the first event ported to MTP shape: its
@@ -1419,9 +1361,9 @@ void process_tcp_cmd(struct app_ctx_per_thread *tctx, lrpc_msg *msg_in)
     switch (msg_in->cmd)
     {
     case APPOUT_TCP_OPEN:
+        /* ported: mtp/tcp_program.h */
         tcp_open_msg_in = (struct appout_tcp_open_t *)msg_in->data;
-        if (tcp_open(tctx, tcp_open_msg_in))
-            notify_app_tcp_conn_open(tctx, tcp_open_msg_in->opaque_connection, tcp_open_msg_in->fd, -1, nullptr);
+        tcp_prog::dispatch_app_connect(tctx, tcp_open_msg_in);
         break;
     case APPOUT_TCP_BIND:
         /* ported: mtp/tcp_program.h. The error notify moved INTO the generated

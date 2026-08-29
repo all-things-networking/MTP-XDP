@@ -112,6 +112,22 @@ public:
         return c;
     }
 
+    /*
+     * Register a context that already exists under its CURRENT key.
+     *
+     * MTP has no instruction for this, because in MTP a context's id does not
+     * change. eTran's does: a socket that bind()s is registered under an id
+     * fabricated from its handle, and when it later connect()s its address
+     * fields are overwritten with the real four-tuple and it is registered
+     * AGAIN -- without the first registration being removed. The donor keeps
+     * both, so this keeps both. Not a rebind: a second binding.
+     */
+    void publish(Ctx *c)
+    {
+        std::lock_guard<std::mutex> g(_lock);
+        _m.insert(std::make_pair(KeyOf{}(c), c));
+    }
+
     /* MTP `del_ctx`: unregister. Freeing is the caller's, because eTran hangs
      * a per-context release hook off the object and runs it on its own schedule. */
     void unbind(Ctx *c)

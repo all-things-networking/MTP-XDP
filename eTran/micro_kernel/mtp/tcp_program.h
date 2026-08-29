@@ -13,7 +13,7 @@
  * generic run-time key/value map: the compiler knows the program, so TCP's key
  * is TCP's key at compile time.
  *
- * Ported so far:  app_bind, app_listen.
+ * Ported so far:  app_bind, app_listen, app_connect.
  * Everything else is still eTran's original code in tcp.cc, on purpose -- one
  * event at a time, each built and measured before the next.
  */
@@ -31,6 +31,11 @@ extern std::unordered_map<struct listen_tuple, std::vector<struct tcp_listener *
 extern std::mutex tcp_listeners_lock;
 extern class eTranNIC *etran_nic;
 void notify_app_tcp_status_listen(struct app_ctx_per_thread *tctx, opaque_ptr l, int fd, int32_t status);
+void notify_app_tcp_conn_open(struct app_ctx_per_thread *tctx, opaque_ptr c, int fd, int32_t status,
+                              struct tcp_connection *conn);
+int alloc_port(void);
+extern class eTranTCP *etran_tcp;
+extern std::list<struct tcp_connection *> tcp_handshake_list;
 int alloc_port(uint16_t port);
 int record_port(struct app_ctx *actx, uint16_t local_port, uint16_t remote_port);
 /* eTran's per-context release hook; no longer static in tcp.cc so that a
@@ -160,8 +165,23 @@ struct app_listen : app_event {
     unsigned int pending_cap;     /* the backlog argument */
 };
 
+/*
+ * event app_connect : app_event { uint32 remote_ip; uint16 remote_port; }
+ *
+ * The doc also gives this event local_ip and local_port and reads both in the
+ * processor. NEITHER IS IN THE CALL: appout_tcp_open_t is
+ * {opaque_connection, fd, remote_ip, remote_port} (intf.h:103-108). The local
+ * address is the node's one configured address and the local port is either the
+ * bound context's or whatever the allocator hands out.
+ */
+struct app_connect : app_event {
+    uint32_t remote_ip;
+    uint16_t remote_port;
+};
+
 /* ------------------------------------------------------------------ *
- * app_parser socket { bind -> sock_bind; listen -> sock_listen; ... }
+ * app_parser socket { bind -> sock_bind; listen -> sock_listen;
+ *                     connect -> sock_connect; ... }
  *
  * Turns one socket call into one event and sets its flow id. The id is set
  * HERE, by the parser, which is what lets the processor be written against a
@@ -191,6 +211,19 @@ static inline void sock_listen(struct app_ctx_per_thread *tctx,
     ev.pending_cap     = op->backlog;
     /* No set_flow_id here: the listening id needs the bound context's port,
      * which this call does not carry. proc_listen derives it. */
+}
+
+static inline void sock_connect(struct app_ctx_per_thread *tctx,
+                                const struct appout_tcp_open_t *op,
+                                app_connect &ev)
+{
+    ev.tctx        = tctx;
+    ev.handle      = op->opaque_connection;
+    ev.fd          = op->fd;
+    ev.remote_ip   = op->remote_ip;
+    ev.remote_port = op->remote_port;
+    /* No set_flow_id: the local port is not known until the processor has
+     * looked for a bound context or asked the allocator. */
 }
 
 /* ------------------------------------------------------------------ *
@@ -303,8 +336,87 @@ static inline int proc_listen(const app_listen &ev)
     return 0;
 }
 
+/*
+ * void proc_connect(app_connect ev, tcp_ctx ctx)
+ *
+ * Two paths, and the second is why the target needs `publish`. If bind() ran,
+ * the context ALREADY EXISTS and is already registered under an id fabricated
+ * from the socket handle. connect() overwrites its address fields with the real
+ * four-tuple and eTran registers it AGAIN, keeping both entries
+ * (tcp.cc:1323, unconditional). The context's identity changes, which MTP has
+ * no instruction for; the donor's behaviour is reproduced exactly rather than
+ * tidied, because tidying it would be a silent protocol change.
+ *
+ * As in proc_bind, the allocation moves after the guard that can fail: nothing
+ * can observe an unregistered context, so it is behaviour-preserving.
+ */
+static inline int proc_connect(const app_connect &ev)
+{
+    opaque_ptr h = ev.handle;
+    struct tcp_connection *ctx = ctxs().find_if(
+        [h](const struct tcp_connection *c) { return c->opaque_connection == h; });
+
+    uint16_t fresh_port = 0;
+    if (!ctx) {
+        /* no bind() ran: take an ephemeral port. Which one is on the wire, and
+         * no MTP instruction names it. */
+        int p = alloc_port();
+        if (p == -1)
+            return -1;
+        fresh_port = (uint16_t)p;
+        record_port(ev.tctx->actx, fresh_port, ev.remote_port);
+    }
+
+    const tcp_fid fid(ev.remote_ip, ev.remote_port, etran_nic->_local_ip,
+                      ctx ? ctx->local_port : fresh_port);
+
+    auto fill = [&](struct tcp_connection *c) {
+        c->type              = TCP_CONN_TYPE_NORMAL;
+        c->tctx              = ev.tctx;
+        c->listener          = nullptr;
+        c->reuseport         = false;
+        c->opaque_connection = ev.handle;
+        c->fd                = ev.fd;
+        c->rx_buf_size       = etran_tcp->_trans_params.tcp.rx_buf_size;
+        c->tx_buf_size       = etran_tcp->_trans_params.tcp.tx_buf_size;
+        c->status            = CONN_WAIT_TX_SYN;
+        c->algorithm         = CC_NONE;
+        c->cc_idx            = POISON_32;
+        c->cc_last_rtt       = TCP_RTT_INIT;
+        c->cc_rate           = CC_TIMELY_INIT_RATE;
+        c->qid               = POISON_32;
+        c->flags             = 0;
+        /* Both sequence numbers start at 0 and neither is randomised. */
+        c->remote_seq        = 0;
+        c->local_seq         = 0;
+    };
+
+    if (!ctx) {
+        ctx = ctxs().new_ctx(fid, fill);
+        if (!ctx)
+            return -1;
+    } else {
+        /* The identity change: stamp the real four-tuple over the synthetic one
+         * and register under it, leaving the old entry in place as eTran does. */
+        tcp_ctx_init{}(ctx, fid);
+        fill(ctx);
+        ctxs().publish(ctx);
+    }
+
+    /* Joining this list is what schedules gen_syn: the control loop sweeps it
+     * and emits the SYN. gen_syn is a separate processor and is not ported yet. */
+    tcp_handshake_list.push_back(ctx);
+
+    /* notify(ctx, CONNECTING) -- status 0 means "in progress". The application
+     * is notified a SECOND time when the SYN-ACK lands; two notifications for
+     * one call has no MTP form. */
+    notify_app_tcp_conn_open(ev.tctx, ctx->opaque_connection, ctx->fd, 0, ctx);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ *
- * dispatch tcp_dispatch { app_bind -> { proc_bind }; app_listen -> { proc_listen }; ... }
+ * dispatch tcp_dispatch { app_bind -> { proc_bind }; app_listen -> { proc_listen };
+ *                         app_connect -> { proc_connect, gen_syn }; ... }
  *
  * One generated entry point per event. The processor LIST is the loop body; for
  * app_bind the list is one long. The error notify is emitted once here, which
@@ -329,6 +441,18 @@ static inline void dispatch_app_listen(struct app_ctx_per_thread *tctx,
 
     if (proc_listen(ev) != 0)
         notify_app_tcp_status_listen(tctx, op->opaque_listener, op->fd, -1);
+}
+
+static inline void dispatch_app_connect(struct app_ctx_per_thread *tctx,
+                                        const struct appout_tcp_open_t *op)
+{
+    app_connect ev;
+    sock_connect(tctx, op, ev);
+
+    /* gen_syn, the second processor in this event's list, is not ported yet: it
+     * runs off tcp_handshake_list in the control loop. */
+    if (proc_connect(ev) != 0)
+        notify_app_tcp_conn_open(tctx, op->opaque_connection, op->fd, -1, nullptr);
 }
 
 } // namespace tcp_prog
