@@ -5,15 +5,16 @@
  * grammar is the authority for what PARSES; examples/tcp-etran.mtp is
  * superseded and must not be read as a reference.
  *
- * INSTRUCTION SPELLING. The grammar's tokens carry an `_instr` suffix
- * (NEW_CTX : 'new_ctx_instr'), but the backends implement the UNSUFFIXED names
- * -- new_ctx, del_ctx, pkt_gen, timer_start, timer_stop -- and emit
- * "no emission for builtin 'new_ctx_instr'" for the suffixed ones. Both parse:
- * the suffixed form as the grammar token, the unsuffixed as an ordinary call
- * that the generator then recognises by name. This program uses the spellings
- * that GENERATE, and the discrepancy is worth closing in one direction or the
- * other, because right now the grammar and the backends disagree and only one
- * of them tells you.
+ * INSTRUCTION SPELLING. The `_instr` suffix is the intended form and this
+ * program uses it: new_ctx_instr, del_ctx_instr, pkt_gen_instr,
+ * timer_start_instr. `timer_stop` has no suffix and is spelt as it is.
+ *
+ * The BACKENDS have not caught up -- DPDKGenerator implements the unsuffixed
+ * names and answers "no emission for builtin 'new_ctx_instr'" -- so compiling
+ * this program with --backend=dpdk reports those. That is the backend to fix,
+ * not the program: both spellings parse, one as the grammar's token and one as
+ * an ordinary call the generator happens to recognise, and only the first is
+ * checkable. The eTran/XDP backend implements the suffixed names.
  *
  * WHAT THIS PROGRAM DESCRIBES. eTran (NSDI'25), as it actually behaves, not as
  * TCP is usually described. Every departure from ordinary TCP below is the
@@ -559,7 +560,7 @@ list<event_t> parse_tcp(pkt_t p, ipv4 h) {
  */
 void proc_bind(app_bind ev, tcp_ctx ctx) {
     tcp_fid fid = ctx.key;
-    new_ctx(fid);
+    new_ctx_instr(fid);
 
     ctx.type      = TYPE_FAKE;
     ctx.reuseport = ev.reuseport;
@@ -583,7 +584,7 @@ void proc_listen(app_listen ev, tcp_ctx bound, tcp_listen_ctx lst) {
         return;
 
     tcp_lid lid = tcp_lid(bound.local_ip, bound.local_port);
-    new_ctx(lid);
+    new_ctx_instr(lid);
 
     lst.local_ip    = bound.local_ip;
     lst.local_port  = bound.local_port;
@@ -638,7 +639,7 @@ void proc_connect(app_connect ev, tcp_ctx ctx) {
     ctx.syn_attempts = 0;
 
     tcp_fid fid = ctx.key;
-    new_ctx(fid);
+    new_ctx_instr(fid);
 
     /* status 0 means "in progress". The application is notified a SECOND time
      * when the SYN-ACK lands, and connect() polls for that one. Two
@@ -656,7 +657,7 @@ void gen_syn(app_connect ev, tcp_ctx ctx) {
         return;
 
     ctx.state = CONN_WAIT_RX_SYNACK;
-    timer_start(ctx.handshake_timer, millisecond(tcp_handshake_timeout));
+    timer_start_instr(ctx.handshake_timer, millisecond(tcp_handshake_timeout));
 
     TCPBP bp;
     bp.src_port = ctx.local_port;
@@ -668,7 +669,7 @@ void gen_syn(app_connect ev, tcp_ctx ctx) {
     bp.flags    = FLAG_SYN | FLAG_ECE | FLAG_CWR;
     bp.opts.add(opt_mss(PARITY_MSS));
     bp.opts.add(opt_ts(0, 0));
-    pkt_gen(bp, PRIO_CONTROL, false);
+    pkt_gen_instr(bp, PRIO_CONTROL, false);
 }
 
 /*
@@ -715,7 +716,7 @@ void proc_passive_open(tcp_syn ev, tcp_listen_ctx lst, tcp_ctx ctx) {
 
     /* Only now is the context addressable by its id. */
     tcp_fid fid = ctx.key;
-    new_ctx(fid);
+    new_ctx_instr(fid);
 
     ctx.state = CONN_WAIT_TX_SYNACK;
     lst.has_accepted = false;
@@ -744,7 +745,7 @@ void gen_synack(tcp_syn ev, tcp_ctx ctx) {
         bp.flags = bp.flags | FLAG_ECE;
     bp.opts.add(opt_mss(PARITY_MSS));
     bp.opts.add(opt_ts(0, ctx.syn_ts));
-    pkt_gen(bp, PRIO_CONTROL, false);
+    pkt_gen_instr(bp, PRIO_CONTROL, false);
 
     /* accept() returns from HERE, not from proc_accept. */
     notify(ctx, ACCEPTED);
@@ -772,7 +773,7 @@ void proc_synack(tcp_synack ev, tcp_ctx ctx) {
         ctx.tx_next_seq = 0;
         ctx.syn_ts      = 0;
         ctx.ecn_enable  = false;
-        timer_start(ctx.handshake_timer, millisecond(tcp_handshake_timeout));
+        timer_start_instr(ctx.handshake_timer, millisecond(tcp_handshake_timeout));
         return;
     }
 
@@ -796,7 +797,7 @@ void proc_synack(tcp_synack ev, tcp_ctx ctx) {
     bp.window   = PARITY_CTRL_WINDOW;
     bp.flags    = FLAG_ACK;
     bp.opts.add(opt_ts(0, ctx.syn_ts));
-    pkt_gen(bp, PRIO_ACK, false);
+    pkt_gen_instr(bp, PRIO_ACK, false);
 }
 
 /*
@@ -807,7 +808,7 @@ void proc_synack(tcp_synack ev, tcp_ctx ctx) {
 void proc_rst(tcp_rst ev, tcp_ctx ctx) {
     notify(ctx, PEER_RESET);
     tcp_fid dead = ctx.key;
-    del_ctx(dead);
+    destroy_ctx_instr(dead);
 }
 
 /*
@@ -826,7 +827,7 @@ void proc_fin(tcp_fin ev, tcp_ctx ctx) {
     bp.ack_seq  = ctx.rx_next_seq;
     bp.window   = PARITY_CTRL_WINDOW;
     bp.flags    = FLAG_ACK;
-    pkt_gen(bp, PRIO_ACK, false);
+    pkt_gen_instr(bp, PRIO_ACK, false);
 }
 
 /*
@@ -843,10 +844,10 @@ void proc_close(app_close ev, tcp_ctx ctx) {
     bp.seq_no   = ctx.tx_next_seq;
     bp.ack_seq  = ctx.rx_next_seq;
     bp.flags    = FLAG_RST;
-    pkt_gen(bp, PRIO_CONTROL, false);
+    pkt_gen_instr(bp, PRIO_CONTROL, false);
 
     tcp_fid dead = ctx.key;
-    del_ctx(dead);
+    destroy_ctx_instr(dead);
     notify(ctx, CLOSED);
 }
 
