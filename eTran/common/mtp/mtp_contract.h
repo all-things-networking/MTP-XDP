@@ -166,8 +166,23 @@ typedef void *mtp_ctx_t;
  * implement these: the eBPF half of this target cannot, and the backend refuses
  * to emit them there rather than emitting a call that would fail at run time.
  */
+/*
+ * REGISTRATION, BECAUSE C HAS NO GENERICS. The target has to store contexts it
+ * knows nothing about: their layout is the PROGRAM's, and the whole point of
+ * the boundary is that the target never sees it. So generated code declares the
+ * two sizes once at start-up -- how big a context of this kind is, and how big
+ * its key is -- and the store is a slab and a hash over key bytes from there.
+ *
+ * Without this, mtp_ctx_new could not be written at all: it takes a `const
+ * void *key` with no length, and a target cannot hash what it cannot measure.
+ */
+void mtp_ctx_register(mtp_ctx_kind_t kind, __u32 ctx_size, __u32 key_size);
+
 mtp_ctx_t mtp_ctx_new(mtp_ctx_kind_t kind, const void *key);
 void      mtp_ctx_del(mtp_ctx_kind_t kind, const void *key);
+/* The lookup half. The dispatch resolves an event's context with this, using
+ * the kind and key its parser declared through mtp_ev_key. */
+mtp_ctx_t mtp_ctx_get(mtp_ctx_kind_t kind, const void *key);
 
 /* ---- packet generation -------------------------------------------------
  * pkt_gen_instr(bp, prio, rtx). It names no context: the target already knows
