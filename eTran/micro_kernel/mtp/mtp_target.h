@@ -193,13 +193,24 @@ public:
 
     ctx_bag(map_t &m, std::mutex &lock) : _m(m), _lock(lock) {}
 
-    /* Every instance under this id, or nullptr. The CALLER picks among them --
-     * which one is protocol policy, not storage. */
-    std::vector<Ctx *> *get_all(const FlowId &id)
+    /*
+     * Run `pick` over every instance under this id, UNDER THE LOCK, and return
+     * what it chose. Which instance is protocol policy and belongs to the
+     * program -- but the choosing has to happen while the set is held, or the
+     * program is indexing a vector another thread may have reallocated.
+     *
+     * An earlier version returned the vector and let the caller index it after
+     * the lock was dropped. That is safe only because eTran does all of this on
+     * one thread, which is not a property worth depending on silently.
+     */
+    template <class Pick>
+    Ctx *select(const FlowId &id, Pick pick)
     {
         std::lock_guard<std::mutex> g(_lock);
         auto it = _m.find(id);
-        return it == _m.end() ? nullptr : &it->second;
+        if (it == _m.end() || it->second.empty())
+            return nullptr;
+        return pick(it->second);
     }
 
     /* As ctx_store::new_ctx, including init-before-publish. */

@@ -324,12 +324,12 @@ static inline tcp_lid tcp_lid_of_pkt(const struct pkt_tcp *p)
  */
 static inline struct tcp_listener *select_listen_ctx(const struct pkt_tcp *p)
 {
-    std::vector<struct tcp_listener *> *all = listen_ctxs().get_all(tcp_lid_of_pkt(p));
-    if (!all || all->empty())
-        return nullptr;
-    uint32_t h = (ntohl(p->ip.src) ^ ntohl(p->ip.dest) ^
-                  ntohs(p->tcp.src) ^ ntohs(p->tcp.dest)) % all->size();
-    return (*all)[h];
+    return listen_ctxs().select(tcp_lid_of_pkt(p),
+        [p](const std::vector<struct tcp_listener *> &all) {
+            uint32_t h = (ntohl(p->ip.src) ^ ntohl(p->ip.dest) ^
+                          ntohs(p->tcp.src) ^ ntohs(p->tcp.dest)) % all.size();
+            return all[h];
+        });
 }
 
 /* ------------------------------------------------------------------ *
