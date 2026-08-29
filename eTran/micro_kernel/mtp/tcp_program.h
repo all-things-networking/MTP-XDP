@@ -14,7 +14,8 @@
  * is TCP's key at compile time.
  *
  * Ported so far:  app_bind, app_listen, app_connect, app_accept, tcp_syn
- *                 (and with it the network demux), tcp_synack.
+ *                 (and with it the network demux), tcp_synack,
+ *                 tcp_rst.
  * Everything else is still eTran's original code in tcp.cc, on purpose -- one
  * event at a time, each built and measured before the next.
  */
@@ -72,6 +73,7 @@ int record_port(struct app_ctx *actx, uint16_t local_port, uint16_t remote_port)
  * generated program can install it the way the donor does. */
 void tcp_connection_close(struct kref *ref);
 void notify_app_tcp_status_bind(struct app_ctx_per_thread *tctx, opaque_ptr c, int fd, int32_t status);
+void notify_app_tcp_status_close(struct app_ctx_per_thread *tctx, opaque_ptr c, int fd, int32_t status);
 
 namespace tcp_prog {
 
@@ -201,6 +203,9 @@ struct tcp_syn : net_event {};
  * bookkeeping: qid is the NIC queue the connection's eBPF state is keyed to.
  */
 struct tcp_synack : net_event {};
+
+/* event tcp_rst : net_event { } */
+struct tcp_rst : net_event {};
 
 /* The target's app_event base: which application thread made the call, and the
  * handles it will be answered on. Not protocol state -- MTP has no type for a
@@ -745,6 +750,26 @@ static inline int proc_synack(const tcp_synack &ev, struct tcp_connection *ctx)
     return 0;
 }
 
+/*
+ * void proc_rst(tcp_rst ev, tcp_ctx ctx)
+ *
+ * notify_close then proc_teardown, the doc's two processors. Teardown is MTP's
+ * del_ctx, which on this target is a reference drop: the release hook installed
+ * by CtxInit runs when the last reference goes, and it is that hook which
+ * deletes the eBPF state, frees the port, unbinds the context from the store --
+ * and emits a RST in reply, because eTran answers a RST with a RST.
+ */
+static inline void proc_rst(const tcp_rst &ev, struct tcp_connection *ctx)
+{
+    (void)ev;
+    /* notify(ctx, CONN_CLOSE) -- status 0 here means "the peer reset us", not
+     * "success". The same notify carries -1 for a failed close. */
+    notify_app_tcp_status_close(ctx->tctx, ctx->opaque_connection, ctx->fd, 0);
+
+    /* del_ctx */
+    kref_put(&ctx->ref, ctx->release);
+}
+
 /* ------------------------------------------------------------------ *
  * dispatch tcp_dispatch { app_bind -> { proc_bind }; app_listen -> { proc_listen };
  *                         app_connect -> { proc_connect, gen_syn };
@@ -833,6 +858,12 @@ static inline int dispatch_net(struct app_ctx *actx, struct pkt_tcp *p, uint32_t
             ev.pkt = p; ev.opts = &opts; ev.qid = qid;
             if (proc_synack(ev, ctx))
                 fprintf(stderr, "proc_synack() failed\n");
+            return 0;
+        }
+        if (ctx->status == CONN_OPEN && (TCPH_FLAGS(&p->tcp) & TCP_RST)) {
+            tcp_rst ev;
+            ev.pkt = p; ev.opts = &opts; ev.qid = qid;
+            proc_rst(ev, ctx);
             return 0;
         }
         tcp_connection_pkt(ctx, p, qid, &opts);   /* remaining arms, not ported */

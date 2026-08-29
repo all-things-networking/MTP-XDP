@@ -745,17 +745,8 @@ void tcp_connection_pkt(struct tcp_connection *c, struct pkt_tcp *p, uint32_t qi
         return;
     }
 
-    if (c->status == CONN_OPEN && ((TCPH_FLAGS(&p->tcp) & TCP_RST)))
-    {
-#ifdef DEBUG_TCP
-        fprintf(stdout, "tcp_connection_pkt: received RST\n");
-#endif
-        /* notify application that we received RST */
-        notify_app_tcp_status_close(c->tctx, c->opaque_connection, c->fd, 0);
-        /* close the connection */
-        tcp_conn_put(c);
-        return;
-    }
+    /* The RST arm is GONE -- it is the tcp_rst event, raised by the generated
+     * dispatch before this function is reached. */
 
     if (c->status == CONN_CLOSED && (TCPH_FLAGS(&p->tcp) & TCP_FIN))
     {
