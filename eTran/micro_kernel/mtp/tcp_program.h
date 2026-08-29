@@ -15,7 +15,7 @@
  *
  * Ported so far:  app_bind, app_listen, app_connect, app_accept, tcp_syn
  *                 (and with it the network demux), tcp_synack,
- *                 tcp_rst.
+ *                 tcp_rst, gen_syn / gen_synack (the deferred generation).
  * Everything else is still eTran's original code in tcp.cc, on purpose -- one
  * event at a time, each built and measured before the next.
  */
@@ -172,6 +172,14 @@ static inline tcp_listen_bag &listen_ctxs()
 {
     static tcp_listen_bag s(tcp_listeners, tcp_listeners_lock);
     return s;
+}
+
+/* The deferred-generation queue. eTran does not emit a SYN inside connect(): the
+ * context is parked and the control loop drains it on its next pass. */
+static inline mtp::work_queue<struct tcp_connection> &gen_queue()
+{
+    static mtp::work_queue<struct tcp_connection> q(tcp_handshake_list);
+    return q;
 }
 
 /* ------------------------------------------------------------------ *
@@ -537,9 +545,9 @@ static inline int proc_connect(const app_connect &ev)
         ctxs().publish(ctx);
     }
 
-    /* Joining this list is what schedules gen_syn: the control loop sweeps it
-     * and emits the SYN. gen_syn is a separate processor and is not ported yet. */
-    tcp_handshake_list.push_back(ctx);
+    /* Parking the context here is what schedules gen_syn, the second processor
+     * in this event's list. */
+    gen_queue().push(ctx);
 
     /* notify(ctx, CONNECTING) -- status 0 means "in progress". The application
      * is notified a SECOND time when the SYN-ACK lands; two notifications for
@@ -823,6 +831,52 @@ static inline void dispatch_app_connect(struct app_ctx_per_thread *tctx,
      * runs off tcp_handshake_list in the control loop. */
     if (proc_connect(ev) != 0)
         notify_app_tcp_conn_open(tctx, op->opaque_connection, op->fd, -1, nullptr);
+}
+
+/*
+ * void gen_syn(tcp_ctx ctx)        -- the second processor of app_connect
+ * void gen_synack(tcp_ctx ctx)     -- and of tcp_syn, with notify_accept
+ *
+ * Both are deferred: the dispatch parks the context and the control loop drains
+ * it. Which of the two runs is decided by the context's status, because that is
+ * what eTran's queue carries -- one list for both events.
+ *
+ * gen_synack sets the connection OPEN *before* the SYN-ACK is emitted and never
+ * waits for the third ACK. That is eTran's behaviour, not a simplification here:
+ * the passive side is live from that moment.
+ */
+static inline int run_deferred_gen(struct tcp_connection *ctx)
+{
+    switch (ctx->status) {
+    case CONN_WAIT_TX_SYN:
+        ctx->status = CONN_WAIT_RX_SYNACK;
+        /* timer_start(handshake, TCP_HANDSHAKE_TIMEOUT) */
+        ctx->next_timeout_tsc = get_cycles() + us_to_cycles(TCP_HANDSHAKE_TIMEOUT * 1000);
+        /* Always ECN-capable: there is no socket option and no configuration. */
+        send_tcp_control(ctx, TCP_SYN | TCP_ECE | TCP_CWR, 1, 0, TCP_MSS);
+        return 1;
+
+    case CONN_WAIT_TX_SYNACK:
+        ctx->status = CONN_OPEN;
+        if (ctx->flags & ECN_ENABLE)
+            send_tcp_control(ctx, TCP_SYN | TCP_ACK | TCP_ECE, 1, ctx->syn_ts, TCP_MSS);
+        else
+            send_tcp_control(ctx, TCP_SYN | TCP_ACK, 1, ctx->syn_ts, TCP_MSS);
+        /* notify_accept: the application's accept() returns from here. */
+        notify_app_tcp_event_accept(ctx->tctx, ctx->opaque_connection, ctx->listen_fd,
+                                    ctx->fd, 0, ctx->rx_buf_size, ctx->tx_buf_size,
+                                    ctx->local_ip, ctx->remote_ip, ctx->remote_port,
+                                    ctx->qid, !ctx->listener->backlog.empty());
+        return 1;
+
+    default:
+        return 0;
+    }
+}
+
+static inline int drain_deferred_gen(void)
+{
+    return gen_queue().drain(run_deferred_gen);
 }
 
 /*

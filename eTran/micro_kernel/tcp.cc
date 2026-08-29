@@ -965,41 +965,14 @@ void poll_tcp_cc_to(void)
 
 }
 
+/*
+ * The generation processors are now generated: mtp/tcp_program.h's gen_syn and
+ * gen_synack, drained through the target's work_queue. This remains as the entry
+ * point the control loop already calls.
+ */
 int poll_tcp_handshake_events(void)
 {
-    struct tcp_connection *c;
-    int work = 0;
-    while (!tcp_handshake_list.empty())
-    {
-        auto it = tcp_handshake_list.begin();
-        c = *it;
-        tcp_handshake_list.pop_front();
-        switch (c->status)
-        {
-        case CONN_WAIT_TX_SYN:
-            c->status = CONN_WAIT_RX_SYNACK;
-            /* arm a TCP handshake timer */
-            c->next_timeout_tsc = get_cycles() + us_to_cycles(TCP_HANDSHAKE_TIMEOUT * 1000);
-            /* send SYN packet */
-            send_tcp_control(c, TCP_SYN | TCP_ECE | TCP_CWR, 1, 0, TCP_MSS);
-            work++;
-            break;
-        case CONN_WAIT_TX_SYNACK:
-            c->status = CONN_OPEN;
-            /* send SYN-ACK packet */
-            if (c->flags & ECN_ENABLE)
-                send_tcp_control(c, TCP_SYN | TCP_ACK | TCP_ECE, 1, c->syn_ts, TCP_MSS);
-            else
-                send_tcp_control(c, TCP_SYN | TCP_ACK, 1, c->syn_ts, TCP_MSS);
-            /* notify application to accept() */
-            notify_app_tcp_event_accept(c->tctx, c->opaque_connection, c->listen_fd, c->fd, 0, c->rx_buf_size, c->tx_buf_size, c->local_ip, c->remote_ip, c->remote_port, c->qid, !c->listener->backlog.empty());
-            work++;
-            break;
-        default:
-            break;
-        }
-    }
-    return work;
+    return tcp_prog::drain_deferred_gen();
 }
 
 // external functions

@@ -23,6 +23,7 @@
  * key" or "generic value" anywhere: the compiler knows the program, so the
  * specialisation happens at compile time.
  */
+#include <list>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -230,6 +231,44 @@ public:
 private:
     map_t &_m;
     std::mutex &_lock;
+};
+
+/*
+ * work_queue -- contexts with a deferred processor still to run.
+ *
+ * MTP's dispatch lists a processor and says nothing about when it runs; the
+ * target decides (§4.1, "the execution strategy is intentionally left to the
+ * target"). eTran's choice for packet GENERATION is to defer it: a processor
+ * that must emit a packet parks its context here, and the control loop drains
+ * the queue once per pass. That is why a SYN is not sent inside connect().
+ *
+ * Protocol-independent: what is queued is a context, and what runs on drain is
+ * whatever the program supplied.
+ */
+template <class Ctx>
+class work_queue
+{
+public:
+    work_queue(std::list<Ctx *> &q) : _q(q) {}
+
+    void push(Ctx *c) { _q.push_back(c); }
+
+    /* Drain to empty, running `run` on each. Returns how many ran, which is what
+     * eTran's control loop uses to decide whether a pass did any work. */
+    template <class Run>
+    int drain(Run run)
+    {
+        int work = 0;
+        while (!_q.empty()) {
+            Ctx *c = _q.front();
+            _q.pop_front();
+            work += run(c);
+        }
+        return work;
+    }
+
+private:
+    std::list<Ctx *> &_q;
 };
 
 } // namespace mtp
