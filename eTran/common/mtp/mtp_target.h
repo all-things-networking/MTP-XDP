@@ -1,6 +1,13 @@
 #pragma once
 /*
- * mtp_target.h -- the MTP target runtime for eTran's control path (site T1).
+ * mtp_target.h -- the MTP target runtime for eTran's C++ sites.
+ *
+ * Lives in common/ because it serves BOTH of them: the micro kernel's control
+ * path (T1) and the application-side library (T3). It moved here when the
+ * application side turned out to need work_queue for exactly the reason the
+ * control path did -- a processor that must emit a packet parks its context and
+ * something else drains it later. A primitive that two independent sites need
+ * unchanged is a target primitive; one that only one site needs is a guess.
  *
  * NOTHING IN THIS FILE MAY NAME A PROTOCOL. That is the whole point of it: a
  * compiler emits one program header per MTP program, and this file is what

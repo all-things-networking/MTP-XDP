@@ -3,6 +3,7 @@
 #include <app_if.h>
 #include <xsk_if.h>
 #include <tcp_if.h>
+#include "mtp/tcp_program_app.h"
 #include <homa_if.h>
 #include <intf/intf.h>
 
@@ -207,30 +208,8 @@ static inline ssize_t eTran_tcp_rx_peek_count_zc(struct app_ctx_per_thread *tctx
  */
 static inline int eTran_tcp_rx_release(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, size_t len)
 {
-    if (conn->rxb_used < len)
-    {
-        fprintf(stderr, "eTran_tcp_submit_rx(): conn->rxb_used < len\n");
-        return -EINVAL;
-    }
-
-    conn->rxb_used -= len;
-    conn->rxb_bump += len;
-
-    conn->rxb_head += len;
-    if (conn->rxb_head > conn->rx_buf_size) {
-        conn->rxb_head -= conn->rx_buf_size;
-    }
-
-    if (unlikely((conn->rxb_bump > std::min(std::min(conn->rx_buf_size >> 2, ((unsigned int)0xFFFF) << TCP_WND_SCALE), (unsigned int)32768) || conn->force_rx_bump) 
-        && !conn->in_rx_bump_pending))
-    {
-        tctx->rx_bump_pending_conns.push_back(conn);
-        conn->in_rx_bump_pending = true;
-    }
-
-    conn->force_rx_bump = false;
-
-    return 0;
+    /* ported: mtp/tcp_program_app.h, app_recv -> { proc_drain, send_wnd_update } */
+    return tcp_prog_app::proc_drain(tctx, conn, len);
 }
 
 /**
