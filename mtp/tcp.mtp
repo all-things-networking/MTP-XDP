@@ -96,6 +96,9 @@ const uint8  PRIO_CONTROL = 2;    /* SYN, SYN-ACK, RST: hold no data position */
 const uint8  PRIO_ACK     = 1;    /* pure acknowledgements */
 const uint8  PRIO_DATA    = 0;    /* payload */
 
+const uint32 PARITY_DUP_ACK_THRESH = 3;      /* the donor acts on the third */
+const uint32 TCP_MAX_RTT           = 1000000;
+
 /**************************** parameters ****************************/
 
 param uint32 tcp_handshake_timeout(50);    /* ms */
@@ -863,6 +866,193 @@ void proc_close(app_close ev, tcp_ctx ctx) {
     notify(ctx, CLOSED);
 }
 
+/*
+ * THE DATA PATH.
+ *
+ * Every processor below touches only fields the program placed in "ebpf" or
+ * "cc_shared", or only ones it placed in "app". That is not a coincidence and it
+ * is not a hint to the compiler: it is what DECIDES where they run. eTran keeps
+ * the per-packet state in an eBPF map and the ring bookkeeping in the
+ * application's memory, so a processor over the first can run in XDP and a
+ * processor over the second cannot.
+ */
+
+/*
+ * proc_ack. Acknowledgement arithmetic and duplicate detection.
+ *
+ * The donor accepts an ACK for bytes it has SUBMITTED but whose egress pass has
+ * not run yet, which is why the window it checks against runs from
+ * tx_next_seq - tx_sent to tx_next_seq + tx_pending rather than to tx_next_seq.
+ */
+void proc_ack(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
+    s.acked = 0;
+    s.trigger_ack = ev.payload_len > 0;
+
+    ctx.cnt_rx_acks = ctx.cnt_rx_acks + 1;
+
+    uint32 first = ctx.tx_next_seq - ctx.tx_sent;
+    if (!in_range(ev.ack, first, ctx.tx_next_seq + ctx.tx_pending)) {
+        s.trigger_ack = false;
+        return;
+    }
+
+    s.acked = ev.ack - first;
+    if (s.acked > ctx.tx_sent) {
+        /* A retransmission acknowledged twice. Not an error, and not counted. */
+        s.acked = 0;
+        s.trigger_ack = false;
+        return;
+    }
+
+    ctx.cnt_rx_ack_bytes = ctx.cnt_rx_ack_bytes + s.acked;
+    if (ev.ecn_ce)
+        ctx.cnt_rx_ecn_bytes = ctx.cnt_rx_ecn_bytes + s.acked;
+
+    ctx.tx_sent = ctx.tx_sent - s.acked;
+    ctx.txp = ctx.tx_sent > 0;
+
+    if (s.acked > 0)
+        ctx.rx_dupack_cnt = 0;
+}
+
+/*
+ * proc_fast_retransmit. Four conditions, all of them, and the donor writes them
+ * out: nothing was acknowledged, something is outstanding, the segment carried
+ * no payload, and the advertised window did not move -- a window update is not a
+ * duplicate. Only then is a third duplicate a loss signal.
+ */
+void proc_fast_retransmit(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
+    if (s.acked > 0)
+        return;
+    if (ctx.tx_sent == 0)
+        return;
+    if (ev.payload_len != 0)
+        return;
+    if (ctx.rx_remote_avail != ev.window)
+        return;
+
+    ctx.rx_dupack_cnt = ctx.rx_dupack_cnt + 1;
+    if (ctx.rx_dupack_cnt != PARITY_DUP_ACK_THRESH)
+        return;
+
+    /* Go back to the first unacknowledged byte. */
+    s.go_back_pos = ctx.tx_sent;
+    ctx.rx_dupack_cnt = 0;
+    ctx.tx_next_seq = ctx.tx_next_seq - ctx.tx_sent;
+    ctx.rx_remote_avail = ctx.rx_remote_avail + ctx.tx_sent;
+    ctx.tx_pending = 0;
+    ctx.tx_sent = 0;
+    ctx.txp = false;
+
+    /* Halve once per interval, not once per duplicate. */
+    if (ctx.cnt_tx_drops == 0)
+        ctx.rate = ctx.rate >> 1;
+    ctx.cnt_tx_drops = ctx.cnt_tx_drops + 1;
+}
+
+/*
+ * proc_window and proc_rtt. THESE ARE tcp_ack PROCESSORS AND THEY RUN AFTER
+ * tcp_data's validation -- see the dispatch. A segment with a bad sequence
+ * number never reaches them, so it never updates the receive window, even
+ * though the window is ACK state. That is the donor's braid, not a simplification.
+ */
+void proc_window(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
+    if (s.acked > 0 || ctx.rx_remote_avail < ev.window)
+        ctx.rx_remote_avail = ev.window;
+}
+
+void proc_rtt(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
+    if (ev.ts_ecr == 0 || s.acked == 0)
+        return;
+
+    uint32 rtt = ev.ts_val - ev.ts_ecr;
+    if (rtt >= TCP_MAX_RTT)
+        return;
+
+    /* A seven-eighths exponential average, which is what the donor keeps. */
+    if (ctx.rtt_est > 0)
+        ctx.rtt_est = (ctx.rtt_est * 7 + rtt) / 8;
+    else
+        ctx.rtt_est = rtt;
+}
+
+/*
+ * proc_seq. Validation, and it heads the chain: every segment the state machine
+ * sees carries the ACK flag, so this runs exactly once per segment and the
+ * payload processing below reads its verdict.
+ */
+void proc_seq(tcp_data ev, tcp_ctx ctx, tcp_scratch s) {
+    s.seg_ok = ev.seq == ctx.rx_next_seq;
+}
+
+/*
+ * proc_ooo. One interval, not a list. The donor keeps a single out-of-order
+ * extent and merges only at its edges; a segment that touches neither edge is
+ * dropped rather than held, which is why a hole with two gaps costs a
+ * retransmission.
+ */
+void proc_ooo(tcp_data ev, tcp_ctx ctx, tcp_scratch s) {
+    if (s.seg_ok)
+        return;
+    if (ev.payload_len == 0)
+        return;
+
+    if (ctx.rx_ooo_len == 0) {
+        ctx.rx_ooo_start = ev.seq;
+        ctx.rx_ooo_len = ev.payload_len;
+    } else if (ev.seq + ev.payload_len == ctx.rx_ooo_start) {
+        ctx.rx_ooo_start = ev.seq;
+        ctx.rx_ooo_len = ctx.rx_ooo_len + ev.payload_len;
+    } else if (ctx.rx_ooo_start + ctx.rx_ooo_len == ev.seq) {
+        ctx.rx_ooo_len = ctx.rx_ooo_len + ev.payload_len;
+    }
+}
+
+/*
+ * proc_recv. The receive state advances, and an out-of-order extent that has
+ * become contiguous is absorbed in the same pass.
+ */
+void proc_recv(tcp_data ev, tcp_ctx ctx, tcp_scratch s) {
+    if (!s.seg_ok)
+        return;
+    if (ev.payload_len == 0)
+        return;
+
+    s.rx_bump = ev.payload_len;
+    ctx.rx_avail = ctx.rx_avail - ev.payload_len;
+    ctx.rx_next_pos = ctx.rx_next_pos + ev.payload_len;
+    ctx.rx_next_seq = ctx.rx_next_seq + ev.payload_len;
+
+    if (ctx.rx_ooo_len > 0 && ctx.rx_ooo_start == ctx.rx_next_seq) {
+        s.rx_bump = s.rx_bump + ctx.rx_ooo_len;
+        ctx.rx_avail = ctx.rx_avail - ctx.rx_ooo_len;
+        ctx.rx_next_pos = ctx.rx_next_pos + ctx.rx_ooo_len;
+        ctx.rx_next_seq = ctx.rx_next_seq + ctx.rx_ooo_len;
+        ctx.rx_ooo_len = 0;
+    }
+}
+
+/*
+ * record_data and proc_drain -- the application's own thread. These touch only
+ * fields placed in "app", so they cannot run where the eBPF processors do, and
+ * the compiler places them from that alone.
+ */
+void record_data(app_send ev, tcp_ctx ctx) {
+    if (ctx.txb_allocated < ev.len)
+        return;
+    ctx.txb_allocated = ctx.txb_allocated - ev.len;
+    ctx.txb_sent = ctx.txb_sent + ev.len;
+}
+
+void proc_drain(app_recv ev, tcp_ctx ctx) {
+    if (ctx.rxb_used < ev.len)
+        return;
+    ctx.rxb_used = ctx.rxb_used - ev.len;
+    ctx.rxb_bump = ctx.rxb_bump + ev.len;
+    ctx.rxb_head = ctx.rxb_head + ev.len;
+    ctx.force_rx_bump = false;
+}
+
 /**************************** the dispatch ****************************/
 
 /*
@@ -878,8 +1068,22 @@ dispatch tcp_dispatch {
     app_connect -> { proc_connect, gen_syn };
     app_close   -> { proc_close };
 
+    app_send    -> { record_data };
+    app_recv    -> { proc_drain };
+
     tcp_syn     -> { proc_passive_open, gen_synack };
     tcp_synack  -> { proc_synack };
     tcp_rst     -> { proc_rst };
     tcp_fin     -> { proc_fin };
+
+    /*
+     * THE BRAID. proc_window and proc_rtt belong to tcp_ack and run AFTER
+     * tcp_data's proc_seq and proc_ooo, because that is the order the donor
+     * runs them in and its early exits skip them. Declaring tcp_ack and
+     * tcp_data as two independent chains would be a different program: a
+     * segment with a bad sequence number would still update the receive window,
+     * and in the donor it does not.
+     */
+    tcp_ack     -> { proc_ack, proc_fast_retransmit, proc_window, proc_rtt };
+    tcp_data    -> { proc_seq, proc_ooo, proc_recv };
 }

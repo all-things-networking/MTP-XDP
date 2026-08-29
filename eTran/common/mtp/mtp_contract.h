@@ -92,8 +92,6 @@ void mtp_set_rate(void *ctx, __u32 rate);
  */
 void mtp_ev_key(void *ev, mtp_ctx_kind_t kind, const void *key);
 
-/* ---- blueprint ----------------------------------------------------------- */
-void *mtp_bp_extract(void *pkt);
 
 /* ---- clock --------------------------------------------------------------- */
 __u64 mtp_now(void);
@@ -162,6 +160,15 @@ void mtp_ev_add(struct mtp_ev_list *out, void *ev);
  */
 struct mtp_pkt { void *data; __u32 len; __u32 qid; };
 typedef struct mtp_pkt pkt_t;
+
+/* ---- blueprint -------------------------------------------------------------
+ * The target reads the fixed header into the blueprint the compiler declared and
+ * fills its option frame. It is handed a size because the blueprint's shape is
+ * the PROGRAM's, and the target must not have an opinion about it.
+ */
+void mtp_bp_read(const struct mtp_pkt *p, void *bp, __u32 size,
+                 struct mtp_opt *opts, __u8 *opts_n, __u8 opts_cap);
+
 
 #ifdef __cplusplus
 }
