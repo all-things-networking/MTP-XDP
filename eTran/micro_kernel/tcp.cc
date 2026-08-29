@@ -22,8 +22,11 @@ extern class eTranTCP *etran_tcp;
 
 uint64_t next_tcp_cc_to_tsc = UINT64_MAX;
 // TODO: configure these parameters
-const unsigned int TCP_HANDSHAKE_TIMEOUT = 50; // ms
-const unsigned int TCP_CLOSE_TIMEOUT = 100;    // ms
+/* The handshake and close timeouts are MTP `param` declarations and now live
+ * with the program, in mtp/tcp_program.h. Named here so the not-yet-ported
+ * control-loop code still reads as it did. */
+using tcp_prog::TCP_HANDSHAKE_TIMEOUT;
+using tcp_prog::TCP_CLOSE_TIMEOUT;
 
 // this map includes all TCP connections of all states except for CONN_WAIT_RX_SYN
 std::unordered_map<struct flow_tuple, struct tcp_connection *, flow_tuple_hash, flow_tuple_equal> tcp_connections;

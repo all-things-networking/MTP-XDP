@@ -76,6 +76,17 @@ void notify_app_tcp_status_bind(struct app_ctx_per_thread *tctx, opaque_ptr c, i
 namespace tcp_prog {
 
 /* ------------------------------------------------------------------ *
+ * param uint32 tcp_handshake_timeout(50);   // ms
+ * param uint32 tcp_close_timeout(100);      // ms
+ *
+ * MTP `param` declarations (paper §5): constants the program names, which the
+ * compiler emits and the target never interprets. They lived in tcp.cc as file
+ * -scope consts; a program's parameters belong to the program.
+ * ------------------------------------------------------------------ */
+const unsigned int TCP_HANDSHAKE_TIMEOUT = 50;
+const unsigned int TCP_CLOSE_TIMEOUT = 100;
+
+/* ------------------------------------------------------------------ *
  * flow_id tcp_fid : (uint32, uint16, uint32, uint16)
  *
  * Emitted as an alias of eTran's flow_tuple rather than as a fresh struct,
