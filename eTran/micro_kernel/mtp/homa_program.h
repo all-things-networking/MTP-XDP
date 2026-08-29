@@ -37,6 +37,8 @@ void notify_app_homa_status_bind(struct app_ctx_per_thread *tctx, opaque_ptr s, 
 /* Homa's own eBPF registration. Protocol-specific, so it is the program that
  * calls it, exactly as TCP's reg_tcp_conn_ebpf is. */
 int reg_homa_socket_ebpf(struct app_ctx_per_thread *tctx, uint16_t port);
+void unreg_homa_socket_ebpf(uint16_t port);
+void notify_app_homa_status_close(struct app_ctx_per_thread *tctx, opaque_ptr s, int fd, int32_t status);
 
 namespace homa_prog {
 
@@ -87,6 +89,9 @@ struct app_bind : app_event {
     uint32_t local_ip;
     uint16_t local_port;
 };
+
+/* event app_close : app_event { } */
+struct app_close : app_event {};
 
 static inline void sock_bind(struct app_ctx_per_thread *tctx,
                              const struct appout_homa_bind_t *op,
@@ -142,6 +147,40 @@ static inline int proc_bind(const app_bind &ev, const homa_sid &sid)
 
     notify_app_homa_status_bind(ev.tctx, ctx->opaque_socket, ctx->fd, 0);
     return 0;
+}
+
+/*
+ * void proc_close(app_close ev, homa_ctx ctx)
+ *
+ * The other end of the lifecycle, and it exercises the part of the store
+ * app_bind did not: unbind. Homa has no kref and no release hook -- where TCP's
+ * close drops a reference and lets the hook do the teardown, this one unbinds
+ * and frees directly. The store is the same store; only the program differs.
+ */
+static inline int proc_close(const app_close &ev)
+{
+    opaque_ptr h = ev.handle;
+    struct homa_socket *ctx = ctxs().find_if(
+        [h](const struct homa_socket *s) { return s->opaque_socket == h; });
+    if (!ctx)
+        return -ENOENT;
+
+    /* del_ctx: unbind, then the protocol's own teardown. */
+    ctxs().unbind(ctx);
+    unreg_homa_socket_ebpf(ctx->local_port);
+    unrecord_port(ev.tctx->actx, ctx->local_port);
+    free_port(ctx->local_port);
+
+    notify_app_homa_status_close(ev.tctx, ev.handle, ctx->fd, 0);
+    delete ctx;
+    return 0;
+}
+
+static inline void dispatch_app_close(struct app_ctx_per_thread *tctx, opaque_ptr handle)
+{
+    app_close ev;
+    ev.tctx = tctx; ev.handle = handle; ev.fd = -1;
+    proc_close(ev);
 }
 
 static inline void dispatch_app_bind(struct app_ctx_per_thread *tctx,

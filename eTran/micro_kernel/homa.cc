@@ -707,7 +707,8 @@ static inline void reg_homa_socket_slowpath(struct homa_socket *s)
     homa_sockets.insert(std::make_pair(s->local_port, s));
 }
 
-static inline void unreg_homa_socket_slowpath(struct homa_socket *s)
+/* unused since app_close was ported; the store's unbind replaces it. */
+__attribute__((unused)) static inline void unreg_homa_socket_slowpath(struct homa_socket *s)
 {
     for (auto it = homa_sockets.begin(); it != homa_sockets.end(); it++)
     {
@@ -724,27 +725,12 @@ static inline void unreg_homa_socket_slowpath(struct homa_socket *s)
  * SAME target the TCP program uses.
  */
 
+/*
+ * homa_close() is GONE -- ported to MTP shape in mtp/homa_program.h.
+ */
 int homa_close(struct app_ctx_per_thread *tctx, opaque_ptr opaque_socket)
 {
-    struct homa_socket *s;
-
-    s = find_homa_socket_slowpath(opaque_socket);
-
-    if (!s)
-        return -ENOENT;
-
-    unreg_homa_socket_slowpath(s);
-
-    unreg_homa_socket_ebpf(s->local_port);
-
-    unrecord_port(tctx->actx, s->local_port);
-
-    free_port(s->local_port);
-
-    notify_app_homa_status_close(tctx, opaque_socket, s->fd, 0);
-
-    delete s;
-
+    homa_prog::dispatch_app_close(tctx, opaque_socket);
     return 0;
 }
 
