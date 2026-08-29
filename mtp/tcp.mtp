@@ -311,6 +311,23 @@ context tcp_ctx {
  * instance, so this is the one place the program cannot be written as the
  * language describes. [GAP: REUSEPORT]
  */
+/*
+ * A HELD SYN. Everything the shared passive-open tail reads, captured when the
+ * SYN arrives and decoded later -- which is the donor's own order, and the only
+ * order that works: on the accept() path the event is an app_accept and the SYN
+ * is long gone.
+ */
+struct pending_syn {
+    uint32 seq;
+    uint16 sport, dport;
+    uint32 local_ip, remote_ip;
+    uint32 ts_val;
+    bool   has_ts, has_mss;
+    bool   ece, cwr;
+    uint32 qid;
+    bool   valid;
+}
+
 context tcp_listen_ctx {
     tcp_lid key;
 
@@ -321,7 +338,13 @@ context tcp_listen_ctx {
                                  * held SYNs -- NOT the queue of completed
                                  * connections, which holds exactly one. */
     uint32 pending_n;
-    tcp_fid pending[PROG_MAX_BACKLOG];
+    /* THE QUEUE HOLDS THE SYN, NOT A FLOW ID. It used to hold a tcp_fid, which
+     * threw away everything proc_passive_open needs -- the sequence number, the
+     * timestamp, the queue it arrived on, whether ECN was offered -- and then
+     * read those fields off an `ev` that, on the accept() path, is an app_accept
+     * carrying none of them. The donor is explicit about this: it copies the raw
+     * SYN into the backlog and decodes it at passive-open time. */
+    pending_syn pending[PROG_MAX_BACKLOG];
 
     /* The completed connection waiting for accept(). Capacity ONE, whatever
      * pending_cap says. */
@@ -694,39 +717,49 @@ void gen_syn(app_connect ev, tcp_ctx ctx) {
  *
  * This is where the context accept() created without an identity gets one.
  */
-void proc_passive_open(tcp_syn ev, tcp_listen_ctx lst, tcp_ctx ctx) {
+/*
+ * THE EVENT IS `event_t`, DELIBERATELY. This processor is the tail that tcp_syn
+ * and app_accept share, and those two carry different fields -- app_accept has
+ * only a port. Naming either concrete type here is a claim the other cannot
+ * satisfy; it read `ev.seq` off an app_accept until the link check made the
+ * dispatch compile. Everything it needs comes from the queue.
+ */
+void proc_passive_open(event_t ev, tcp_listen_ctx lst, tcp_ctx ctx) {
+    pending_syn syn;
+
     if (!lst.has_accepted) {
-        /* No accept waiting: hold the SYN. A backlog that is full DROPS it --
-         * silently, and not with a reset. */
-        if (lst.pending_n >= lst.pending_cap)
+        /* No accept waiting: the SYN stays queued. proc_syn_queue already put
+         * it there, so there is nothing to do but tell the application. */
+        if (lst.pending_n == 0)
             return;
-        lst.pending[lst.pending_n] = tcp_fid(ev.remote_ip, ev.sport,
-                                             ev.local_ip, ev.dport);
-        lst.pending_n = lst.pending_n + 1;
         notify(lst, NEW_CONN);
         return;
     }
 
+    if (lst.pending_n == 0)
+        return;                       /* accept() waiting, no SYN yet */
+    syn = lst.pending[0];
+
     /* The options are re-parsed HERE, not when the SYN arrived: the donor
      * copies 256 raw bytes into the backlog and decodes them at this point,
      * which is why MSS and the timestamp are read later than received. */
-    if (!ev.has_ts || !ev.has_mss)
+    if (!syn.has_ts || !syn.has_mss)
         return;
 
-    ctx.qid         = ev.qid;
+    ctx.qid         = syn.qid;
     ctx.type        = TYPE_NORMAL;
-    ctx.local_ip    = ev.local_ip;
-    ctx.local_port  = ev.dport;
-    ctx.remote_ip   = ev.remote_ip;
-    ctx.remote_port = ev.sport;
-    ctx.rx_next_seq = ev.seq + 1;
+    ctx.local_ip    = syn.local_ip;
+    ctx.local_port  = syn.dport;
+    ctx.remote_ip   = syn.remote_ip;
+    ctx.remote_port = syn.sport;
+    ctx.rx_next_seq = syn.seq + 1;
     ctx.tx_next_seq = PARITY_ISN_PASSIVE;
-    ctx.syn_ts      = ev.ts_val;
+    ctx.syn_ts      = syn.ts_val;
 
     /* The OFFER is ECE and CWR together. The active side treats ECE ALONE as
      * the acceptance -- the two sides test different things and both are
      * right. */
-    if (ev.ece && ev.cwr)
+    if (syn.ece && syn.cwr)
         ctx.ecn_enable = true;
 
     /* Only now is the context addressable by its id. */
@@ -735,6 +768,43 @@ void proc_passive_open(tcp_syn ev, tcp_listen_ctx lst, tcp_ctx ctx) {
 
     ctx.state = CONN_WAIT_TX_SYNACK;
     lst.has_accepted = false;
+
+    /* THE SYN IS SPENT. Both halves of the rendezvous are consumed together --
+     * leaving it queued would hand the same SYN to the next accept(). */
+    uint32 i = 0;
+    while (i + 1 < lst.pending_n) {
+        lst.pending[i] = lst.pending[i + 1];
+        i = i + 1;
+    }
+    lst.pending_n = lst.pending_n - 1;
+}
+
+/*
+ * The tcp_syn half of the rendezvous: hold the SYN so the shared tail can read
+ * it, whether the accept() has already arrived or comes later. A full backlog
+ * DROPS it -- silently, and not with a reset, which is the donor's behaviour.
+ */
+void proc_syn_queue(tcp_syn ev, tcp_listen_ctx lst) {
+    pending_syn syn;
+
+    if (lst.pending_n >= lst.pending_cap)
+        return;
+
+    syn.seq       = ev.seq;
+    syn.sport     = ev.sport;
+    syn.dport     = ev.dport;
+    syn.local_ip  = ev.local_ip;
+    syn.remote_ip = ev.remote_ip;
+    syn.ts_val    = ev.ts_val;
+    syn.has_ts    = ev.has_ts;
+    syn.has_mss   = ev.has_mss;
+    syn.ece       = ev.ece;
+    syn.cwr       = ev.cwr;
+    syn.qid       = ev.qid;
+    syn.valid     = true;
+
+    lst.pending[lst.pending_n] = syn;
+    lst.pending_n = lst.pending_n + 1;
 }
 
 /*
@@ -743,7 +813,9 @@ void proc_passive_open(tcp_syn ev, tcp_listen_ctx lst, tcp_ctx ctx) {
  * live from this moment, which is why a retransmitted SYN later cannot be told
  * from a new one.
  */
-void gen_synack(tcp_syn ev, tcp_ctx ctx) {
+/* `event_t`, because tcp_syn and app_accept both end here -- and it reads
+ * nothing off the event anyway: a SYN-ACK is built entirely from the context. */
+void gen_synack(event_t ev, tcp_ctx ctx) {
     if (ctx.state != CONN_WAIT_TX_SYNACK)
         return;
 
@@ -1071,7 +1143,7 @@ dispatch tcp_dispatch {
     app_send    -> { record_data };
     app_recv    -> { proc_drain };
 
-    tcp_syn     -> { proc_passive_open, gen_synack };
+    tcp_syn     -> { proc_syn_queue, proc_passive_open, gen_synack };
     tcp_synack  -> { proc_synack };
     tcp_rst     -> { proc_rst };
     tcp_fin     -> { proc_fin };
