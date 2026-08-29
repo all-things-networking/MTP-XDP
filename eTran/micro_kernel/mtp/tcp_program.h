@@ -42,10 +42,14 @@ void notify_app_tcp_conn_open(struct app_ctx_per_thread *tctx, opaque_ptr c, int
 int alloc_port(void);
 extern class eTranTCP *etran_tcp;
 extern std::list<struct tcp_connection *> tcp_handshake_list;
+/* Declared to match the DEFINITION at tcp.cc:554, which takes 12 arguments.
+ * Note tcp.cc:67 forward-declares an 11-argument overload of the same name, with
+ * no `newfd`, that is never defined -- a pre-existing inconsistency in the donor.
+ * Copying that one links against nothing. */
 void notify_app_tcp_event_accept(struct app_ctx_per_thread *tctx, opaque_ptr c, int fd, int newfd,
-                                 int32_t status, uint32_t remote_ip, uint16_t remote_port,
-                                 uint32_t local_ip, uint16_t local_port, uint32_t qid,
-                                 uint64_t rx_base, uint64_t tx_base);
+                                 int32_t status, uint32_t rx_buf_size, uint32_t tx_buf_size,
+                                 uint32_t local_ip, uint32_t remote_ip, uint16_t remote_port,
+                                 uint32_t qid, bool backlog);
 /* The shared suffix of tcp_syn and app_accept: matches a queued SYN against a
  * waiting accept. NOT ported yet -- it belongs with the handshake events -- so it
  * is called here as the donor calls it, and lost its `static` to allow that. */
