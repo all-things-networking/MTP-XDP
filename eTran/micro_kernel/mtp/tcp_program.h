@@ -14,7 +14,7 @@
  * is TCP's key at compile time.
  *
  * Ported so far:  app_bind, app_listen, app_connect, app_accept, tcp_syn
- *                 (and with it the network demux).
+ *                 (and with it the network demux), tcp_synack.
  * Everything else is still eTran's original code in tcp.cc, on purpose -- one
  * event at a time, each built and measured before the next.
  */
@@ -63,6 +63,9 @@ void tcp_connection_pkt(struct tcp_connection *c, struct pkt_tcp *p, uint32_t qi
                         struct tcp_opts *opts);
 void send_tcp_reset(struct app_ctx *actx, const struct pkt_tcp *orig_p);
 int parse_tcp_opts(struct pkt_tcp *p, struct tcp_opts *opts);
+void send_tcp_control(struct tcp_connection *c, uint8_t flags, int ts_opt, uint32_t ts_echo,
+                      uint16_t mss_opt);
+int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen);
 int alloc_port(uint16_t port);
 int record_port(struct app_ctx *actx, uint16_t local_port, uint16_t remote_port);
 /* eTran's per-context release hook; no longer static in tcp.cc so that a
@@ -178,6 +181,15 @@ struct net_event {
 };
 
 struct tcp_syn : net_event {};
+
+/*
+ * event tcp_synack : net_event { ... }
+ *
+ * Also carries the packet. The doc's processors omit `ctx.qid = ev.qid`, which
+ * eTran does in tcp_connection_pkt before dispatching -- a state write, not
+ * bookkeeping: qid is the NIC queue the connection's eBPF state is keyed to.
+ */
+struct tcp_synack : net_event {};
 
 /* The target's app_event base: which application thread made the call, and the
  * handles it will be answered on. Not protocol state -- MTP has no type for a
@@ -642,6 +654,86 @@ static inline void proc_backlog(const tcp_syn &ev, struct tcp_listener *lst)
         tcp_listener_accept(lst);
 }
 
+/*
+ * void proc_synack(tcp_synack ev, tcp_ctx ctx)
+ *
+ * The doc splits this into proc_synack / open_ctx / notify_connect / gen_ack.
+ * Two notes where it does not match the code:
+ *
+ *  - `open_ctx` is written as `new_ctx(tcp_fid(...))`, but the context already
+ *    exists -- proc_connect made it. What happens here is that its eBPF halves
+ *    (classes a and b) are created. In MTP there is ONE context, so a program
+ *    cannot say "new_ctx" twice for it; the storage split is the target's.
+ *  - `ctx.qid = ev.qid` is missing from the doc entirely.
+ *
+ * The ORDER is the unusual part and is preserved exactly: the eBPF state is
+ * registered and the application is told the connection is open BEFORE the third
+ * ACK is emitted. By the time that ACK leaves, connect() has already returned
+ * and the fast path is live.
+ */
+static inline int proc_synack(const tcp_synack &ev, struct tcp_connection *ctx)
+{
+    struct pkt_tcp *p = ev.pkt;
+    const uint32_t ecn_flags = TCPH_FLAGS(&p->tcp) & (TCP_ECE | TCP_CWR);
+
+    /* The NIC queue this connection's eBPF state will be keyed to. */
+    ctx->qid = ev.qid;
+
+    /* timer_stop(handshake) */
+    ctx->next_timeout_tsc = 0;
+
+    bool ok = true;
+    if ((TCPH_FLAGS(&p->tcp) & (TCP_SYN | TCP_ACK)) != (TCP_SYN | TCP_ACK)) {
+        fprintf(stderr, "proc_synack: unexpected flags %x\n", TCPH_FLAGS(&p->tcp));
+        ok = false;
+    } else if (ev.opts->ts == nullptr) {
+        fprintf(stderr, "proc_synack: no timestamp option received\n");
+        ok = false;
+    }
+
+    if (ok) {
+        memcpy(ctx->local_mac, (uint8_t *)p->eth.dest.addr, ETH_ALEN);
+        memcpy(ctx->remote_mac, (uint8_t *)p->eth.src.addr, ETH_ALEN);
+        ctx->remote_seq = ntohl(p->tcp.seqno) + 1;
+        /* NOT +1: the SYN's octet is already counted in the peer's ack. */
+        ctx->local_seq  = ntohl(p->tcp.ackno);
+        ctx->syn_ts     = ntohl(ev.opts->ts->ts_val);
+
+        /* ECE alone means the peer accepted ECN; ECE|CWR is the offer, not the
+         * acceptance. */
+        if (ecn_flags == TCP_ECE)
+            ctx->flags |= ECN_ENABLE;
+
+        /* open_ctx: the eBPF halves of this context come into existence here. */
+        if (reg_tcp_conn_ebpf(ctx, false)) {
+            fprintf(stderr, "proc_synack: failed to register connection\n");
+            ok = false;
+        }
+    }
+
+    if (!ok) {
+        /* Undo every field this processor wrote, and rearm the handshake timer
+         * so the SYN is retried. */
+        memset(ctx->local_mac, 0, ETH_ALEN);
+        memset(ctx->remote_mac, 0, ETH_ALEN);
+        ctx->remote_seq = 0;
+        ctx->local_seq  = 0;
+        ctx->syn_ts     = 0;
+        ctx->flags      = 0;
+        ctx->next_timeout_tsc = get_cycles() + us_to_cycles(TCP_HANDSHAKE_TIMEOUT * 1000);
+        return -1;
+    }
+
+    ctx->status = CONN_OPEN;
+
+    /* notify(ctx, CONN_OPEN) -- status 1, the SECOND notification connect() gets. */
+    notify_app_tcp_conn_open(ctx->tctx, ctx->opaque_connection, ctx->fd, 1, ctx);
+
+    /* gen_ack: the third ACK, after the two above. */
+    send_tcp_control(ctx, TCP_ACK, 1, ctx->syn_ts, 0);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ *
  * dispatch tcp_dispatch { app_bind -> { proc_bind }; app_listen -> { proc_listen };
  *                         app_connect -> { proc_connect, gen_syn };
@@ -721,7 +813,18 @@ static inline int dispatch_net(struct app_ctx *actx, struct pkt_tcp *p, uint32_t
 
     /* An established connection owns the packet if one exists under its id. */
     if (struct tcp_connection *ctx = ctxs().get_ctx(tcp_fid_of_pkt(p))) {
-        tcp_connection_pkt(ctx, p, qid, &opts);   /* not ported yet */
+        /* Which event this is, is decided HERE rather than inside the
+         * connection handler -- that is the event-first shape. Only the
+         * SYN-ACK arm is ported so far; the rest still go to eTran's
+         * state-then-flags cascade. */
+        if (ctx->status == CONN_WAIT_RX_SYNACK) {
+            tcp_synack ev;
+            ev.pkt = p; ev.opts = &opts; ev.qid = qid;
+            if (proc_synack(ev, ctx))
+                fprintf(stderr, "proc_synack() failed\n");
+            return 0;
+        }
+        tcp_connection_pkt(ctx, p, qid, &opts);   /* remaining arms, not ported */
         return 0;
     }
 

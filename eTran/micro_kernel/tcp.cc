@@ -115,14 +115,15 @@ static void _tcp_connection_close(struct tcp_connection *c, enum connection_stat
  * hook, the way the donor's tcp_bind did inline. */
 void tcp_connection_close(struct kref *ref);
 
-static int tcp_synack_pkt(struct tcp_connection *c, struct pkt_tcp *p, struct tcp_opts *opts);
 
 // This function is called when connection is not established
 /* not static: the generated network dispatch replies with it. */
 void send_tcp_reset(struct app_ctx *actx, const struct pkt_tcp *orig_p);
-static void send_tcp_control(struct tcp_connection *c, uint8_t flags, int ts_opt, uint32_t ts_echo, uint16_t mss_opt);
+/* not static: the generated proc_synack emits the third ACK with it. */
+void send_tcp_control(struct tcp_connection *c, uint8_t flags, int ts_opt, uint32_t ts_echo, uint16_t mss_opt);
 
-static int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen);
+/* not static: the generated proc_synack creates the eBPF halves of the context. */
+int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen);
 static void unreg_tcp_conn_ebpf(struct tcp_connection *c);
 
 
@@ -245,70 +246,11 @@ static inline void tcp_conn_put(struct tcp_connection *c)
     kref_put(&c->ref, c->release);
 }
 
-static int tcp_synack_pkt(struct tcp_connection *c, struct pkt_tcp *p, struct tcp_opts *opts)
-{
-    uint32_t ecn_flags = TCPH_FLAGS(&p->tcp) & (TCP_ECE | TCP_CWR);
-
-    /* stop timer */
-    c->next_timeout_tsc = 0;
-
-    /* check TCP flags */
-    if ((TCPH_FLAGS(&p->tcp) & (TCP_SYN | TCP_ACK)) != (TCP_SYN | TCP_ACK))
-    {
-        fprintf(stderr, "tcp_synack_pkt: unexpected flags %x\n",
-                TCPH_FLAGS(&p->tcp));
-        goto fail;
-    }
-
-    if (opts->ts == nullptr)
-    {
-        fprintf(stderr, "tcp_synack_pkt: no timestamp option received\n");
-        goto fail;
-    }
-
-    /* update connection state */
-    memcpy(c->local_mac, (uint8_t *)p->eth.dest.addr, ETH_ALEN);
-    memcpy(c->remote_mac, (uint8_t *)p->eth.src.addr, ETH_ALEN);
-    c->remote_seq = ntohl(p->tcp.seqno) + 1;
-    c->local_seq = ntohl(p->tcp.ackno);
-    c->syn_ts = ntohl(opts->ts->ts_val);
-
-    if (ecn_flags == TCP_ECE)
-    {
-        c->flags |= ECN_ENABLE;
-    }
-
-    /* add eBPF state */
-    if (reg_tcp_conn_ebpf(c, false))
-    {
-        fprintf(stderr, "tcp_synack_pkt: failed to register connection\n");
-        goto fail;
-    }
-
-    c->status = CONN_OPEN;
-
-    /* notify application connect() success */
-    notify_app_tcp_conn_open(c->tctx, c->opaque_connection, c->fd, 1, c);
-
-    /* send ACK */
-    send_tcp_control(c, TCP_ACK, 1, c->syn_ts, 0);
-
-    return 0;
-
-fail:
-    /* restore connection state */
-    memset(c->local_mac, 0, ETH_ALEN);
-    memset(c->remote_mac, 0, ETH_ALEN);
-    c->remote_seq = 0;
-    c->local_seq = 0;
-    c->syn_ts = 0;
-    c->flags = 0;
-
-    /* rearm a TCP handshake timer */
-    c->next_timeout_tsc = get_cycles() + us_to_cycles(TCP_HANDSHAKE_TIMEOUT * 1000);
-
-    return -1;
-}
+/*
+ * tcp_synack_pkt() is GONE -- ported as proc_synack in mtp/tcp_program.h,
+ * event 6 (tcp_synack). The qid write that tcp_connection_pkt did just before
+ * calling it went with it: it is a state write the event owns.
+ */
 
 void send_tcp_reset(struct app_ctx *actx, const struct pkt_tcp *orig_p)
 {
@@ -354,7 +296,7 @@ void send_tcp_reset(struct app_ctx *actx, const struct pkt_tcp *orig_p)
     return;
 }
 
-static void send_tcp_control(struct tcp_connection *c, uint8_t flags, int ts_opt, uint32_t ts_echo, uint16_t mss_opt)
+void send_tcp_control(struct tcp_connection *c, uint8_t flags, int ts_opt, uint32_t ts_echo, uint16_t mss_opt)
 {
     struct app_ctx *actx = c->tctx->actx;
     struct pkt_tcp *p;
@@ -467,7 +409,7 @@ static void unreg_tcp_conn_ebpf(struct tcp_connection *c)
     return;
 }
 
-static int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen)
+int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen)
 {
     struct ebpf_flow_tuple key = {0};
     struct bpf_tcp_conn ebpf_c = {0};
@@ -770,16 +712,8 @@ void tcp_listener_accept(struct tcp_listener *l)
 void tcp_connection_pkt(struct tcp_connection *c, struct pkt_tcp *p, uint32_t qid, struct tcp_opts *opts)
 {
     uint32_t ecn_flags = 0;
-    if (c->status == CONN_WAIT_RX_SYNACK)
-    {
-        c->qid = qid;
-        if (tcp_synack_pkt(c, p, opts))
-        {
-            /* this is not our expected SYN-ACK packet */
-            fprintf(stderr, "tcp_synack_pkt() failed\n");
-        }
-        return;
-    }
+    /* The CONN_WAIT_RX_SYNACK arm is GONE -- it is the tcp_synack event, raised
+     * by the generated dispatch before this function is reached. */
     if (c->status == CONN_OPEN && ((TCPH_FLAGS(&p->tcp) & ~ecn_flags) == TCP_SYN))
     {
         /* handle re-transmitted SYN for dropped SYN-ACK */
