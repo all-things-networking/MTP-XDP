@@ -131,9 +131,6 @@ static void unreg_tcp_conn_ebpf(struct tcp_connection *c);
 
 
 
-/* not static: called by the generated network dispatch until tcp_ack/tcp_data
- * are ported. */
-void tcp_connection_pkt(struct tcp_connection *c, struct pkt_tcp *p, uint32_t qid, struct tcp_opts *opts);
 
 
 int parse_tcp_opts(struct pkt_tcp *p, struct tcp_opts *opts)
@@ -646,50 +643,11 @@ void notify_app_tcp_status_close(struct app_ctx_per_thread *tctx, opaque_ptr c, 
  * place where the context accept() created without an identity finally gets one.
  */
 
-void tcp_connection_pkt(struct tcp_connection *c, struct pkt_tcp *p, uint32_t qid, struct tcp_opts *opts)
-{
-    uint32_t ecn_flags = 0;
-    /* The CONN_WAIT_RX_SYNACK arm is GONE -- it is the tcp_synack event, raised
-     * by the generated dispatch before this function is reached. */
-    if (c->status == CONN_OPEN && ((TCPH_FLAGS(&p->tcp) & ~ecn_flags) == TCP_SYN))
-    {
-        /* handle re-transmitted SYN for dropped SYN-ACK */
-        /* TODO: should only do this if we're still waiting for initial ACK,
-         * otherwise we should send a challenge ACK */
-        if (opts->ts == nullptr)
-        {
-            fprintf(stderr, "tcp_connection_pkt: re-transmitted SYN does not have TS "
-                            "option\n");
-            tcp_conn_put(c);
-            return;
-        }
-
-        /* send ECN accepting SYN-ACK */
-        if (c->flags & ECN_ENABLE)
-        {
-            ecn_flags = TCP_ECE;
-        }
-
-        send_tcp_control(c, TCP_SYN | TCP_ACK | ecn_flags, 1, htonl(opts->ts->ts_val), TCP_MSS);
-        return;
-    }
-    if (c->status == CONN_OPEN && ((TCPH_FLAGS(&p->tcp) & TCP_SYN)))
-    {
-        /* silently ignore a re-transmited SYN_ACK */
-        return;
-    }
-
-    /* The RST arm is GONE -- it is the tcp_rst event, raised by the generated
-     * dispatch before this function is reached. */
-
-    if (c->status == CONN_CLOSED && (TCPH_FLAGS(&p->tcp) & TCP_FIN))
-    {
-        /* silently ignore a FIN for an already closed connection: TODO figure out
-         * why necessary*/
-        send_tcp_control(c, TCP_ACK, 1, 0, 0);
-        return;
-    }
-}
+/*
+ * tcp_connection_pkt() is GONE. Its state-then-flags cascade WAS the demux, and
+ * the demux is now the generated dispatch: every arm became an event chosen
+ * before any processor runs. See dispatch_net in mtp/tcp_program.h.
+ */
 
 /*
  * tcp_listener_pkt() is GONE -- ported as proc_backlog in mtp/tcp_program.h,

@@ -16,7 +16,8 @@
  * Ported so far:  app_bind, app_listen, app_connect, app_accept, tcp_syn
  *                 (and with it the network demux), tcp_synack,
  *                 tcp_rst, gen_syn / gen_synack (the deferred generation),
- *                 app_close, the three timer events, and proc_passive_open.
+ *                 app_close, the three timer events, proc_passive_open, and
+ *                 the remaining connection-packet arms (tcp_fin among them).
  * Everything else is still eTran's original code in tcp.cc, on purpose -- one
  * event at a time, each built and measured before the next.
  */
@@ -63,10 +64,6 @@ void notify_app_tcp_event_accept(struct app_ctx_per_thread *tctx, opaque_ptr c, 
 
 void notify_app_tcp_event_newconn(struct app_ctx_per_thread *tctx, opaque_ptr l, int fd,
                                   uint32_t remote_ip, uint16_t remote_port);
-/* Still eTran's, both un-static'd so the generated demux can reach them: the
- * established-connection path and the RST reply are later events. */
-void tcp_connection_pkt(struct tcp_connection *c, struct pkt_tcp *p, uint32_t qid,
-                        struct tcp_opts *opts);
 void send_tcp_reset(struct app_ctx *actx, const struct pkt_tcp *orig_p);
 int parse_tcp_opts(struct pkt_tcp *p, struct tcp_opts *opts);
 void send_tcp_control(struct tcp_connection *c, uint8_t flags, int ts_opt, uint32_t ts_echo,
@@ -219,6 +216,17 @@ struct tcp_synack : net_event {};
 
 /* event tcp_rst : net_event { } */
 struct tcp_rst : net_event {};
+
+/*
+ * event tcp_fin : net_event { }
+ *
+ * docs/eTran/README.md says "eTran neither sends nor processes a FIN". IT
+ * PROCESSES ONE: a FIN arriving on a closed connection is answered with an ACK
+ * (donor tcp_connection_pkt). It never SENDS one, which is the true half of the
+ * claim -- close() emits a RST instead. A program written from that sentence
+ * would drop an arm that exists.
+ */
+struct tcp_fin : net_event {};
 
 /* The target's app_event base: which application thread made the call, and the
  * handles it will be answered on. Not protocol state -- MTP has no type for a
@@ -863,6 +871,44 @@ static inline int proc_synack(const tcp_synack &ev, struct tcp_connection *ctx)
 }
 
 /*
+ * void proc_syn_retransmit(tcp_syn ev, tcp_ctx ctx)
+ *
+ * A SYN arriving on a connection that is already OPEN: the peer did not get our
+ * SYN-ACK. eTran answers with another one. Note the donor's own TODO -- it should
+ * only do this while still waiting for the initial ACK and send a challenge ACK
+ * otherwise; it does not, because gen_synack marked the connection OPEN without
+ * ever waiting for that ACK.
+ */
+static inline void proc_syn_retransmit(const tcp_syn &ev, struct tcp_connection *ctx)
+{
+    struct pkt_tcp *p = ev.pkt;
+
+    if (ev.opts->ts == nullptr) {
+        fprintf(stderr, "proc_syn_retransmit: re-transmitted SYN has no TS option\n");
+        kref_put(&ctx->ref, ctx->release);      /* del_ctx */
+        return;
+    }
+
+    uint32_t ecn_flags = (ctx->flags & ECN_ENABLE) ? TCP_ECE : 0;
+    send_tcp_control(ctx, TCP_SYN | TCP_ACK | ecn_flags, 1,
+                     htonl(ev.opts->ts->ts_val), TCP_MSS);
+    (void)p;
+}
+
+/*
+ * void proc_fin(tcp_fin ev, tcp_ctx ctx)
+ *
+ * A FIN on an already-closed connection, answered with a bare ACK. The donor's
+ * comment is "TODO figure out why necessary". Kept exactly, including the
+ * puzzlement: this is the arm the README says does not exist.
+ */
+static inline void proc_fin(const tcp_fin &ev, struct tcp_connection *ctx)
+{
+    (void)ev;
+    send_tcp_control(ctx, TCP_ACK, 1, 0, 0);
+}
+
+/*
  * void proc_rst(tcp_rst ev, tcp_ctx ctx)
  *
  * notify_close then proc_teardown, the doc's two processors. Teardown is MTP's
@@ -1154,12 +1200,12 @@ static inline void dispatch_timers(void)
  * decides WHICH event a packet is, and the context is then found by the event's
  * flow id.
  *
- * What is written here is the honest middle: the context lookups are expressed
- * as the two stores' own operations, keyed by the ids the parser derives, and
- * the listening branch raises a real tcp_syn event. The connection branch still
- * calls eTran's tcp_connection_pkt, which does its own flag dispatch, because
- * tcp_ack / tcp_data / tcp_synack / tcp_rst are not ported yet. When they are,
- * that call disappears and the parser raises those events directly.
+ * The context lookups are the two stores' own operations, keyed by the ids the
+ * parser derives, and every branch now raises a real event: tcp_syn to a
+ * listening context, and on an established one tcp_synack, tcp_rst, a
+ * retransmitted tcp_syn, or tcp_fin, chosen by status and flags BEFORE any
+ * processor runs. eTran's tcp_connection_pkt is gone -- its state-then-flags
+ * cascade was the demux, and the demux is now the dispatch.
  */
 static inline int dispatch_net(struct app_ctx *actx, struct pkt_tcp *p, uint32_t qid)
 {
@@ -1186,7 +1232,25 @@ static inline int dispatch_net(struct app_ctx *actx, struct pkt_tcp *p, uint32_t
             proc_rst(ev, ctx);
             return 0;
         }
-        tcp_connection_pkt(ctx, p, qid, &opts);   /* remaining arms, not ported */
+        /* A SYN on an OPEN connection is a retransmission, not a new flow. The
+         * donor tested `(flags & ~ecn_flags) == TCP_SYN` with ecn_flags still
+         * zero at that point, so the mask did nothing: it is an exact-SYN test. */
+        if (ctx->status == CONN_OPEN && TCPH_FLAGS(&p->tcp) == TCP_SYN) {
+            tcp_syn ev;
+            ev.pkt = p; ev.opts = &opts; ev.qid = qid;
+            proc_syn_retransmit(ev, ctx);
+            return 0;
+        }
+        if (ctx->status == CONN_OPEN && (TCPH_FLAGS(&p->tcp) & TCP_SYN)) {
+            /* a retransmitted SYN-ACK: silently ignored, no processor */
+            return 0;
+        }
+        if (ctx->status == CONN_CLOSED && (TCPH_FLAGS(&p->tcp) & TCP_FIN)) {
+            tcp_fin ev;
+            ev.pkt = p; ev.opts = &opts; ev.qid = qid;
+            proc_fin(ev, ctx);
+            return 0;
+        }
         return 0;
     }
 
