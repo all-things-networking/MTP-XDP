@@ -46,12 +46,21 @@ const uint8  FLAG_CWR = 0x80;
  * accept() has created but no SYN has yet claimed -- the one state whose
  * contexts are deliberately NOT in the connection map.
  */
+/*
+ * THE DONOR'S VALUES, IN THE DONOR'S ORDER. These were 0,1,2,3,4,5 in the order
+ * they read best, which put CONN_WAIT_TX_SYN and CONN_WAIT_RX_SYNACK the wrong
+ * way round -- eTran's enum interleaves the accept() pair and the open() pair.
+ * A constant that does not match is invisible until a generated processor
+ * writes it into the donor's struct, and then the connect path is simply
+ * broken. Checked against runtime/tcp.h:98.
+ */
 const uint8  CONN_WAIT_RX_SYN    = 0;
 const uint8  CONN_WAIT_TX_SYNACK = 1;
-const uint8  CONN_WAIT_RX_SYNACK = 2;
-const uint8  CONN_WAIT_TX_SYN    = 3;
+const uint8  CONN_WAIT_TX_SYN    = 2;
+const uint8  CONN_WAIT_RX_SYNACK = 3;
 const uint8  CONN_OPEN           = 4;
 const uint8  CONN_CLOSED         = 5;
+const uint8  CONN_FAILED         = 6;
 
 /*
  * The KIND of a context, which eTran keeps separately from its state. A bound
@@ -60,8 +69,10 @@ const uint8  CONN_CLOSED         = 5;
  * ST_BOUND and ST_LISTEN do not exist in the donor, and earlier versions of the
  * event documents invented them for exactly the two events that have none.
  */
-const uint8  TYPE_FAKE   = 0;
-const uint8  TYPE_NORMAL = 1;
+/* Also the donor's, and also the other way round from what was written here:
+ * TCP_CONN_TYPE_NORMAL is 0 and TCP_CONN_TYPE_FAKE is 1 (runtime/tcp.h:255). */
+const uint8  TYPE_NORMAL = 0;
+const uint8  TYPE_FAKE   = 1;
 
 /* PARITY: both initial sequence numbers are constants and neither is
  * randomised. The active open sends 0, the passive open sends 1. Reproduce,
