@@ -24,7 +24,9 @@
 #include "prog_proc_control.h"
 #include "prog_proc_bpf.h"
 #include "prog_proc_app.h"
-#include "prog_dispatch.c"
+#include "prog_dispatch_control.c"
+#include "prog_dispatch_bpf.h"
+#include "prog_dispatch_app.h"
 #include <stdio.h>
 #include <string.h>
 

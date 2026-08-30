@@ -79,7 +79,7 @@ static __always_inline bool tcp_is_slow_path_event(const struct tcphdr *tcph)
  * ------------------------------------------------------------------ */
 #include "gen/prog.h"
 #include "gen/prog_proc_bpf.h"
-#include "gen/prog_dispatch.c"
+#include "gen/prog_dispatch_bpf.h"
 
 /*
  * The metadata the redirect needs, derived after the chain from the scratchpad
