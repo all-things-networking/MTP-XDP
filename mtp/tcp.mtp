@@ -395,6 +395,13 @@ scratchpad_t tcp_scratch {
     bool   clear_ooo;
     bool   drop;
     bool   seg_ok;
+    /* WHICH OOO THING HAPPENED. The target has to tell its data path apart --
+     * a segment held, a held interval discarded, a held interval delivered --
+     * and only the program knows which of the three it was. Everything else the
+     * target needs about this packet it can derive from the fields above and
+     * the state before the chain ran; these two it cannot. */
+    bool   ooo_seg;
+    bool   ooo_fin;
 }
 
 /**************************** the app parser ****************************/
@@ -1193,6 +1200,7 @@ void proc_ooo(tcp_data ev, tcp_ctx ctx, tcp_scratch s) {
     if (s.payload_len == 0)
         return;
 
+    s.ooo_seg = true;
     if (ctx.rx_ooo_len == 0) {
         ctx.rx_ooo_start = s.seq;
         ctx.rx_ooo_len = s.payload_len;
@@ -1282,6 +1290,7 @@ void proc_recv(tcp_data ev, tcp_ctx ctx, tcp_scratch s) {
                     ctx.rx_next_pos = ctx.rx_next_pos - ctx.rx_buf_size;
                 ctx.rx_next_seq = ctx.rx_next_seq + ctx.rx_ooo_len;
                 ctx.rx_ooo_len = 0;
+                s.ooo_fin = true;
             }
         }
     }
