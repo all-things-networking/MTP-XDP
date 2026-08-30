@@ -22,8 +22,8 @@ int main(void)
     tcp_ctx_init(c);
     c->key = fid;
 
-    printf("state after init      : %u  (CONN_WAIT_RX_SYN = %u)\n",
-           c->control.state, (unsigned)CONN_WAIT_RX_SYN);
+    printf("status after init      : %u  (CONN_WAIT_RX_SYN = %u)\n",
+           c->control.status, (unsigned)CONN_WAIT_RX_SYN);
 
     /* An ACK for data we never sent must be rejected, and the chain says so
      * through the scratchpad rather than by returning. */

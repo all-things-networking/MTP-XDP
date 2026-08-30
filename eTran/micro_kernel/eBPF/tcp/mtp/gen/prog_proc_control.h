@@ -235,7 +235,7 @@ static inline void proc_connect(struct app_connect *ev, struct tcp_ctx *ctx)
     ctx->control.type = TYPE_NORMAL;
     ctx->control.remote_ip = ev->remote_ip;
     ctx->control.remote_port = ev->remote_port;
-    ctx->control.state = CONN_WAIT_TX_SYN;
+    ctx->control.status = CONN_WAIT_TX_SYN;
     ctx->ebpf.rx_next_seq = 0;
     ctx->ebpf.tx_next_seq = PARITY_ISN_ACTIVE;
     ctx->control.syn_attempts = 0;
@@ -247,10 +247,10 @@ static inline void proc_connect(struct app_connect *ev, struct tcp_ctx *ctx)
 /* ---- gen_syn  [control]--------------------------------- */
 static inline void gen_syn(struct app_connect *ev, struct tcp_ctx *ctx)
 {
-    if (ctx->control.state != CONN_WAIT_TX_SYN) {
+    if (ctx->control.status != CONN_WAIT_TX_SYN) {
         return;
     }
-    ctx->control.state = CONN_WAIT_RX_SYNACK;
+    ctx->control.status = CONN_WAIT_RX_SYNACK;
     mtp_timer_start(&ctx->handshake_timer, ((__u64)(tcp_handshake_timeout) * 1000000ULL));
     struct TCPBP bp;
     bp.src_port = ctx->control.local_port;
@@ -292,11 +292,11 @@ static inline void proc_passive_open(void * ev, struct tcp_listen_ctx *lst, stru
     ctx->ebpf.tx_next_seq = PARITY_ISN_PASSIVE;
     ctx->control.syn_ts = syn.ts_val;
     if (syn.ece && syn.cwr) {
-        ctx->control.ecn_enable = true;
+        ctx->ebpf.ecn_enable = true;
     }
     struct tcp_fid fid = ctx->key;
     (struct tcp_ctx *)mtp_ctx_new(MTP_CTX_tcp_ctx, &fid);
-    ctx->control.state = CONN_WAIT_TX_SYNACK;
+    ctx->control.status = CONN_WAIT_TX_SYNACK;
     lst->has_accepted = false;
     __u32 i = 0;
     while (i + 1 < lst->pending_n) {
@@ -332,10 +332,10 @@ static inline void proc_syn_queue(struct tcp_syn *ev, struct tcp_listen_ctx *lst
 /* ---- gen_synack  [control]------------------------------ */
 static inline void gen_synack(void * ev, struct tcp_ctx *ctx)
 {
-    if (ctx->control.state != CONN_WAIT_TX_SYNACK) {
+    if (ctx->control.status != CONN_WAIT_TX_SYNACK) {
         return;
     }
-    ctx->control.state = CONN_OPEN;
+    ctx->control.status = CONN_OPEN;
     struct TCPBP bp;
     bp.src_port = ctx->control.local_port;
     bp.dst_port = ctx->control.remote_port;
@@ -343,7 +343,7 @@ static inline void gen_synack(void * ev, struct tcp_ctx *ctx)
     bp.ack_seq = ctx->ebpf.rx_next_seq;
     bp.window = PARITY_CTRL_WINDOW;
     bp.flags = FLAG_SYN | FLAG_ACK;
-    if (ctx->control.ecn_enable) {
+    if (ctx->ebpf.ecn_enable) {
         bp.flags = bp.flags | FLAG_ECE;
     }
     mtp_opt_add(bp.opts.opts, &bp.opts.opts_n, opt_mss(PARITY_MSS));
@@ -355,7 +355,7 @@ static inline void gen_synack(void * ev, struct tcp_ctx *ctx)
 /* ---- proc_synack  [control]----------------------------- */
 static inline void proc_synack(struct tcp_synack *ev, struct tcp_ctx *ctx)
 {
-    if (ctx->control.state != CONN_WAIT_RX_SYNACK) {
+    if (ctx->control.status != CONN_WAIT_RX_SYNACK) {
         return;
     }
     ctx->control.qid = ev->qid;
@@ -364,7 +364,7 @@ static inline void proc_synack(struct tcp_synack *ev, struct tcp_ctx *ctx)
         ctx->ebpf.rx_next_seq = 0;
         ctx->ebpf.tx_next_seq = 0;
         ctx->control.syn_ts = 0;
-        ctx->control.ecn_enable = false;
+        ctx->ebpf.ecn_enable = false;
         mtp_timer_start(&ctx->handshake_timer, ((__u64)(tcp_handshake_timeout) * 1000000ULL));
         return;
     }
@@ -372,9 +372,9 @@ static inline void proc_synack(struct tcp_synack *ev, struct tcp_ctx *ctx)
     ctx->ebpf.tx_next_seq = ev->ack;
     ctx->control.syn_ts = ev->ts_val;
     if (ev->ece && !ev->cwr) {
-        ctx->control.ecn_enable = true;
+        ctx->ebpf.ecn_enable = true;
     }
-    ctx->control.state = CONN_OPEN;
+    ctx->control.status = CONN_OPEN;
     mtp_notify(ctx, MTP_NOTIFY_CONN_OPEN_OK);
     struct TCPBP bp;
     bp.src_port = ctx->control.local_port;
@@ -398,7 +398,7 @@ static inline void proc_rst(struct tcp_rst *ev, struct tcp_ctx *ctx)
 /* ---- proc_fin  [control]-------------------------------- */
 static inline void proc_fin(struct tcp_fin *ev, struct tcp_ctx *ctx)
 {
-    if (ctx->control.state != CONN_CLOSED) {
+    if (ctx->control.status != CONN_CLOSED) {
         return;
     }
     struct TCPBP bp;
@@ -414,7 +414,7 @@ static inline void proc_fin(struct tcp_fin *ev, struct tcp_ctx *ctx)
 /* ---- proc_close  [control]------------------------------ */
 static inline void proc_close(struct app_close *ev, struct tcp_ctx *ctx)
 {
-    ctx->control.state = CONN_CLOSED;
+    ctx->control.status = CONN_CLOSED;
     struct TCPBP bp;
     bp.src_port = ctx->control.local_port;
     bp.dst_port = ctx->control.remote_port;

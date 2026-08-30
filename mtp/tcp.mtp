@@ -259,15 +259,18 @@ context tcp_ctx {
      */
     @placement("control") {
         uint8  type = TYPE_FAKE;
-        uint8  state = CONN_WAIT_RX_SYN;
+        /* `status`, WHICH IS THE DONOR'S NAME. It was `state`; a name that does
+         * not match is a rename at every swap, and the whole point of the
+         * placement groups is that a generated processor drops in beside the
+         * hand-written one -- which needs the field to be the same field. */
+        uint8  status = CONN_WAIT_RX_SYN;
         bool   reuseport;
         uint16 local_port, remote_port;
         uint32 local_ip, remote_ip;
         uint32 syn_ts;
         uint32 syn_attempts;
-        uint32 next_timeout;
+        uint64 next_timeout_tsc;   /* the donor's name, and a TSC needs 64 bits */
         uint32 qid;
-        bool   ecn_enable;
     }
 
     /*
@@ -281,6 +284,11 @@ context tcp_ctx {
          * donor keeps them in the map entry precisely because the fast path
          * needs them, and without the wrap the position walks off the ring. */
         uint32 rx_buf_size, tx_buf_size;
+        /* THE HEADER BUILDER READS IT, so it lives where the header is built.
+         * Placed on the control path first, which is where the socket option
+         * arrives -- but placement is about which memory holds it at run time,
+         * not about who first sets it. */
+        bool ecn_enable;
         uint32 rx_avail, rx_remote_avail;
         uint32 rx_next_pos, rx_next_seq;
         uint32 rx_dupack_cnt;
@@ -740,7 +748,7 @@ void proc_connect(app_connect ev, tcp_ctx ctx) {
     ctx.type        = TYPE_NORMAL;
     ctx.remote_ip   = ev.remote_ip;
     ctx.remote_port = ev.remote_port;
-    ctx.state       = CONN_WAIT_TX_SYN;
+    ctx.status       = CONN_WAIT_TX_SYN;
     ctx.rx_next_seq = 0;
     ctx.tx_next_seq = PARITY_ISN_ACTIVE;
     ctx.syn_attempts = 0;
@@ -760,10 +768,10 @@ void proc_connect(app_connect ev, tcp_ctx ctx) {
  * why this is a separate processor rather than the tail of proc_connect.
  */
 void gen_syn(app_connect ev, tcp_ctx ctx) {
-    if (ctx.state != CONN_WAIT_TX_SYN)
+    if (ctx.status != CONN_WAIT_TX_SYN)
         return;
 
-    ctx.state = CONN_WAIT_RX_SYNACK;
+    ctx.status = CONN_WAIT_RX_SYNACK;
     timer_start_instr(ctx.handshake_timer, millisecond(tcp_handshake_timeout));
 
     TCPBP bp;
@@ -835,7 +843,7 @@ void proc_passive_open(event_t ev, tcp_listen_ctx lst, tcp_ctx ctx) {
     tcp_fid fid = ctx.key;
     new_ctx_instr(fid);
 
-    ctx.state = CONN_WAIT_TX_SYNACK;
+    ctx.status = CONN_WAIT_TX_SYNACK;
     lst.has_accepted = false;
 
     /* THE SYN IS SPENT. Both halves of the rendezvous are consumed together --
@@ -885,10 +893,10 @@ void proc_syn_queue(tcp_syn ev, tcp_listen_ctx lst) {
 /* `event_t`, because tcp_syn and app_accept both end here -- and it reads
  * nothing off the event anyway: a SYN-ACK is built entirely from the context. */
 void gen_synack(event_t ev, tcp_ctx ctx) {
-    if (ctx.state != CONN_WAIT_TX_SYNACK)
+    if (ctx.status != CONN_WAIT_TX_SYNACK)
         return;
 
-    ctx.state = CONN_OPEN;
+    ctx.status = CONN_OPEN;
 
     TCPBP bp;
     bp.src_port = ctx.local_port;
@@ -914,7 +922,7 @@ void gen_synack(event_t ev, tcp_ctx ctx) {
  * returned and the fast path is running.
  */
 void proc_synack(tcp_synack ev, tcp_ctx ctx) {
-    if (ctx.state != CONN_WAIT_RX_SYNACK)
+    if (ctx.status != CONN_WAIT_RX_SYNACK)
         return;
 
     /* The NIC queue this connection's eBPF half will be keyed to. A state
@@ -942,7 +950,7 @@ void proc_synack(tcp_synack ev, tcp_ctx ctx) {
     if (ev.ece && !ev.cwr)
         ctx.ecn_enable = true;
 
-    ctx.state = CONN_OPEN;
+    ctx.status = CONN_OPEN;
     notify(ctx, CONN_OPEN_OK);
 
     TCPBP bp;
@@ -973,7 +981,7 @@ void proc_rst(tcp_rst ev, tcp_ctx ctx) {
  * the puzzlement. No FIN ever advances a connection here.
  */
 void proc_fin(tcp_fin ev, tcp_ctx ctx) {
-    if (ctx.state != CONN_CLOSED)
+    if (ctx.status != CONN_CLOSED)
         return;
 
     TCPBP bp;
@@ -992,7 +1000,7 @@ void proc_fin(tcp_fin ev, tcp_ctx ctx) {
  * resets the connection.
  */
 void proc_close(app_close ev, tcp_ctx ctx) {
-    ctx.state = CONN_CLOSED;
+    ctx.status = CONN_CLOSED;
 
     TCPBP bp;
     bp.src_port = ctx.local_port;
