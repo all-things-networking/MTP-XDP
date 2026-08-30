@@ -29,7 +29,7 @@ int main(void)
     struct tcp_scratch sp; __builtin_memset(&sp, 0, sizeof sp);
     struct tcp_ack a; __builtin_memset(&a, 0, sizeof a);
     a.ack = 5000; a.payload_len = 0;
-    mtp_dispatch_tcp_ack_ebpf(&a, c, &sp);
+    mtp_dispatch_tcp_ack_ebpf(&a, &c->ebpf, &c->cc_shared, &sp);
     printf("bogus ack accepted?   : tx_sent=%u (unchanged 0 = rejected)\n", c->ebpf.tx_sent);
 
     /* An in-order segment must advance the receive sequence. rx_buf_size is set
@@ -40,13 +40,13 @@ int main(void)
     struct tcp_data d; __builtin_memset(&d, 0, sizeof d);
     d.seq = 7000; d.payload_len = 1448;
     __builtin_memset(&sp, 0, sizeof sp);
-    mtp_dispatch_tcp_data_ebpf(&d, c, &sp);
+    mtp_dispatch_tcp_data_ebpf(&d, &c->ebpf, &sp);
     printf("in-order 1448 bytes   : rx_next_seq 7000 -> %u\n", c->ebpf.rx_next_seq);
 
     /* And the same segment again is a duplicate. */
     __u32 before = c->ebpf.rx_next_seq;
     __builtin_memset(&sp, 0, sizeof sp);
-    mtp_dispatch_tcp_data_ebpf(&d, c, &sp);
+    mtp_dispatch_tcp_data_ebpf(&d, &c->ebpf, &sp);
     printf("same segment again    : rx_next_seq %u -> %u\n", before, c->ebpf.rx_next_seq);
 
     /* A segment overlapping what was already delivered is TRIMMED, not refused:
@@ -56,7 +56,7 @@ int main(void)
     __builtin_memset(&sp, 0, sizeof sp);
     __builtin_memset(&d, 0, sizeof d);
     d.seq = 19600; d.payload_len = 1000;
-    mtp_dispatch_tcp_data_ebpf(&d, c, &sp);
+    mtp_dispatch_tcp_data_ebpf(&d, &c->ebpf, &sp);
     printf("overlapping segment   : trim_start=%u accepted=%u rx_next_seq=%u\n",
            sp.trim_start, sp.rx_bump, c->ebpf.rx_next_seq);
 
@@ -66,7 +66,7 @@ int main(void)
     __builtin_memset(&sp, 0, sizeof sp); sp.trigger_ack = true;
     __builtin_memset(&d, 0, sizeof d);
     d.seq = 90000; d.payload_len = 100;
-    mtp_dispatch_tcp_data_ebpf(&d, c, &sp);
+    mtp_dispatch_tcp_data_ebpf(&d, &c->ebpf, &sp);
     printf("out of window         : rx_bump=%u rx_next_seq=%u trigger_ack=%d\n",
            sp.rx_bump, c->ebpf.rx_next_seq, (int)sp.trigger_ack);
 
@@ -76,7 +76,7 @@ int main(void)
     __builtin_memset(&sp, 0, sizeof sp);
     __builtin_memset(&d, 0, sizeof d);
     d.seq = 40000; d.payload_len = 300;
-    mtp_dispatch_tcp_data_ebpf(&d, c, &sp);
+    mtp_dispatch_tcp_data_ebpf(&d, &c->ebpf, &sp);
     printf("ring wrap             : rx_next_pos 3900 + 300 of 4096 -> %u\n",
            c->ebpf.rx_next_pos);
 

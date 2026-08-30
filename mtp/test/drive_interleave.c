@@ -36,12 +36,12 @@ void mtp_contract_report(void);
 static void run_etran_order(struct tcp_ack *a, struct tcp_data *d,
                             struct tcp_ctx *c, struct tcp_scratch *s)
 {
-    proc_ack(a, c, s);
-    proc_fast_retransmit(a, c, s);
+    proc_ack(a, &c->ebpf, &c->cc_shared, s);
+    proc_fast_retransmit(a, &c->ebpf, &c->cc_shared, s);
     proc_seq(d, &c->ebpf, s);
     proc_ooo(d, &c->ebpf, s);
     proc_window(a, &c->ebpf, s);
-    proc_rtt(a, c, s);
+    proc_rtt(a, &c->ebpf, &c->cc_shared, s);
     proc_recv(d, &c->ebpf, s);
 }
 
@@ -51,10 +51,10 @@ static void run_etran_order(struct tcp_ack *a, struct tcp_data *d,
 static void run_program_order(struct tcp_ack *a, struct tcp_data *d,
                               struct tcp_ctx *c, struct tcp_scratch *s)
 {
-    proc_ack(a, c, s);
-    proc_fast_retransmit(a, c, s);
+    proc_ack(a, &c->ebpf, &c->cc_shared, s);
+    proc_fast_retransmit(a, &c->ebpf, &c->cc_shared, s);
     proc_window(a, &c->ebpf, s);
-    proc_rtt(a, c, s);
+    proc_rtt(a, &c->ebpf, &c->cc_shared, s);
     proc_seq(d, &c->ebpf, s);
     proc_ooo(d, &c->ebpf, s);
     proc_recv(d, &c->ebpf, s);
@@ -152,8 +152,8 @@ int main(void)
         /* Both of the packet's chains, on ONE scratchpad the caller owns --
          * which is the whole point of the dispatch taking it rather than
          * declaring it. */
-        mtp_dispatch_tcp_ack_ebpf(&a, &c, &s);
-        mtp_dispatch_tcp_data_ebpf(&d, &c, &s);
+        mtp_dispatch_tcp_ack_ebpf(&a, &c.ebpf, &c.cc_shared, &s);
+        mtp_dispatch_tcp_data_ebpf(&d, &c.ebpf, &s);
         printf("through the generated dispatches    : rx_bump = %u\n", s.rx_bump);
         if (s.rx_bump != 1448) { printf("FAIL: the packet's chains lost it\n"); return 1; }
     }
