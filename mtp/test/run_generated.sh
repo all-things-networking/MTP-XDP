@@ -47,6 +47,16 @@ check "out of window         : rx_bump=0 rx_next_seq=30000 trigger_ack=0" \
                                   "an out-of-window segment to deliver nothing and provoke no ack"
 check "ring wrap             : rx_next_pos 3900 + 300 of 4096 -> 104" \
                                   "the receive ring to wrap"
+check "segment out           : tx_ok=1 seq 5000->5300 pos 3900+300 of 4096 -> 104 sent=300" \
+                                  "a segment to advance the stream and wrap the send ring"
+check "stale position        : tx_ok=0 seq stays 5000 sent stays 0" \
+                                  "a frame at a stale position to advance nothing"
+check "window update alone   : wnd_upd=1 rx_avail 1000+4000 -> 5000" \
+                                  "a freed receive buffer with nothing in flight to be worth its own packet"
+check "window update rides   : wnd_upd=0" \
+                                  "a window update to ride along when data is pending"
+check "rto, nothing in flight: tx_ok=0" "an rto with nothing outstanding to do nothing"
+check "rto, data in flight   : tx_ok=1" "an rto with data outstanding to act"
 check "0 of 8 cases differ"       "eTran's interleaved order and the program's order to agree"
 check "through the generated dispatches    : rx_bump = 1448" \
                                   "one packet's two chains to share a scratchpad"

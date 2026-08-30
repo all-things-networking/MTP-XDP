@@ -102,6 +102,7 @@ int main(void)
         d.window = 65535; d.ts_val = 12345; d.ts_ecr = 1;
 
         memset(&s1, 0, sizeof s1); memset(&s2, 0, sizeof s2);
+        s1.ack_ok = true; s2.ack_ok = true;
         run_etran_order(&a, &d, &c1, &s1);
         run_program_order(&a, &d, &c2, &s2);
 
@@ -145,6 +146,7 @@ int main(void)
         d.seq = 7000; d.payload_len = 1448; d.window = 65535;
 
         memset(&s, 0, sizeof s);
+        s.ack_ok = true;   /* the ack chain ran and did not end the chain */
         proc_seq(&d, &c.ebpf, &s); proc_ooo(&d, &c.ebpf, &s); proc_recv(&d, &c.ebpf, &s);
         printf("\nscratchpad shared across the packet : rx_bump = %u\n", s.rx_bump);
 
