@@ -292,14 +292,7 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
 /* ------------------------------------------------------------------ *
  * scratchpad_t tcp_tx_scratch { ... }   -- app_send's processors share these.
  * ------------------------------------------------------------------ */
-struct tcp_tx_scratch {
-    __u32 rx_bump;
-    __u32 payload_len;
-    __u32 tx_pending;
-    __u32 tx_pos;
-    __u64 ref_ts;
-    bool  wnd_upd;
-};
+/* tcp_tx_scratch is generated now -- see gen/prog_blueprint.h. */
 
 /*
  * dispatch: app_send -> { record_data, gen_seg }
@@ -346,7 +339,12 @@ static __always_inline int gen_retransmit(struct bpf_tcp_conn *c, struct bpf_cc 
     /* --- gen_retransmit (EVENT-TIMER-RTO 1.3): the RTO's dummy packet ----- */
     /* Timeout packet from slowpath, process it first */
     if (unlikely(data_meta->tx.flag & FLAG_TO)) {
-        if (!c->tx_sent) {
+        /* GENERATED: whether there is anything outstanding to resend. Where the
+         * stream goes back to is the target's congestion control, which owns
+         * the recovery point -- see fast_retransmit just below. */
+        struct rto_timeout ev_to = {0};
+        gen_retransmit(&ev_to, c, s);
+        if (!s->tx_ok) {
             TCP_UNLOCK(c);
             xdp_egress_log("Timeout but no data to retransmit");
             return XDP_DROP;
@@ -376,12 +374,11 @@ static __always_inline int send_wnd_update(struct iphdr *iph, struct tcphdr *tcp
 {
     /* --- send_wnd_update (EVENT-APP-RECV 1.3) ----------------------------- */
     /* update receving buffer space */
-    if (s->rx_bump) {
-        // if ((c->rx_avail >> TCP_WND_SCALE) == 0 && c->tx_avail == 0)
-        if (c->tx_pending == 0)
-            s->wnd_upd = true;
-        c->rx_avail += s->rx_bump;
-        xdp_egress_log("Rxwnd is updated from %u to %u", min((c->rx_avail - s->rx_bump) >> TCP_WND_SCALE, 0xFFFF), c->rx_avail);
+    /* GENERATED: the window has moved, and whether that is worth a packet of its
+     * own. Building the frame and choosing the verdict stay the target's. */
+    {
+        struct app_recv ev_rcv = {0};
+        send_wnd_update(&ev_rcv, c, s);
     }
 
     /* --- the FLAG_SYNC dummy packet: a frame with no payload sent purely to
@@ -413,15 +410,14 @@ static __always_inline int gen_seg(struct iphdr *iph, struct tcphdr *tcph,
 
     // this is probably caused by fast retransmission as we reset the c->tx_next_pos
     // but there are pending packets in the queue, simply drop them
-    if (unlikely(s->tx_pos != c->tx_next_pos)) {
-        TCP_UNLOCK(c);
-        xdp_egress_log("tx_pos(%u) != c->tx_next_pos(%u)", s->tx_pos, c->tx_next_pos);
-        // bpf_printk("tx_pos(%u) != c->tx_next_pos(%u)", s->tx_pos, c->tx_next_pos);
-        return XDP_DROP;
-    }
-
-    if (s->tx_pending)
-        c->tx_pending += s->tx_pending;
+    /*
+     * The guard and the state advance are BOTH generated, and both happen
+     * below, in one call. The donor checks first and advances last; a generated
+     * processor is one function, so the check comes with the advance and the
+     * frame that fails it is built and then dropped. That costs work on a path
+     * that already ends in XDP_DROP, and it is the alternative -- calling the
+     * processor twice -- that would be wrong: it advances state.
+     */
 
     __u32 avail = tcp_txavail(c);
 
@@ -438,13 +434,16 @@ static __always_inline int gen_seg(struct iphdr *iph, struct tcphdr *tcph,
 
     fill_ip_hdr(iph, s->payload_len, c->ecn_enable);
 
-    c->tx_next_seq += s->payload_len;
-    c->tx_next_pos += s->payload_len;
-    if (c->tx_next_pos >= c->tx_buf_size)
-        c->tx_next_pos -= c->tx_buf_size;
-    c->tx_sent += s->payload_len;
-    cc->txp = c->tx_sent > 0;
-    c->tx_pending -= s->payload_len;
+    /* GENERATED: everything a segment going out advances, and the consistency
+     * check between where the application believes the stream is and where the
+     * transport does. */
+    struct app_send ev_snd = {0};
+    ev_snd.len = s->payload_len;
+    gen_seg(&ev_snd, c, cc, s);
+    if (unlikely(!s->tx_ok)) {
+        TCP_UNLOCK(c);
+        return XDP_DROP;
+    }
 
     // /*** NO CC ***/
     // TCP_UNLOCK(c);
@@ -497,7 +496,7 @@ static __always_inline int dispatch_tcp_tx(struct iphdr *iph, struct tcphdr *tcp
                                            struct meta_info *data_meta, void *data_end)
 {
     /* scratchpad_t tcp_tx_scratch -- app_send's processors share these. */
-    struct tcp_tx_scratch s = {0};
+    struct tcp_tx_scratch s = {0};   /* generated: gen/prog_blueprint.h */
     s.rx_bump    = data_meta->tx.rx_bump;
     s.payload_len = data_meta->tx.plen;
     s.tx_pending = data_meta->tx.tx_pending;

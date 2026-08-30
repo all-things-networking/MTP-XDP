@@ -378,6 +378,28 @@ context tcp_listen_ctx {
  * live, which the donor says by returning false. MTP has no way to refuse
  * (docs/REFUSAL.md), so it is carried.
  */
+/*
+ * The TX site's scratchpad. Separate from tcp_scratch because it is a different
+ * site with a different event: these are the values the egress processors hand
+ * one another, and the donor keeps them in their own struct for the same reason.
+ *
+ * `ref_ts` is the time of this transmission, established once by the target --
+ * see the note on s.now in proc_rtt. `tx_pos` is where the application believes
+ * the stream is, which the target reads off the frame and the program checks.
+ */
+scratchpad_t tcp_tx_scratch {
+    uint32 rx_bump;
+    uint32 payload_len;
+    uint32 tx_pending;
+    uint32 tx_pos;
+    /* NANOSECONDS, so 64 bits. Declared uint32 first, which truncates a
+     * monotonic clock roughly every four seconds -- the pacing decision it
+     * feeds would have gone wrong once per wrap and looked like jitter. */
+    uint64 ref_ts;
+    bool   wnd_upd;
+    bool   tx_ok;
+}
+
 scratchpad_t tcp_scratch {
     uint32 seq;
     uint32 ack_seq;
@@ -1360,6 +1382,65 @@ void proc_drain(app_recv ev, tcp_ctx ctx) {
  * AFTER tcp_data's sequence validation, and are skipped by its early exits.
  * Declaring them as two independent chains would be a different program.
  */
+/*============================================================================*
+ * The egress site
+ *
+ * These run where the packet is built, which on this target is a second eBPF
+ * program. Each is SMALL, and that is the point: almost everything the donor
+ * does at this site is target machinery -- filling headers, pacing against a
+ * timing wheel, taking and dropping a lock, choosing an XDP verdict -- and none
+ * of it is protocol. What is protocol is the state the transport advances when
+ * a segment goes out, and that is what is here.
+ *============================================================================*/
+
+/*
+ * The retransmission timer fired. The only decision is whether there is
+ * anything outstanding to resend; where the stream goes back to is computed by
+ * the target's congestion control, which owns the recovery point.
+ */
+void gen_retransmit(rto_timeout ev, tcp_ctx ctx, tcp_tx_scratch s) {
+    s.tx_ok = ctx.tx_sent > 0;
+}
+
+/*
+ * The application freed receive buffer, so the window has moved. A window
+ * update goes out on its own ONLY if nothing else is about to carry it --
+ * an update riding on a segment costs nothing, one on its own costs a packet.
+ */
+void send_wnd_update(app_recv ev, tcp_ctx ctx, tcp_tx_scratch s) {
+    if (s.rx_bump == 0)
+        return;
+    if (ctx.tx_pending == 0)
+        s.wnd_upd = true;
+    ctx.rx_avail = ctx.rx_avail + s.rx_bump;
+}
+
+/*
+ * A segment goes out. The guard is a consistency check between what the
+ * application believes it has written and where the transport thinks the stream
+ * is; they disagree only if a frame arrived out of order behind our back, and
+ * then the frame is not ours to send.
+ */
+void gen_seg(app_send ev, tcp_ctx ctx, tcp_tx_scratch s) {
+    s.tx_ok = false;
+    if (s.tx_pos != ctx.tx_next_pos)
+        return;
+
+    if (s.tx_pending > 0)
+        ctx.tx_pending = ctx.tx_pending + s.tx_pending;
+
+    ctx.tx_next_seq = ctx.tx_next_seq + s.payload_len;
+    ctx.tx_next_pos = ctx.tx_next_pos + s.payload_len;
+    /* The send ring wraps, exactly as the receive ring does. */
+    if (ctx.tx_next_pos >= ctx.tx_buf_size)
+        ctx.tx_next_pos = ctx.tx_next_pos - ctx.tx_buf_size;
+    ctx.tx_sent = ctx.tx_sent + s.payload_len;
+    ctx.txp = ctx.tx_sent > 0;
+    ctx.tx_pending = ctx.tx_pending - s.payload_len;
+
+    s.tx_ok = true;
+}
+
 dispatch tcp_dispatch {
     app_bind    -> { proc_bind };
     app_listen  -> { proc_listen };
@@ -1367,8 +1448,8 @@ dispatch tcp_dispatch {
     app_connect -> { proc_connect, gen_syn };
     app_close   -> { proc_close };
 
-    app_send    -> { record_data };
-    app_recv    -> { proc_drain };
+    app_send    -> { record_data, gen_seg };
+    app_recv    -> { proc_drain, send_wnd_update };
 
     tcp_syn     -> { proc_syn_queue, proc_passive_open, gen_synack };
     tcp_synack  -> { proc_synack };
@@ -1385,4 +1466,6 @@ dispatch tcp_dispatch {
      */
     tcp_ack     -> { proc_ack, proc_fast_retransmit, proc_window, proc_rtt };
     tcp_data    -> { proc_seq, proc_ooo, proc_recv };
+
+    rto_timeout -> { gen_retransmit };
 }
