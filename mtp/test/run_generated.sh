@@ -42,6 +42,11 @@ check "rx_next_seq 8448 -> 8448"  "a duplicate segment to advance nothing"
 check "tx_sent=0"                 "an ack for data never sent to be rejected"
 check "new=1 del=1"               "the context to be created and destroyed"
 check "live=0"                    "no context left behind"
+check "trim_start=400 accepted=600" "an overlapping segment to be trimmed, not refused"
+check "out of window         : rx_bump=0 rx_next_seq=30000 trigger_ack=0" \
+                                  "an out-of-window segment to deliver nothing and provoke no ack"
+check "ring wrap             : rx_next_pos 3900 + 300 of 4096 -> 104" \
+                                  "the receive ring to wrap"
 check "0 of 8 cases differ"       "eTran's interleaved order and the program's order to agree"
 check "through the generated dispatches    : rx_bump = 1448" \
                                   "one packet's two chains to share a scratchpad"

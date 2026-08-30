@@ -32,8 +32,11 @@ int main(void)
     mtp_dispatch_tcp_ack_ebpf(&a, c, &sp);
     printf("bogus ack accepted?   : tx_sent=%u (unchanged 0 = rejected)\n", c->ebpf.tx_sent);
 
-    /* An in-order segment must advance the receive sequence. */
+    /* An in-order segment must advance the receive sequence. rx_buf_size is set
+     * because the ring wraps on it now, and a zero would make the wrap a no-op
+     * and the test meaningless. */
     c->ebpf.rx_next_seq = 7000; c->ebpf.rx_avail = 65535;
+    c->ebpf.rx_buf_size = 4096; c->ebpf.rx_next_pos = 0;
     struct tcp_data d; __builtin_memset(&d, 0, sizeof d);
     d.seq = 7000; d.payload_len = 1448;
     __builtin_memset(&sp, 0, sizeof sp);
@@ -45,6 +48,37 @@ int main(void)
     __builtin_memset(&sp, 0, sizeof sp);
     mtp_dispatch_tcp_data_ebpf(&d, c, &sp);
     printf("same segment again    : rx_next_seq %u -> %u\n", before, c->ebpf.rx_next_seq);
+
+    /* A segment overlapping what was already delivered is TRIMMED, not refused:
+     * 1000 bytes starting 400 before the stream position deliver 600. */
+    c->ebpf.rx_next_seq = 20000; c->ebpf.rx_avail = 65535;
+    c->ebpf.rx_next_pos = 0; c->ebpf.rx_ooo_len = 0;
+    __builtin_memset(&sp, 0, sizeof sp);
+    __builtin_memset(&d, 0, sizeof d);
+    d.seq = 19600; d.payload_len = 1000;
+    mtp_dispatch_tcp_data_ebpf(&d, c, &sp);
+    printf("overlapping segment   : trim_start=%u accepted=%u rx_next_seq=%u\n",
+           sp.trim_start, sp.rx_bump, c->ebpf.rx_next_seq);
+
+    /* Wholly out of window: nothing accepted, and no ack provoked. */
+    c->ebpf.rx_next_seq = 30000; c->ebpf.rx_avail = 1000;
+    c->ebpf.rx_next_pos = 0; c->ebpf.rx_ooo_len = 0;
+    __builtin_memset(&sp, 0, sizeof sp); sp.trigger_ack = true;
+    __builtin_memset(&d, 0, sizeof d);
+    d.seq = 90000; d.payload_len = 100;
+    mtp_dispatch_tcp_data_ebpf(&d, c, &sp);
+    printf("out of window         : rx_bump=%u rx_next_seq=%u trigger_ack=%d\n",
+           sp.rx_bump, c->ebpf.rx_next_seq, (int)sp.trigger_ack);
+
+    /* The ring wraps: 300 bytes from position 3900 of a 4096 ring land at 104. */
+    c->ebpf.rx_next_seq = 40000; c->ebpf.rx_avail = 65535;
+    c->ebpf.rx_next_pos = 3900; c->ebpf.rx_buf_size = 4096; c->ebpf.rx_ooo_len = 0;
+    __builtin_memset(&sp, 0, sizeof sp);
+    __builtin_memset(&d, 0, sizeof d);
+    d.seq = 40000; d.payload_len = 300;
+    mtp_dispatch_tcp_data_ebpf(&d, c, &sp);
+    printf("ring wrap             : rx_next_pos 3900 + 300 of 4096 -> %u\n",
+           c->ebpf.rx_next_pos);
 
     mtp_ctx_del(MTP_CTX_tcp_ctx, &fid);
     mtp_contract_report();

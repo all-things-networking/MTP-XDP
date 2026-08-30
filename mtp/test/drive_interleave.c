@@ -114,8 +114,8 @@ int main(void)
                    c1.ebpf.tx_sent, c2.ebpf.tx_sent);
             printf("   rx_dupack    etran-order %-10u program-order %u\n",
                    c1.ebpf.rx_dupack_cnt, c2.ebpf.rx_dupack_cnt);
-            printf("   acked        etran-order %-10u program-order %u\n",
-                   s1.acked, s2.acked);
+            printf("   tx_bump      etran-order %-10u program-order %u\n",
+                   s1.tx_bump, s2.tx_bump);
             printf("   rx_bump      etran-order %-10u program-order %u\n",
                    s1.rx_bump, s2.rx_bump);
             printf("   trigger_ack  etran-order %-10d program-order %d\n",

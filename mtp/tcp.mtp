@@ -268,7 +268,6 @@ context tcp_ctx {
         uint32 next_timeout;
         uint32 qid;
         bool   ecn_enable;
-        uint32 rx_buf_size, tx_buf_size;
     }
 
     /*
@@ -277,6 +276,11 @@ context tcp_ctx {
      * arithmetic happens here.
      */
     @placement("ebpf") {
+        /* THE RING SIZES ARE EBPF-SIDE. They were placed on the control path,
+         * which is wrong the moment proc_recv has to wrap rx_next_pos: the
+         * donor keeps them in the map entry precisely because the fast path
+         * needs them, and without the wrap the position walks off the ring. */
+        uint32 rx_buf_size, tx_buf_size;
         uint32 rx_avail, rx_remote_avail;
         uint32 rx_next_pos, rx_next_seq;
         uint32 rx_dupack_cnt;
@@ -362,11 +366,34 @@ context tcp_listen_ctx {
 
 /**************************** scratchpad ****************************/
 
+/*
+ * THE DONOR'S SCRATCHPAD, FIELD FOR FIELD. It used to be five fields of our own
+ * naming, which is fine while nothing else reads it and impossible the moment a
+ * generated processor has to sit in a chain beside a hand-written one -- they
+ * share this, and two definitions of it cannot both be right.
+ *
+ * `seq` and `payload_len` are MUTABLE COPIES of the event's, because trimming
+ * changes them and the event is what arrived, not what will be accepted.
+ * `seg_ok` is the one field the donor does not have: it says the chain is still
+ * live, which the donor says by returning false. MTP has no way to refuse
+ * (docs/REFUSAL.md), so it is carried.
+ */
 scratchpad_t tcp_scratch {
-    uint32 acked;
+    uint32 seq;
+    uint32 ack_seq;
+    uint32 ts_val;
+    uint32 ts_ecr;
+    uint32 now;
+    uint32 payload_off;
+    uint32 payload_len;
     uint32 rx_bump;
+    uint32 tx_bump;
     uint32 go_back_pos;
+    uint32 trim_start;
+    uint32 trim_end;
     bool   trigger_ack;
+    bool   clear_ooo;
+    bool   drop;
     bool   seg_ok;
 }
 
@@ -965,7 +992,7 @@ void proc_close(app_close ev, tcp_ctx ctx) {
  * tx_next_seq - tx_sent to tx_next_seq + tx_pending rather than to tx_next_seq.
  */
 void proc_ack(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
-    s.acked = 0;
+    s.tx_bump = 0;
     s.trigger_ack = ev.payload_len > 0;
 
     ctx.cnt_rx_acks = ctx.cnt_rx_acks + 1;
@@ -976,22 +1003,22 @@ void proc_ack(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
         return;
     }
 
-    s.acked = ev.ack - first;
-    if (s.acked > ctx.tx_sent) {
+    s.tx_bump = ev.ack - first;
+    if (s.tx_bump > ctx.tx_sent) {
         /* A retransmission acknowledged twice. Not an error, and not counted. */
-        s.acked = 0;
+        s.tx_bump = 0;
         s.trigger_ack = false;
         return;
     }
 
-    ctx.cnt_rx_ack_bytes = ctx.cnt_rx_ack_bytes + s.acked;
+    ctx.cnt_rx_ack_bytes = ctx.cnt_rx_ack_bytes + s.tx_bump;
     if (ev.ecn_ce)
-        ctx.cnt_rx_ecn_bytes = ctx.cnt_rx_ecn_bytes + s.acked;
+        ctx.cnt_rx_ecn_bytes = ctx.cnt_rx_ecn_bytes + s.tx_bump;
 
-    ctx.tx_sent = ctx.tx_sent - s.acked;
+    ctx.tx_sent = ctx.tx_sent - s.tx_bump;
     ctx.txp = ctx.tx_sent > 0;
 
-    if (s.acked > 0)
+    if (s.tx_bump > 0)
         ctx.rx_dupack_cnt = 0;
 }
 
@@ -1002,7 +1029,7 @@ void proc_ack(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
  * duplicate. Only then is a third duplicate a loss signal.
  */
 void proc_fast_retransmit(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
-    if (s.acked > 0)
+    if (s.tx_bump > 0)
         return;
     if (ctx.tx_sent == 0)
         return;
@@ -1045,7 +1072,7 @@ void proc_window(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
      * unsigned then warns -- rightly, because the same expression on a wider
      * shift would overflow into the sign bit. The program says the width it
      * means. */
-    if (s.acked > 0 || ctx.rx_remote_avail < (uint32(ev.window) << TCP_WND_SCALE))
+    if (s.tx_bump > 0 || ctx.rx_remote_avail < (uint32(ev.window) << TCP_WND_SCALE))
         ctx.rx_remote_avail = uint32(ev.window) << TCP_WND_SCALE;
 }
 
@@ -1057,7 +1084,7 @@ void proc_rtt(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
     if (ev.payload_len > 0 && ctx.tx_next_ts == 0)
         ctx.tx_next_ts = ev.ts_val;
 
-    if (ev.ts_ecr == 0 || s.acked == 0)
+    if (ev.ts_ecr == 0 || s.tx_bump == 0)
         return;
 
     /*
@@ -1068,7 +1095,7 @@ void proc_rtt(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
      * bytes on the wire, which is ours and not the peer's delay.
      */
     uint32 rtt = (now() - ev.ts_ecr) / 1000;
-    rtt = rtt - (s.acked * 1000000) / LINK_BANDWIDTH;
+    rtt = rtt - (s.tx_bump * 1000000) / LINK_BANDWIDTH;
     if (rtt >= TCP_MAX_RTT)
         return;
 
@@ -1084,8 +1111,65 @@ void proc_rtt(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
  * sees carries the ACK flag, so this runs exactly once per segment and the
  * payload processing below reads its verdict.
  */
+/*
+ * SEQUENCE VALIDATION AND TRIMMING. The program used to say `seg_ok = seq ==
+ * rx_next_seq` and nothing else, which accepts a segment that overlaps what has
+ * already been delivered and one that runs past the advertised window -- both
+ * of which the donor trims rather than accepts whole.
+ *
+ * THE COMPARISONS ARE WRAP-SAFE and are written out rather than using the
+ * language's `in_range`, which compiles to a plain `a >= b && a <= c`. Sequence
+ * space wraps; a plain comparison is wrong for every connection that lives long
+ * enough to pass 2^32, and wrong immediately for one whose ISN is near the top.
+ * `(x - start) < (end - start)` in unsigned arithmetic is the half-open test
+ * that survives the wrap, and it is why these fields must be unsigned.
+ */
 void proc_seq(tcp_data ev, tcp_ctx ctx, tcp_scratch s) {
-    s.seg_ok = ev.seq == ctx.rx_next_seq;
+    uint32 exp_first = ctx.rx_next_seq;
+    uint32 exp_last  = ctx.rx_next_seq + ctx.rx_avail;
+    uint32 pkt_first = ev.seq;
+    uint32 pkt_last  = ev.seq + ev.payload_len;
+    uint32 exp_width = exp_last - exp_first;
+    uint32 pkt_width = pkt_last - pkt_first;
+
+    s.seq         = ev.seq;
+    s.payload_len = ev.payload_len;
+
+    /* Any overlap at all, in either direction. The last two terms are what
+     * catches a segment that CONTAINS the whole window. */
+    bool first_in = (pkt_first - exp_first) < exp_width;
+    bool last_in  = (pkt_last - exp_first - 1) < exp_width;
+    bool valid = first_in || last_in
+              || (exp_first - pkt_first) < pkt_width
+              || (exp_last - pkt_first - 1) < pkt_width;
+
+    if (!valid) {
+        /* Out of window entirely. No acknowledgement is triggered -- the donor
+         * is explicit that a bad sequence number does not provoke one. */
+        s.trigger_ack = false;
+        s.seg_ok = false;
+        s.payload_len = 0;
+        return;
+    }
+
+    /* Bytes at the front already delivered, and bytes at the back past the
+     * window. Both are dropped from the segment rather than the segment. */
+    if (first_in)
+        s.trim_start = 0;
+    else
+        s.trim_start = exp_first - pkt_first;
+
+    if (last_in)
+        s.trim_end = 0;
+    else
+        s.trim_end = pkt_last - exp_last;
+
+    s.payload_off = s.payload_off + s.trim_start;
+    if (ev.payload_len >= s.trim_start + s.trim_end)
+        s.payload_len = ev.payload_len - s.trim_start - s.trim_end;
+    s.seq = ev.seq + s.trim_start;
+
+    s.seg_ok = s.seq == ctx.rx_next_seq;
 }
 
 /*
@@ -1094,20 +1178,33 @@ void proc_seq(tcp_data ev, tcp_ctx ctx, tcp_scratch s) {
  * dropped rather than held, which is why a hole with two gaps costs a
  * retransmission.
  */
+/*
+ * The out-of-order interval, which is ONE interval and not a list: eTran keeps a
+ * start and a length, so a segment that neither extends it at the front nor at
+ * the back is DROPPED. The program used to fall off the end of the chain in
+ * that case, silently leaving the segment to be treated as accepted.
+ *
+ * It works on the TRIMMED segment -- s.seq and s.payload_len, not the event's --
+ * because what is stored has to be what would be delivered.
+ */
 void proc_ooo(tcp_data ev, tcp_ctx ctx, tcp_scratch s) {
     if (s.seg_ok)
         return;
-    if (ev.payload_len == 0)
+    if (s.payload_len == 0)
         return;
 
     if (ctx.rx_ooo_len == 0) {
-        ctx.rx_ooo_start = ev.seq;
-        ctx.rx_ooo_len = ev.payload_len;
-    } else if (ev.seq + ev.payload_len == ctx.rx_ooo_start) {
-        ctx.rx_ooo_start = ev.seq;
-        ctx.rx_ooo_len = ctx.rx_ooo_len + ev.payload_len;
-    } else if (ctx.rx_ooo_start + ctx.rx_ooo_len == ev.seq) {
-        ctx.rx_ooo_len = ctx.rx_ooo_len + ev.payload_len;
+        ctx.rx_ooo_start = s.seq;
+        ctx.rx_ooo_len = s.payload_len;
+    } else if (s.seq + s.payload_len == ctx.rx_ooo_start) {
+        ctx.rx_ooo_start = s.seq;
+        ctx.rx_ooo_len = ctx.rx_ooo_len + s.payload_len;
+    } else if (ctx.rx_ooo_start + ctx.rx_ooo_len == s.seq) {
+        ctx.rx_ooo_len = ctx.rx_ooo_len + s.payload_len;
+    } else {
+        /* One interval, and this segment joins neither end of it. */
+        s.payload_len = 0;
+        s.drop = true;
     }
 }
 
@@ -1115,23 +1212,78 @@ void proc_ooo(tcp_data ev, tcp_ctx ctx, tcp_scratch s) {
  * proc_recv. The receive state advances, and an out-of-order extent that has
  * become contiguous is absorbed in the same pass.
  */
+/*
+ * ACCEPTANCE. Three things the program did not say and the donor does:
+ *
+ *  - THE RING WRAPS. rx_next_pos is an offset into a buffer of rx_buf_size, and
+ *    without the wrap it walks off the end -- which is why rx_buf_size had to
+ *    move to the eBPF group.
+ *  - THE HELD INTERVAL IS REVALIDATED against the window that just moved, and
+ *    trimmed, before it is asked whether it now joins. An interval that has
+ *    fallen out of the window entirely is discarded, not merged.
+ *  - Only THEN can it be delivered, and only if it starts exactly where the
+ *    stream now does.
+ *
+ * It also works on the trimmed length, s.payload_len, not the event's.
+ */
 void proc_recv(tcp_data ev, tcp_ctx ctx, tcp_scratch s) {
     if (!s.seg_ok)
         return;
-    if (ev.payload_len == 0)
+    if (s.payload_len == 0)
         return;
 
-    s.rx_bump = ev.payload_len;
-    ctx.rx_avail = ctx.rx_avail - ev.payload_len;
-    ctx.rx_next_pos = ctx.rx_next_pos + ev.payload_len;
-    ctx.rx_next_seq = ctx.rx_next_seq + ev.payload_len;
+    s.rx_bump = s.payload_len;
+    ctx.rx_avail = ctx.rx_avail - s.payload_len;
+    ctx.rx_next_pos = ctx.rx_next_pos + s.payload_len;
+    if (ctx.rx_next_pos >= ctx.rx_buf_size)
+        ctx.rx_next_pos = ctx.rx_next_pos - ctx.rx_buf_size;
+    ctx.rx_next_seq = ctx.rx_next_seq + s.payload_len;
 
-    if (ctx.rx_ooo_len > 0 && ctx.rx_ooo_start == ctx.rx_next_seq) {
-        s.rx_bump = s.rx_bump + ctx.rx_ooo_len;
-        ctx.rx_avail = ctx.rx_avail - ctx.rx_ooo_len;
-        ctx.rx_next_pos = ctx.rx_next_pos + ctx.rx_ooo_len;
-        ctx.rx_next_seq = ctx.rx_next_seq + ctx.rx_ooo_len;
-        ctx.rx_ooo_len = 0;
+    if (ctx.rx_ooo_len > 0) {
+        /* The same wrap-safe overlap test as proc_seq, against the window as it
+         * now stands. Written out again because MTP has no way to name a
+         * predicate that is not an event processor. */
+        uint32 exp_first = ctx.rx_next_seq;
+        uint32 exp_last  = ctx.rx_next_seq + ctx.rx_avail;
+        uint32 ooo_first = ctx.rx_ooo_start;
+        uint32 ooo_last  = ctx.rx_ooo_start + ctx.rx_ooo_len;
+        uint32 exp_width = exp_last - exp_first;
+        uint32 ooo_width = ooo_last - ooo_first;
+
+        bool first_in = (ooo_first - exp_first) < exp_width;
+        bool last_in  = (ooo_last - exp_first - 1) < exp_width;
+        bool valid = first_in || last_in
+                  || (exp_first - ooo_first) < ooo_width
+                  || (exp_last - ooo_first - 1) < ooo_width;
+
+        if (!valid) {
+            /* Entirely superfluous now. Dropped, and no acknowledgement. */
+            ctx.rx_ooo_len = 0;
+            s.trigger_ack = false;
+            s.clear_ooo = true;
+        } else {
+            if (first_in)
+                s.trim_start = 0;
+            else
+                s.trim_start = exp_first - ooo_first;
+            if (last_in)
+                s.trim_end = 0;
+            else
+                s.trim_end = ooo_last - exp_last;
+
+            ctx.rx_ooo_start = ctx.rx_ooo_start + s.trim_start;
+            ctx.rx_ooo_len = ctx.rx_ooo_len - s.trim_start - s.trim_end;
+
+            if (ctx.rx_ooo_len > 0 && ctx.rx_ooo_start == ctx.rx_next_seq) {
+                s.rx_bump = s.rx_bump + ctx.rx_ooo_len;
+                ctx.rx_avail = ctx.rx_avail - ctx.rx_ooo_len;
+                ctx.rx_next_pos = ctx.rx_next_pos + ctx.rx_ooo_len;
+                if (ctx.rx_next_pos >= ctx.rx_buf_size)
+                    ctx.rx_next_pos = ctx.rx_next_pos - ctx.rx_buf_size;
+                ctx.rx_next_seq = ctx.rx_next_seq + ctx.rx_ooo_len;
+                ctx.rx_ooo_len = 0;
+            }
+        }
     }
 }
 
