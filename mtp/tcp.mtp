@@ -98,6 +98,14 @@ const uint8  PRIO_DATA    = 0;    /* payload */
 
 const uint32 PARITY_DUP_ACK_THRESH = 3;      /* the donor acts on the third */
 const uint32 TCP_MAX_RTT           = 1000000;
+/* The receive window on the wire is SCALED. The donor shifts by a fixed amount
+ * rather than negotiating it, and a program that forgets the shift advertises a
+ * window 4096x too small -- which throttles the sender and reads as a transport
+ * that is simply slow. */
+const uint32 TCP_WND_SCALE         = 12;
+/* Serialisation is subtracted from the RTT sample: the time to put the
+ * acknowledged bytes on the wire is not the peer's delay. Bits per second. */
+const uint32 LINK_BANDWIDTH        = 25000000000;
 
 /**************************** parameters ****************************/
 
@@ -1029,15 +1037,38 @@ void proc_fast_retransmit(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
  * though the window is ACK state. That is the donor's braid, not a simplification.
  */
 void proc_window(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
-    if (s.acked > 0 || ctx.rx_remote_avail < ev.window)
-        ctx.rx_remote_avail = ev.window;
+    /* SCALED. `ev.window` is the sixteen bits off the wire; what the sender may
+     * have outstanding is that shifted. The program said `ev.window` and would
+     * have advertised 1/4096 of the real window. */
+    /* WIDENED BEFORE SHIFTING. `ev.window` is sixteen bits; shifting it left by
+     * twelve promotes to a SIGNED int in C, and the comparison against an
+     * unsigned then warns -- rightly, because the same expression on a wider
+     * shift would overflow into the sign bit. The program says the width it
+     * means. */
+    if (s.acked > 0 || ctx.rx_remote_avail < (uint32(ev.window) << TCP_WND_SCALE))
+        ctx.rx_remote_avail = uint32(ev.window) << TCP_WND_SCALE;
 }
 
 void proc_rtt(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
+    /* THE TIMESTAMP TO ECHO, taken from the first segment that carried data and
+     * not replaced until it has been sent. The program omitted this entirely,
+     * so every outgoing segment would have echoed zero and the peer's own RTT
+     * estimate would have been meaningless. */
+    if (ev.payload_len > 0 && ctx.tx_next_ts == 0)
+        ctx.tx_next_ts = ev.ts_val;
+
     if (ev.ts_ecr == 0 || s.acked == 0)
         return;
 
-    uint32 rtt = ev.ts_val - ev.ts_ecr;
+    /*
+     * THE SAMPLE IS AGAINST NOW, NOT AGAINST THE PEER'S CLOCK. `ev.ts_val` is
+     * the sender's timestamp and subtracting the echo from it measures nothing
+     * -- the program did exactly that. It is now-minus-echo, in nanoseconds,
+     * converted to microseconds, less the time it took to put the acknowledged
+     * bytes on the wire, which is ours and not the peer's delay.
+     */
+    uint32 rtt = (now() - ev.ts_ecr) / 1000;
+    rtt = rtt - (s.acked * 1000000) / LINK_BANDWIDTH;
     if (rtt >= TCP_MAX_RTT)
         return;
 
