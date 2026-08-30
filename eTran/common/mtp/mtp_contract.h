@@ -178,6 +178,26 @@ typedef void *mtp_ctx_t;
  */
 void mtp_ctx_register(mtp_ctx_kind_t kind, __u32 ctx_size, __u32 key_size);
 
+/*
+ * A TARGET THAT ALREADY HAS A STORE SAYS SO HERE.
+ *
+ * The built-in store above is a real one, and it is what makes generated code
+ * runnable on its own. But a target being ported INTO -- eTran, here -- already
+ * keeps connections somewhere, and two stores for one connection is not a
+ * substitution: generated proc_bind would create a context the rest of the
+ * micro kernel cannot see.
+ *
+ * Binding hooks per kind keeps this file protocol-free while letting the tree
+ * point a kind at its own container. The hooks take the key by address, exactly
+ * as the built-in store does, so nothing here learns what a key is.
+ */
+struct mtp_ctx_store_ops {
+    mtp_ctx_t (*create)(const void *key);
+    mtp_ctx_t (*lookup)(const void *key);
+    void      (*destroy)(const void *key);
+};
+void mtp_ctx_bind_store(mtp_ctx_kind_t kind, const struct mtp_ctx_store_ops *ops);
+
 mtp_ctx_t mtp_ctx_new(mtp_ctx_kind_t kind, const void *key);
 void      mtp_ctx_del(mtp_ctx_kind_t kind, const void *key);
 /* The lookup half. The dispatch resolves an event's context with this, using

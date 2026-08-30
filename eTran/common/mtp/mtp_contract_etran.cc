@@ -41,6 +41,9 @@ namespace {
 struct Kind {
     __u32 ctx_size = 0;
     __u32 key_size = 0;
+    /* When the tree has bound its own container for this kind, these are used
+     * and the map below stays empty. */
+    const struct mtp_ctx_store_ops *ops = nullptr;
     /* The key bytes are the map key. std::string is used as a byte container,
      * not as text: keys contain embedded zeros and are compared by length. */
     std::unordered_map<std::string, void *> by_key;
@@ -72,9 +75,18 @@ void mtp_ctx_register(mtp_ctx_kind_t kind, __u32 ctx_size, __u32 key_size)
     k.key_size = key_size;
 }
 
+void mtp_ctx_bind_store(mtp_ctx_kind_t kind, const struct mtp_ctx_store_ops *ops)
+{
+    g_kinds[kind].ops = ops;
+}
+
 mtp_ctx_t mtp_ctx_new(mtp_ctx_kind_t kind, const void *key)
 {
     auto it = g_kinds.find(kind);
+    if (it != g_kinds.end() && it->second.ops && it->second.ops->create) {
+        g_n.ctx_new++;
+        return it->second.ops->create(key);
+    }
     if (it == g_kinds.end()) {
         /* NOT SILENT. An unregistered kind means generated start-up never ran,
          * and every context of that kind would otherwise vanish one at a time. */
@@ -103,6 +115,7 @@ mtp_ctx_t mtp_ctx_get(mtp_ctx_kind_t kind, const void *key)
     g_n.ctx_get++;
     auto it = g_kinds.find(kind);
     if (it == g_kinds.end()) return nullptr;
+    if (it->second.ops && it->second.ops->lookup) return it->second.ops->lookup(key);
     auto f = it->second.by_key.find(key_of(kind, key));
     if (f == it->second.by_key.end()) { g_n.ctx_miss++; return nullptr; }
     return f->second;
@@ -112,6 +125,11 @@ void mtp_ctx_del(mtp_ctx_kind_t kind, const void *key)
 {
     auto it = g_kinds.find(kind);
     if (it == g_kinds.end()) return;
+    if (it->second.ops && it->second.ops->destroy) {
+        g_n.ctx_del++;
+        it->second.ops->destroy(key);
+        return;
+    }
     auto f = it->second.by_key.find(key_of(kind, key));
     if (f == it->second.by_key.end()) return;
     free(f->second);
