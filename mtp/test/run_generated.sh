@@ -19,12 +19,21 @@ mkdir -p "$OUT/mtp"
 cp "$ROOT/eTran/common/mtp/mtp_contract.h" "$ROOT/eTran/common/mtp/mtp_contract_impl.h" "$OUT/mtp/"
 "$MTPC/compiler" --backend=xdp --out="$OUT" "$ROOT/mtp/tcp.mtp" >/dev/null
 cp "$HERE/drive_tcp.c" "$OUT/"
+cp "$HERE/drive_interleave.c" "$OUT/"
 gcc -c -std=c11 -Wall -Wextra -Wno-unused-parameter -I"$OUT" -o "$OUT/drive.o" "$OUT/drive_tcp.c"
+gcc -c -std=c11 -Wall -Wextra -Wno-unused-parameter -I"$OUT" -o "$OUT/il.o"    "$OUT/drive_interleave.c"
 g++ -std=c++17 -I"$OUT" -I"$OUT/mtp" -o "$OUT/run" "$OUT/drive.o" \
+    "$ROOT/eTran/common/mtp/mtp_contract_etran.cc"
+g++ -std=c++17 -I"$OUT" -I"$OUT/mtp" -o "$OUT/il"  "$OUT/il.o" \
     "$ROOT/eTran/common/mtp/mtp_contract_etran.cc"
 
 got="$("$OUT/run" 2>&1)"
 echo "$got"
+echo
+il="$("$OUT/il" 2>&1)" || { echo "$il"; echo "FAIL: the interleave check" >&2; exit 1; }
+echo "$il"
+got="$got
+$il"
 
 fail=0
 check() { grep -q "$1" <<<"$got" || { echo "FAIL: expected $2" >&2; fail=1; }; }
@@ -33,5 +42,8 @@ check "rx_next_seq 8448 -> 8448"  "a duplicate segment to advance nothing"
 check "tx_sent=0"                 "an ack for data never sent to be rejected"
 check "new=1 del=1"               "the context to be created and destroyed"
 check "live=0"                    "no context left behind"
+check "0 of 8 cases differ"       "eTran's interleaved order and the program's order to agree"
+check "through the generated dispatches    : rx_bump = 1448" \
+                                  "one packet's two chains to share a scratchpad"
 [ "$fail" -eq 0 ] && echo "ok: the generated program runs and the receive path is right"
 exit "$fail"

@@ -80,12 +80,28 @@ that.** It declares two chains and says nothing about how a target that gets
 both at once should schedule them, so the generated code runs one and then the
 other.
 
-Whether that reordering is observable is untested and should not be assumed
-either way: `proc_window`/`proc_rtt` update the send window and the RTT estimate,
-`proc_seq`/`proc_recv` the receive side, and they are believed disjoint — but
-"believed disjoint" is a hypothesis, and rule 4 applies. It is the one place
-where the generated RX fast path would not be instruction-for-instruction the
-path measured at 101%.
+**Tested now, and it is not observable.** `mtp/test/drive_interleave.c` runs both
+orders from byte-identical starting state over eight inputs chosen to walk the
+branches — in order, out of order, a duplicate ack, everything acked, a pure ack,
+nothing outstanding, at zero, and across a sequence wrap — and compares the whole
+context and the whole scratchpad afterwards. **0 of 8 differ.** The reordering is
+a freedom the target has, and the earlier "believed disjoint" is now measured
+disjoint. Settled semantically rather than by throughput, which is the right way:
+a benchmark could not have told the difference between "equivalent" and "the
+difference is smaller than the noise".
+
+### What the same test DID find
+
+The generated dispatch declared its own scratchpad, so the two events one packet
+raises each got a fresh one — and `rx_bump`, which `proc_recv` writes and which
+is how the receive ring is advanced, did not survive from one chain to the next.
+1448 through eTran's single scratchpad, 0 through the generated pair.
+
+The fix is a statement about whose decision it is: **the scratchpad's lifetime
+belongs to the target**, so the dispatch now takes one rather than making one.
+The program says only that a scratchpad exists; that it lives for a packet
+rather than for an event is exactly the kind of thing a target decides, and on
+another target it might live for an RPC.
 
 ## The `@placement` split, checked rather than claimed
 

@@ -26,21 +26,24 @@ int main(void)
     /* An ACK for data we never sent must be rejected, and the chain says so
      * through the scratchpad rather than by returning. */
     c->ebpf.tx_next_seq = 1000; c->ebpf.tx_sent = 0; c->ebpf.tx_pending = 0;
+    struct tcp_scratch sp; __builtin_memset(&sp, 0, sizeof sp);
     struct tcp_ack a; __builtin_memset(&a, 0, sizeof a);
     a.ack = 5000; a.payload_len = 0;
-    mtp_dispatch_tcp_ack_ebpf(&a, c);
+    mtp_dispatch_tcp_ack_ebpf(&a, c, &sp);
     printf("bogus ack accepted?   : tx_sent=%u (unchanged 0 = rejected)\n", c->ebpf.tx_sent);
 
     /* An in-order segment must advance the receive sequence. */
     c->ebpf.rx_next_seq = 7000; c->ebpf.rx_avail = 65535;
     struct tcp_data d; __builtin_memset(&d, 0, sizeof d);
     d.seq = 7000; d.payload_len = 1448;
-    mtp_dispatch_tcp_data_ebpf(&d, c);
+    __builtin_memset(&sp, 0, sizeof sp);
+    mtp_dispatch_tcp_data_ebpf(&d, c, &sp);
     printf("in-order 1448 bytes   : rx_next_seq 7000 -> %u\n", c->ebpf.rx_next_seq);
 
     /* And the same segment again is a duplicate. */
     __u32 before = c->ebpf.rx_next_seq;
-    mtp_dispatch_tcp_data_ebpf(&d, c);
+    __builtin_memset(&sp, 0, sizeof sp);
+    mtp_dispatch_tcp_data_ebpf(&d, c, &sp);
     printf("same segment again    : rx_next_seq %u -> %u\n", before, c->ebpf.rx_next_seq);
 
     mtp_ctx_del(MTP_CTX_tcp_ctx, &fid);
