@@ -333,7 +333,15 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
  */
 #define MTP_TX_NEXT (-1)
 
-static __always_inline int gen_retransmit(struct bpf_tcp_conn *c, struct bpf_cc *cc,
+/*
+ * `site_` PREFIXES THE TARGET'S SHELLS. The generated processors carry the
+ * program's names -- gen_retransmit, send_wnd_update, gen_seg -- and what is
+ * left here around each of them is the target's: the frame, the pacing, the
+ * lock, the XDP verdict. Two things cannot share one name, and it is the
+ * program's name that should win.
+ */
+
+static __always_inline int site_gen_retransmit(struct bpf_tcp_conn *c, struct bpf_cc *cc,
                                           struct meta_info *data_meta, struct tcp_tx_scratch *s)
 {
     /* --- gen_retransmit (EVENT-TIMER-RTO 1.3): the RTO's dummy packet ----- */
@@ -367,7 +375,7 @@ static __always_inline int gen_retransmit(struct bpf_tcp_conn *c, struct bpf_cc 
     return MTP_TX_NEXT;
 }
 
-static __always_inline int send_wnd_update(struct iphdr *iph, struct tcphdr *tcph,
+static __always_inline int site_send_wnd_update(struct iphdr *iph, struct tcphdr *tcph,
                                            struct bpf_tcp_conn *c, void *data_end,
                                            struct meta_info *data_meta,
                                            struct tcp_tx_scratch *s)
@@ -402,7 +410,7 @@ static __always_inline int send_wnd_update(struct iphdr *iph, struct tcphdr *tcp
     return MTP_TX_NEXT;
 }
 
-static __always_inline int gen_seg(struct iphdr *iph, struct tcphdr *tcph,
+static __always_inline int site_gen_seg(struct iphdr *iph, struct tcphdr *tcph,
                                    struct bpf_tcp_conn *c, struct bpf_cc *cc,
                                    void *data_end, struct meta_info *data_meta,
                                    struct tcp_tx_scratch *s, __u32 cpu)
@@ -530,13 +538,13 @@ static __always_inline int dispatch_tcp_tx(struct iphdr *iph, struct tcphdr *tcp
      * Every one of them releases the lock this dispatch took -- see the note on
      * the processors above; gen_seg drops it partway through on purpose.
      */
-    int v = gen_retransmit(c, cc, data_meta, &s);          /* FLAG_TO   */
+    int v = site_gen_retransmit(c, cc, data_meta, &s);          /* FLAG_TO   */
     if (v != MTP_TX_NEXT)
         return v;
 
-    v = send_wnd_update(iph, tcph, c, data_end, data_meta, &s);   /* FLAG_SYNC */
+    v = site_send_wnd_update(iph, tcph, c, data_end, data_meta, &s);   /* FLAG_SYNC */
     if (v != MTP_TX_NEXT)
         return v;
 
-    return gen_seg(iph, tcph, c, cc, data_end, data_meta, &s, cpu);
+    return site_gen_seg(iph, tcph, c, cc, data_end, data_meta, &s, cpu);
 }
