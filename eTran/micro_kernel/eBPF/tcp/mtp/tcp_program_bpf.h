@@ -251,14 +251,34 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
     __u32 pos0 = c->rx_next_pos, seq0 = c->rx_next_seq;
 
     /*
-     * BOTH CHAINS, ON ONE SCRATCHPAD, ack then data. That is the program's
-     * order and not the donor's interleave -- and the two were shown to be
-     * indistinguishable over every branch of this chain
-     * (mtp/test/drive_interleave.c, 0 of 8 cases differ), which is why taking
-     * the program's order here is a substitution and not a change.
+     * THE DONOR'S ORDER, WITH THE DONOR'S EARLY EXITS -- and this is a TARGET
+     * decision, not the program's.
+     *
+     * One segment raises tcp_ack and tcp_data together. The program declares
+     * two chains and says nothing about how a target holding both at once
+     * should schedule them, so the schedule is ours to pick, and we pick
+     * eTran's: it interleaves them, and window and RTT do not update for a
+     * packet whose sequence number was rejected.
+     *
+     * AN EARLIER VERSION RAN THE TWO DISPATCHES BACK TO BACK, and that was
+     * wrong in a way the interleave test did not catch: that test compared the
+     * two ORDERS but ran every processor in both, so it never modelled the
+     * chain ENDING. The donor's `break` skips work; the generated dispatches
+     * skip nothing. The program now carries `ack_ok` and `seg_ok` and every
+     * processor that must not run guards on them -- which is how MTP says
+     * "the chain is over" -- and the calls below are ordered to match.
      */
-    mtp_dispatch_tcp_ack_ebpf(&ev_ack, c, cc, &s);
-    mtp_dispatch_tcp_data_ebpf(&ev_data, c, &s);
+    proc_ack(&ev_ack, c, cc, &s);
+    if (likely(s.ack_ok)) {
+        proc_fast_retransmit(&ev_ack, c, cc, &s);
+        proc_seq(&ev_data, c, &s);
+        proc_ooo(&ev_data, c, &s);
+        if (likely(s.seg_ok)) {
+            proc_window(&ev_ack, c, &s);
+            proc_rtt(&ev_ack, c, cc, &s);
+            proc_recv(&ev_data, c, &s);
+        }
+    }
     mtp_rx_meta(c, data_meta, &s, pos0, seq0);
 
     post_data(c, data_meta, &s);

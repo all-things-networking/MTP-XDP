@@ -57,6 +57,7 @@ struct tcp_scratch {
     bool seg_ok;
     bool ooo_seg;
     bool ooo_fin;
+    bool ack_ok;
 };
 
 struct TCPBP {

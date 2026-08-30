@@ -402,6 +402,11 @@ scratchpad_t tcp_scratch {
      * the state before the chain ran; these two it cannot. */
     bool   ooo_seg;
     bool   ooo_fin;
+    /* THE ACKNOWLEDGEMENT WAS USABLE. The donor says this by returning false
+     * from proc_ack, which ends the chain -- and ending a chain is the one
+     * thing MTP cannot say (docs/REFUSAL.md). Carried, so the processors that
+     * must not run can guard on it and the target can stop early. */
+    bool   ack_ok;
 }
 
 /**************************** the app parser ****************************/
@@ -999,6 +1004,7 @@ void proc_close(app_close ev, tcp_ctx ctx) {
  * tx_next_seq - tx_sent to tx_next_seq + tx_pending rather than to tx_next_seq.
  */
 void proc_ack(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
+    s.ack_ok = false;
     s.tx_bump = 0;
     s.trigger_ack = ev.payload_len > 0;
 
@@ -1027,6 +1033,9 @@ void proc_ack(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
 
     if (s.tx_bump > 0)
         ctx.rx_dupack_cnt = 0;
+
+    /* Reached the end: everything after this may run. */
+    s.ack_ok = true;
 }
 
 /*
@@ -1036,6 +1045,11 @@ void proc_ack(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
  * duplicate. Only then is a third duplicate a loss signal.
  */
 void proc_fast_retransmit(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
+    /* The donor ends the chain when the acknowledgement is unusable; MTP says
+     * the same thing as a guard at the top of everything that follows. */
+    if (!s.ack_ok)
+        return;
+
     if (s.tx_bump > 0)
         return;
     if (ctx.tx_sent == 0)
@@ -1071,6 +1085,11 @@ void proc_fast_retransmit(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
  * though the window is ACK state. That is the donor's braid, not a simplification.
  */
 void proc_window(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
+    /* The donor ends the chain when the acknowledgement is unusable; MTP says
+     * the same thing as a guard at the top of everything that follows. */
+    if (!s.ack_ok)
+        return;
+
     /* SCALED. `ev.window` is the sixteen bits off the wire; what the sender may
      * have outstanding is that shifted. The program said `ev.window` and would
      * have advertised 1/4096 of the real window. */
@@ -1084,6 +1103,11 @@ void proc_window(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
 }
 
 void proc_rtt(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
+    /* The donor ends the chain when the acknowledgement is unusable; MTP says
+     * the same thing as a guard at the top of everything that follows. */
+    if (!s.ack_ok)
+        return;
+
     /* THE TIMESTAMP TO ECHO, taken from the first segment that carried data and
      * not replaced until it has been sent. The program omitted this entirely,
      * so every outgoing segment would have echoed zero and the peer's own RTT
@@ -1101,7 +1125,13 @@ void proc_rtt(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
      * converted to microseconds, less the time it took to put the acknowledged
      * bytes on the wire, which is ours and not the peer's delay.
      */
-    uint32 rtt = (now() - ev.ts_ecr) / 1000;
+    /* `s.now` AND NOT `now()`. The time of this packet is established once, at
+     * the top of its processing, and every processor that needs it reads the
+     * same value -- which is both cheaper and more correct than each asking the
+     * clock again. On this target `now()` is a helper call and the donor caches
+     * it per CPU for exactly that reason; calling it here put the call back,
+     * once per acknowledgement, in the fast path. */
+    uint32 rtt = (s.now - ev.ts_ecr) / 1000;
     rtt = rtt - (s.tx_bump * 1000000) / LINK_BANDWIDTH;
     if (rtt >= TCP_MAX_RTT)
         return;
@@ -1132,6 +1162,11 @@ void proc_rtt(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
  * that survives the wrap, and it is why these fields must be unsigned.
  */
 void proc_seq(tcp_data ev, tcp_ctx ctx, tcp_scratch s) {
+    /* The donor ends the chain when the acknowledgement is unusable; MTP says
+     * the same thing as a guard at the top of everything that follows. */
+    if (!s.ack_ok)
+        return;
+
     uint32 exp_first = ctx.rx_next_seq;
     uint32 exp_last  = ctx.rx_next_seq + ctx.rx_avail;
     uint32 pkt_first = ev.seq;

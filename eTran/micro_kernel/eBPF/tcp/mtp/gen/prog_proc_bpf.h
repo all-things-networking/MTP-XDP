@@ -18,6 +18,7 @@ static __always_inline void proc_recv(struct tcp_data *ev, struct bpf_tcp_conn *
 /* ---- proc_ack  [ebpf]----------------------------------- */
 static __always_inline void proc_ack(struct tcp_ack *ev, struct bpf_tcp_conn *ctx_ebpf, struct bpf_cc *ctx_cc_shared, struct tcp_scratch *s)
 {
+    s->ack_ok = false;
     s->tx_bump = 0;
     s->trigger_ack = ev->payload_len > 0;
     ctx_cc_shared->cnt_rx_acks = ctx_cc_shared->cnt_rx_acks + 1;
@@ -41,11 +42,15 @@ static __always_inline void proc_ack(struct tcp_ack *ev, struct bpf_tcp_conn *ct
     if (s->tx_bump > 0) {
         ctx_ebpf->rx_dupack_cnt = 0;
     }
+    s->ack_ok = true;
 }
 
 /* ---- proc_fast_retransmit  [ebpf]----------------------- */
 static __always_inline void proc_fast_retransmit(struct tcp_ack *ev, struct bpf_tcp_conn *ctx_ebpf, struct bpf_cc *ctx_cc_shared, struct tcp_scratch *s)
 {
+    if (!s->ack_ok) {
+        return;
+    }
     if (s->tx_bump > 0) {
         return;
     }
@@ -78,6 +83,9 @@ static __always_inline void proc_fast_retransmit(struct tcp_ack *ev, struct bpf_
 /* ---- proc_window  [ebpf]-------------------------------- */
 static __always_inline void proc_window(struct tcp_ack *ev, struct bpf_tcp_conn *ctx_ebpf, struct tcp_scratch *s)
 {
+    if (!s->ack_ok) {
+        return;
+    }
     if (s->tx_bump > 0 || ctx_ebpf->rx_remote_avail < ((__u32)(ev->window) << TCP_WND_SCALE)) {
         ctx_ebpf->rx_remote_avail = (__u32)(ev->window) << TCP_WND_SCALE;
     }
@@ -86,13 +94,16 @@ static __always_inline void proc_window(struct tcp_ack *ev, struct bpf_tcp_conn 
 /* ---- proc_rtt  [ebpf]----------------------------------- */
 static __always_inline void proc_rtt(struct tcp_ack *ev, struct bpf_tcp_conn *ctx_ebpf, struct bpf_cc *ctx_cc_shared, struct tcp_scratch *s)
 {
+    if (!s->ack_ok) {
+        return;
+    }
     if (ev->payload_len > 0 && ctx_ebpf->tx_next_ts == 0) {
         ctx_ebpf->tx_next_ts = ev->ts_val;
     }
     if (ev->ts_ecr == 0 || s->tx_bump == 0) {
         return;
     }
-    __u32 rtt = (mtp_now() - ev->ts_ecr) / 1000;
+    __u32 rtt = (s->now - ev->ts_ecr) / 1000;
     rtt = rtt - (s->tx_bump * 1000000) / LINK_BANDWIDTH;
     if (rtt >= TCP_MAX_RTT) {
         return;
@@ -107,6 +118,9 @@ static __always_inline void proc_rtt(struct tcp_ack *ev, struct bpf_tcp_conn *ct
 /* ---- proc_seq  [ebpf]----------------------------------- */
 static __always_inline void proc_seq(struct tcp_data *ev, struct bpf_tcp_conn *ctx_ebpf, struct tcp_scratch *s)
 {
+    if (!s->ack_ok) {
+        return;
+    }
     __u32 exp_first = ctx_ebpf->rx_next_seq;
     __u32 exp_last = ctx_ebpf->rx_next_seq + ctx_ebpf->rx_avail;
     __u32 pkt_first = ev->seq;

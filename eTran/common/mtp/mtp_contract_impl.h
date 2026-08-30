@@ -28,7 +28,20 @@ extern "C" {
  * spelling in some trees. Accept either -- getting this wrong pulls <time.h>
  * into an eBPF program. */
 #if defined(__BPF__) || defined(__bpf__) || defined(__TARGET_ARCH_bpf)
-static inline __u64 mtp_now(void) { return bpf_ktime_get_ns(); }
+/*
+ * THE TARGET MAY ALREADY HAVE THE TIME, and on this one it does: eTran reads
+ * the clock once per NAPI batch and caches it per CPU, because bpf_ktime_get_ns
+ * is a helper call and the fast path runs per packet. Generated code calling
+ * the clock itself put that call back, once per acknowledgement.
+ *
+ * A target that has nothing better falls through to the helper. `now` is the
+ * program's word for the current time; how expensive it is to obtain is the
+ * target's business, which is exactly why this is overridable and not inlined.
+ */
+#ifndef MTP_NOW
+#define MTP_NOW() bpf_ktime_get_ns()
+#endif
+static inline __u64 mtp_now(void) { return MTP_NOW(); }
 #else
 /* _POSIX_C_SOURCE before <time.h>: the generated code compiles as -std=c11,
  * which is strict ANSI and hides clock_gettime. */
