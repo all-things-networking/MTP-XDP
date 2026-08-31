@@ -89,6 +89,7 @@ const uint16 PARITY_MSS_W_TS    = 1448;   /* mss minus the timestamp option */
 
 /* The compile-time bound on one listener's held SYNs. A SYN arriving with the
  * backlog full is DROPPED, silently -- not reset. */
+const uint32 PROG_MAX_SOCKETS      = 8;   /* sockets sharing one endpoint (SO_REUSEPORT) */
 const uint32 PROG_MAX_BACKLOG   = 512;
 
 /* eTran offers ECN on every SYN unconditionally: there is no socket option and
@@ -136,7 +137,15 @@ flow_id tcp_lid : (uint32, uint16);
 
 /**************************** events ****************************/
 
+/*
+ * THE SOCKET IS A FIELD, NOT AN IDENTITY. Every application call names the
+ * endpoint it acts on -- (ip, port), which is the listening context's id -- and
+ * carries the application's own socket reference as ORDINARY DATA, used only to
+ * pick which of the sockets bound to that endpoint it means. The program never
+ * takes the value apart; it only compares it.
+ */
 event app_bind : app_event {
+    uint64 socket;
     uint32 local_ip;        /* PARSED AND DISCARDED -- see proc_bind */
     uint16 local_port;
     bool   reuseport;
@@ -149,15 +158,17 @@ event app_bind : app_event {
  * it from the bound context.
  */
 event app_listen : app_event {
+    uint64 socket;
     uint32 pending_cap;
 }
 
 event app_accept : app_event {
-    uint16 local_port;      /* which listening endpoint, from the app */
+    uint64 socket;          /* which of the sockets bound to this endpoint */
 }
 
 /* Likewise: the call carries the REMOTE endpoint only. */
 event app_connect : app_event {
+    uint64 socket;
     uint32 remote_ip;
     uint16 remote_port;
 }
@@ -170,7 +181,9 @@ event app_recv : app_event {
     uint32 len;
 }
 
-event app_close : app_event { }
+event app_close : app_event {
+    uint64 socket;
+}
 
 event tcp_syn : net_event {
     uint32 seq;
@@ -179,8 +192,6 @@ event tcp_syn : net_event {
     uint32 ts_val;
     bool   has_ts, has_mss;
     bool   ece, cwr;
-    uint32 qid;             /* the NIC queue it arrived on -- state, not
-                             * bookkeeping: the eBPF half is keyed to it */
 }
 
 event tcp_synack : net_event {
@@ -189,7 +200,6 @@ event tcp_synack : net_event {
     uint32 ts_val;
     bool   has_ts;
     bool   ece, cwr;
-    uint32 qid;
 }
 
 event tcp_ack : net_event {
@@ -231,10 +241,19 @@ event rto_timeout : timer_event { }
 pkt_bp TCPBP {
     uint16 src_port, dst_port;
     uint32 seq_no, ack_seq;
-    /* data_off and checksum are fields the COMPILER fills: the program cannot
-     * do arithmetic over the compiler's own option layout, which is the one
-     * thing it does not know. */
-    hdrlen4_t data_off;
+    /*
+     * THE HEADER LENGTH IS A REAL FIELD and the receiver reads it -- that is
+     * how it finds where the payload starts. So the program declares it, with
+     * an ordinary width.
+     *
+     * It never ASSIGNS it. On egress the value is a function of the option
+     * layout, and the option layout is the compiler's: the program declared the
+     * options and the compiler writes the packing, so the compiler is the only
+     * thing that can compute the length. It used to be declared `hdrlen4_t`, a
+     * type MTP does not have, which said "compiler-filled" in the type where it
+     * belongs in a comment.
+     */
+    uint8  data_off;
     uint8  flags;
     uint16 window;
     checksum16_t checksum;
@@ -281,7 +300,6 @@ context tcp_ctx {
         uint32 syn_ts;
         uint32 syn_attempts;
         uint64 next_timeout_tsc;   /* the donor's name, and a TSC needs 64 bits */
-        uint32 qid;
     }
 
     /*
@@ -355,32 +373,63 @@ struct pending_syn {
     uint32 ts_val;
     bool   has_ts, has_mss;
     bool   ece, cwr;
-    uint32 qid;
     bool   valid;
 }
 
-context tcp_listen_ctx {
-    tcp_lid key;
-
-    uint32 local_ip;
-    uint16 local_port;
+/*
+ * ONE SOCKET BOUND TO AN ENDPOINT.
+ *
+ * A record rather than a context of its own, because a context is selected by
+ * its id and there is no id that distinguishes two sockets bound to the same
+ * (ip, port) -- which is exactly what SO_REUSEPORT is. Holding them in a list
+ * inside the endpoint's context is what lets the id keep selecting the
+ * instance, and it is what makes the reuseport choice something the PROGRAM
+ * makes rather than something the target makes on its behalf.
+ */
+struct listen_slot {
+    /* The application's own reference. Compared, never taken apart. */
+    uint64 socket;
 
     uint32 pending_cap;         /* the backlog argument. It bounds the queue of
                                  * held SYNs -- NOT the queue of completed
                                  * connections, which holds exactly one. */
-    uint32 pending_n;
-    /* THE QUEUE HOLDS THE SYN, NOT A FLOW ID. It used to hold a tcp_fid, which
-     * threw away everything proc_passive_open needs -- the sequence number, the
-     * timestamp, the queue it arrived on, whether ECN was offered -- and then
-     * read those fields off an `ev` that, on the accept() path, is an app_accept
-     * carrying none of them. The donor is explicit about this: it copies the raw
-     * SYN into the backlog and decodes it at passive-open time. */
-    pending_syn pending[PROG_MAX_BACKLOG];
+    /* THE QUEUE HOLDS THE SYN ITSELF. The donor copies the raw SYN into the
+     * backlog and decodes it at passive-open time, because on the accept() path
+     * the event is an app_accept and the SYN is long gone.
+     *
+     * An ARRAY AND A COUNT, not `list<tcp_syn>`. The backend has no typed
+     * bounded list -- `list<>` reaches it only as the event frame and the option
+     * frame -- so a list of a declared type emits as itself and does not
+     * compile. Recorded in docs/LANGUAGE-NEEDS.md; the list form is the one
+     * that should exist. */
+    uint32  pending_n;
+    tcp_syn pending[PROG_MAX_BACKLOG];
 
     /* The completed connection waiting for accept(). Capacity ONE, whatever
      * pending_cap says. */
     tcp_fid accepted;
     bool    has_accepted;
+}
+
+/*
+ * THE LISTENING ENDPOINT -- one instance per (ip, port), and a store rather
+ * than a bag.
+ *
+ * It used to be one context per listening socket, keyed by (ip, port), which
+ * collides the moment two sockets share an endpoint: the target held them in a
+ * bag and picked between them by hashing an arriving SYN's four-tuple. That put
+ * a protocol decision inside the target and broke MTP's rule that an id selects
+ * an instance. Now the id selects THE endpoint, and the sockets bound to it are
+ * a list the program reads.
+ *
+ * Both of this context's users can name it: an arriving packet carries
+ * (local ip, local port), and so does a socket call.
+ */
+context tcp_listen_ctx {
+    tcp_lid key;
+    /* Array and count, for the reason above. */
+    uint32      socket_n;
+    listen_slot sockets[PROG_MAX_SOCKETS];
 }
 
 /**************************** scratchpad ****************************/
@@ -417,6 +466,17 @@ scratchpad_t tcp_tx_scratch {
     uint64 ref_ts;
     bool   wnd_upd;
     bool   tx_ok;
+}
+
+/*
+ * WHICH SOCKET, on an endpoint that has more than one. The SYN path picks by
+ * hashing the four-tuple; the accept() path picks by the socket the call names.
+ * Either way the processors that follow need to know, and that is what a
+ * scratchpad is for.
+ */
+scratchpad_t tcp_open_scratch {
+    uint32 slot;
+    bool   slot_ok;
 }
 
 scratchpad_t tcp_scratch {
@@ -477,27 +537,28 @@ list<event_t> sock_bind(bind op) {
     list<event_t> out;
     app_bind ev;
 
+    ev.socket     = op.socket;
     ev.local_ip   = op.local.ip;
     ev.local_port = op.local.port;
     ev.reuseport  = op.reuseport;
-    set_ctx_lookup_info(ev, tcp_ctx,
-                        tcp_fid(uint32(op.handle >> 16), uint16(op.handle),
-                                uint32(op.handle >> 32), op.local.port));
+    set_ctx_lookup_info(ev, tcp_listen_ctx, tcp_lid(op.local.ip, op.local.port));
     out.add(ev);
     return out;
 }
 
+/*
+ * `op.local` IS POPULATED ON EVERY SOCKET CALL, including this one. A listen()
+ * carries no address of its own -- but the socket layer knows what the socket
+ * bound, because bind() told it, and filling that in is the target's job. The
+ * program should not have to reconstruct an endpoint it already named once.
+ */
 list<event_t> sock_listen(listen op) {
     list<event_t> out;
     app_listen ev;
 
+    ev.socket      = op.socket;
     ev.pending_cap = op.len;
-    /* The BOUND context, by the same fabricated id. The listening endpoint is
-     * not knowable here -- the call carries no address -- so proc_listen
-     * derives it from the context this resolves to. */
-    set_ctx_lookup_info(ev, tcp_ctx,
-                        tcp_fid(uint32(op.handle >> 16), uint16(op.handle),
-                                uint32(op.handle >> 32), op.local.port));
+    set_ctx_lookup_info(ev, tcp_listen_ctx, tcp_lid(op.local.ip, op.local.port));
     out.add(ev);
     return out;
 }
@@ -506,7 +567,7 @@ list<event_t> sock_accept(accept op) {
     list<event_t> out;
     app_accept ev;
 
-    ev.local_port = op.local.port;
+    ev.socket = op.socket;
     set_ctx_lookup_info(ev, tcp_listen_ctx, tcp_lid(op.local.ip, op.local.port));
     out.add(ev);
     return out;
@@ -516,11 +577,17 @@ list<event_t> sock_connect(connect op) {
     list<event_t> out;
     app_connect ev;
 
+    ev.socket      = op.socket;
     ev.remote_ip   = op.remote.ip;
     ev.remote_port = op.remote.port;
+    /* TWO CONTEXTS, which the parser may name and does elsewhere. The
+     * connection this call creates, by the four-tuple the call itself supplies
+     * -- and the endpoint, because a socket that bound before connecting has a
+     * slot there to give up. */
     set_ctx_lookup_info(ev, tcp_ctx,
-                        tcp_fid(uint32(op.handle >> 16), uint16(op.handle),
-                                uint32(op.handle >> 32), op.local.port));
+                        tcp_fid(op.remote.ip, op.remote.port,
+                                op.local.ip, op.local.port));
+    set_ctx_lookup_info(ev, tcp_listen_ctx, tcp_lid(op.local.ip, op.local.port));
     out.add(ev);
     return out;
 }
@@ -599,7 +666,6 @@ list<event_t> parse_tcp(pkt_t p, ipv4 h) {
         s.has_mss = bp.opts.has_mss;
         s.ece = (bp.flags & FLAG_ECE) != 0;
         s.cwr = (bp.flags & FLAG_CWR) != 0;
-        s.qid = p.qid;
         set_ctx_lookup_info(s, tcp_listen_ctx, lid);
         out.add(s);
         return out;
@@ -612,7 +678,6 @@ list<event_t> parse_tcp(pkt_t p, ipv4 h) {
         sa.has_ts = bp.opts.has_ts;
         sa.ece = (bp.flags & FLAG_ECE) != 0;
         sa.cwr = (bp.flags & FLAG_CWR) != 0;
-        sa.qid = p.qid;
         set_ctx_lookup_info(sa, tcp_ctx, fid);
         out.add(sa);
         return out;
@@ -684,20 +749,26 @@ list<event_t> parse_tcp(pkt_t p, ipv4 h) {
  * it again on failure. Written with new_ctx after the guards, which is
  * behaviour-preserving because nothing can observe an unregistered context.
  */
-void proc_bind(app_bind ev, tcp_ctx ctx) {
-    tcp_fid fid = ctx.key;
-    new_ctx_instr(fid);
+void proc_bind(app_bind ev, tcp_listen_ctx lst) {
+    /* The endpoint, which several sockets may share. First bind creates it. */
+    tcp_lid lid = tcp_lid(ev.local_ip, ev.local_port);
+    new_ctx_instr(lid);
 
-    ctx.type      = TYPE_FAKE;
-    ctx.reuseport = ev.reuseport;
-    ctx.local_port = ev.local_port;
+    if (lst.socket_n >= PROG_MAX_SOCKETS)
+        return;
 
-    /* ev.local_ip IS DISCARDED. Every bind takes the node's single configured
-     * address; the donor reads the field into a local and writes
-     * `(void)_local_ip; // FIXME`. Binding to a specific address is not
-     * implemented, and a program that honoured the field would not be eTran. */
+    lst.sockets[lst.socket_n].socket       = ev.socket;
+    lst.sockets[lst.socket_n].pending_cap  = 0;
+    lst.sockets[lst.socket_n].pending_n    = 0;
+    lst.sockets[lst.socket_n].has_accepted = false;
+    lst.socket_n = lst.socket_n + 1;
 
-    notify(ctx, BOUND);
+    /* ev.local_ip IS OTHERWISE DISCARDED. Every bind takes the node's single
+     * configured address; the donor reads the field and writes `(void)`.
+     * Binding to a specific address is not implemented, and a program that
+     * honoured the field would not be eTran. */
+
+    notify(lst, BOUND);
 }
 
 /*
@@ -705,18 +776,21 @@ void proc_bind(app_bind ev, tcp_ctx ctx) {
  * bound socket, not a connection". Nothing marks the bound context as
  * listening -- the listener's existence is what says so.
  */
-void proc_listen(app_listen ev, tcp_ctx bound, tcp_listen_ctx lst) {
-    if (bound.type != TYPE_FAKE)
+void proc_listen(app_listen ev, tcp_listen_ctx lst, tcp_open_scratch s) {
+    uint32 i = 0;
+
+    s.slot_ok = false;
+    while (i < lst.socket_n) {
+        if (lst.sockets[i].socket == ev.socket) {
+            s.slot = i;
+            s.slot_ok = true;
+        }
+        i = i + 1;
+    }
+    if (!s.slot_ok)
         return;
 
-    tcp_lid lid = tcp_lid(bound.local_ip, bound.local_port);
-    new_ctx_instr(lid);
-
-    lst.local_ip    = bound.local_ip;
-    lst.local_port  = bound.local_port;
-    lst.pending_cap = ev.pending_cap;
-    lst.pending_n   = 0;
-    lst.has_accepted = false;
+    lst.sockets[s.slot].pending_cap = ev.pending_cap;
 
     notify(lst, LISTENING);
 }
@@ -734,13 +808,53 @@ void proc_listen(app_listen ev, tcp_ctx bound, tcp_listen_ctx lst) {
  * There is no notify on this path. The application is told when the SYN-ACK
  * goes out, from gen_synack.
  */
-void proc_accept(app_accept ev, tcp_listen_ctx lst) {
-    /* Exactly ONE completed connection may wait, whatever pending_cap says --
-     * that cap governs the queue of held SYNs, which is a different queue. */
-    if (lst.has_accepted)
+void proc_accept(app_accept ev, tcp_listen_ctx lst, tcp_open_scratch s) {
+    uint32 i = 0;
+
+    s.slot_ok = false;
+    while (i < lst.socket_n) {
+        if (lst.sockets[i].socket == ev.socket) {
+            s.slot = i;
+            s.slot_ok = true;
+        }
+        i = i + 1;
+    }
+    if (!s.slot_ok)
+        return;
+    if (lst.sockets[s.slot].has_accepted)
         return;
 
-    lst.has_accepted = true;
+    lst.sockets[s.slot].has_accepted = true;
+}
+
+/*
+ * WHICH LISTENING SOCKET AN ARRIVING SYN BELONGS TO -- the SO_REUSEPORT choice,
+ * and the first time this program has been able to make it. eTran makes the
+ * same choice inside ctx_bag::select, which is protocol policy living in the
+ * target; here it is a hash the program writes, over a list the program holds.
+ *
+ * The hash is the donor's exactly (tcp_program.h): source ip, destination ip,
+ * source port and destination port XORed, modulo the number of sockets. It has
+ * to be exactly that, or a SYN lands on a different socket than eTran would
+ * have chosen -- invisible with one listening socket, observable with two.
+ */
+void proc_syn_select(tcp_syn ev, tcp_listen_ctx lst, tcp_open_scratch s) {
+    s.slot_ok = false;
+    if (lst.socket_n == 0)
+        return;
+
+    /* MTP HAS NO XOR. It has ~ & | << >>, and the donor's hash is XOR, so it is
+     * written out with the identity a^b == (a|b) & ~(a&b). Exact, and ugly;
+     * `^` is on the list in docs/LANGUAGE-NEEDS.md. */
+    uint32 a = ev.remote_ip;
+    uint32 b = ev.local_ip;
+    uint32 c = uint32(ev.sport);
+    uint32 d = uint32(ev.dport);
+    uint32 x1 = (a | b) & ~(a & b);
+    uint32 x2 = (c | d) & ~(c & d);
+    uint32 h  = ((x1 | x2) & ~(x1 & x2)) % lst.socket_n;
+    s.slot = h;
+    s.slot_ok = true;
 }
 
 /*
@@ -812,29 +926,30 @@ void gen_syn(app_connect ev, tcp_ctx ctx) {
  * satisfy; it read `ev.seq` off an app_accept until the link check made the
  * dispatch compile. Everything it needs comes from the queue.
  */
-void proc_passive_open(event_t ev, tcp_listen_ctx lst, tcp_ctx ctx) {
-    pending_syn syn;
+void proc_passive_open(event_t ev, tcp_listen_ctx lst, tcp_ctx ctx, tcp_open_scratch s) {
+    tcp_syn syn;
 
-    if (!lst.has_accepted) {
+    if (!s.slot_ok)
+        return;
+
+    if (!lst.sockets[s.slot].has_accepted) {
         /* No accept waiting: the SYN stays queued. proc_syn_queue already put
          * it there, so there is nothing to do but tell the application. */
-        if (lst.pending_n == 0)
+        if (lst.sockets[s.slot].pending_n == 0)
             return;
         notify(lst, NEW_CONN);
         return;
     }
 
-    if (lst.pending_n == 0)
+    if (lst.sockets[s.slot].pending_n == 0)
         return;                       /* accept() waiting, no SYN yet */
-    syn = lst.pending[0];
+    syn = lst.sockets[s.slot].pending[0];
 
     /* The options are re-parsed HERE, not when the SYN arrived: the donor
      * copies 256 raw bytes into the backlog and decodes them at this point,
      * which is why MSS and the timestamp are read later than received. */
     if (!syn.has_ts || !syn.has_mss)
         return;
-
-    ctx.qid         = syn.qid;
     ctx.type        = TYPE_NORMAL;
     ctx.local_ip    = syn.local_ip;
     ctx.local_port  = syn.dport;
@@ -855,16 +970,16 @@ void proc_passive_open(event_t ev, tcp_listen_ctx lst, tcp_ctx ctx) {
     new_ctx_instr(fid);
 
     ctx.status = CONN_WAIT_TX_SYNACK;
-    lst.has_accepted = false;
+    lst.sockets[s.slot].has_accepted = false;
 
     /* THE SYN IS SPENT. Both halves of the rendezvous are consumed together --
      * leaving it queued would hand the same SYN to the next accept(). */
     uint32 i = 0;
-    while (i + 1 < lst.pending_n) {
-        lst.pending[i] = lst.pending[i + 1];
+    while (i + 1 < lst.sockets[s.slot].pending_n) {
+        lst.sockets[s.slot].pending[i] = lst.sockets[s.slot].pending[i + 1];
         i = i + 1;
     }
-    lst.pending_n = lst.pending_n - 1;
+    lst.sockets[s.slot].pending_n = lst.sockets[s.slot].pending_n - 1;
 }
 
 /*
@@ -872,27 +987,16 @@ void proc_passive_open(event_t ev, tcp_listen_ctx lst, tcp_ctx ctx) {
  * it, whether the accept() has already arrived or comes later. A full backlog
  * DROPS it -- silently, and not with a reset, which is the donor's behaviour.
  */
-void proc_syn_queue(tcp_syn ev, tcp_listen_ctx lst) {
-    pending_syn syn;
-
-    if (lst.pending_n >= lst.pending_cap)
+void proc_syn_queue(tcp_syn ev, tcp_listen_ctx lst, tcp_open_scratch s) {
+    if (!s.slot_ok)
+        return;
+    if (lst.sockets[s.slot].pending_n >= lst.sockets[s.slot].pending_cap)
         return;
 
-    syn.seq       = ev.seq;
-    syn.sport     = ev.sport;
-    syn.dport     = ev.dport;
-    syn.local_ip  = ev.local_ip;
-    syn.remote_ip = ev.remote_ip;
-    syn.ts_val    = ev.ts_val;
-    syn.has_ts    = ev.has_ts;
-    syn.has_mss   = ev.has_mss;
-    syn.ece       = ev.ece;
-    syn.cwr       = ev.cwr;
-    syn.qid       = ev.qid;
-    syn.valid     = true;
-
-    lst.pending[lst.pending_n] = syn;
-    lst.pending_n = lst.pending_n + 1;
+    /* The SYN itself, held whole. The donor copies the raw segment into the
+     * backlog and decodes it at passive-open time. */
+    lst.sockets[s.slot].pending[lst.sockets[s.slot].pending_n] = ev;
+    lst.sockets[s.slot].pending_n = lst.sockets[s.slot].pending_n + 1;
 }
 
 /*
@@ -938,7 +1042,6 @@ void proc_synack(tcp_synack ev, tcp_ctx ctx) {
 
     /* The NIC queue this connection's eBPF half will be keyed to. A state
      * write, not bookkeeping. */
-    ctx.qid = ev.qid;
     timer_stop(ctx.handshake_timer);
 
     if (!ev.has_ts) {
@@ -1470,7 +1573,7 @@ dispatch tcp_dispatch {
     app_send    -> { record_data, gen_seg };
     app_recv    -> { proc_drain, send_wnd_update };
 
-    tcp_syn     -> { proc_syn_queue, proc_passive_open, gen_synack };
+    tcp_syn     -> { proc_syn_select, proc_syn_queue, proc_passive_open, gen_synack };
     tcp_synack  -> { proc_synack };
     tcp_rst     -> { proc_rst };
     tcp_fin     -> { proc_fin };

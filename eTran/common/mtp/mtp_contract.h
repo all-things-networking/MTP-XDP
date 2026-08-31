@@ -96,7 +96,13 @@ struct mtp_addr { __u32 ip; __u16 port; __u64 ref; __u32 len; };
 struct mtp_sock_op {
     struct mtp_addr local;
     struct mtp_addr remote;
-    __u64  handle;        /* the application's socket handle */
+    /*
+     * THE APPLICATION'S SOCKET, as the socket layer names it. A program may
+     * carry this value and compare it; it may NOT take it apart. It was called
+     * `handle` and tcp.mtp was slicing it into a flow id -- three quarters of a
+     * context's identity were bytes of a pointer. Named for what it is.
+     */
+    __u64  socket;
     __u32  len;           /* send/recv length, or the listen backlog */
     __u32  flags;         /* the call's own flags, e.g. send's */
     struct mtp_addr data; /* the buffer a send hands over, by address */
