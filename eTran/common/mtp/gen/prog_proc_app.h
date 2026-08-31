@@ -7,11 +7,11 @@
 #include "prog.h"
 
 /* ---- prototypes----------------------------------------- */
-static inline void record_data(struct app_send *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_app *ctx_app);
-static inline void proc_drain(struct app_recv *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_app *ctx_app);
+static inline void record_data(struct app_send *ev, struct tcp_ctx_app *ctx_app);
+static inline void proc_drain(struct app_recv *ev, struct tcp_ctx_app *ctx_app);
 
 /* ---- record_data  [app]--------------------------------- */
-static inline void record_data(struct app_send *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_app *ctx_app)
+static inline void record_data(struct app_send *ev, struct tcp_ctx_app *ctx_app)
 {
     if (ctx_app->txb_allocated < ev->len) {
         return;
@@ -21,7 +21,7 @@ static inline void record_data(struct app_send *ev, struct tcp_ctx_common *ctx_c
 }
 
 /* ---- proc_drain  [app]---------------------------------- */
-static inline void proc_drain(struct app_recv *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_app *ctx_app)
+static inline void proc_drain(struct app_recv *ev, struct tcp_ctx_app *ctx_app)
 {
     if (ctx_app->rxb_used < ev->len) {
         return;

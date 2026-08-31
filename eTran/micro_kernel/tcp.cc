@@ -440,20 +440,20 @@ int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen)
 
     ebpf_c.rx_buf_size = etran_tcp->_trans_params.tcp.rx_buf_size;
     ebpf_c.tx_buf_size = etran_tcp->_trans_params.tcp.tx_buf_size;
-    ebpf_c.rx_avail = std::min(etran_tcp->_trans_params.tcp.rx_buf_size, (unsigned int)(0xffff << TCP_WND_SCALE));
-    ebpf_c.rx_remote_avail = std::min(etran_tcp->_trans_params.tcp.rx_buf_size, (unsigned int)(0xffff << TCP_WND_SCALE));
-    ebpf_c.rx_next_pos = 0;
-    ebpf_c.rx_next_seq = c->remote_seq;
+    ebpf_c.mtp_ebpf.rx_avail = std::min(etran_tcp->_trans_params.tcp.rx_buf_size, (unsigned int)(0xffff << TCP_WND_SCALE));
+    ebpf_c.mtp_ebpf.rx_remote_avail = std::min(etran_tcp->_trans_params.tcp.rx_buf_size, (unsigned int)(0xffff << TCP_WND_SCALE));
+    ebpf_c.mtp_ebpf.rx_next_pos = 0;
+    ebpf_c.mtp_ebpf.rx_next_seq = c->remote_seq;
 
-    ebpf_c.rx_dupack_cnt = 0;
-    ebpf_c.rx_ooo_start = 0;
-    ebpf_c.rx_ooo_len = 0;
+    ebpf_c.mtp_ebpf.rx_dupack_cnt = 0;
+    ebpf_c.mtp_ebpf.rx_ooo_start = 0;
+    ebpf_c.mtp_ebpf.rx_ooo_len = 0;
 
-    ebpf_c.tx_pending = 0;
-    ebpf_c.tx_sent = 0;
-    ebpf_c.tx_next_pos = 0;
-    ebpf_c.tx_next_seq = listen ? c->local_seq + 1 : c->local_seq;
-    ebpf_c.tx_next_ts = 0;
+    ebpf_c.mtp_ebpf.tx_pending = 0;
+    ebpf_c.mtp_ebpf.tx_sent = 0;
+    ebpf_c.mtp_ebpf.tx_next_pos = 0;
+    ebpf_c.mtp_ebpf.tx_next_seq = listen ? c->local_seq + 1 : c->local_seq;
+    ebpf_c.mtp_ebpf.tx_next_ts = 0;
 
     ebpf_c.cc_idx = cc_idx;
     ebpf_c.ecn_enable = c->flags & ECN_ENABLE;

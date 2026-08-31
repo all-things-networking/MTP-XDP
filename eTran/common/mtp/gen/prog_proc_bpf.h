@@ -7,19 +7,19 @@
 #include "prog.h"
 
 /* ---- prototypes----------------------------------------- */
-static __always_inline void proc_ack(struct tcp_ack *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_scratch *s);
-static __always_inline void proc_fast_retransmit(struct tcp_ack *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_scratch *s);
-static __always_inline void proc_window(struct tcp_ack *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s);
-static __always_inline void proc_rtt(struct tcp_ack *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_scratch *s);
-static __always_inline void proc_seq(struct tcp_data *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s);
-static __always_inline void proc_ooo(struct tcp_data *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s);
-static __always_inline void proc_recv(struct tcp_data *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s);
-static __always_inline void gen_retransmit(struct rto_timeout *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_tx_scratch *s);
-static __always_inline void send_wnd_update(struct app_recv *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_tx_scratch *s);
-static __always_inline void gen_seg(struct app_send *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_tx_scratch *s);
+static __always_inline void proc_ack(struct tcp_ack *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_scratch *s);
+static __always_inline void proc_fast_retransmit(struct tcp_ack *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_scratch *s);
+static __always_inline void proc_window(struct tcp_ack *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s);
+static __always_inline void proc_rtt(struct tcp_ack *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_scratch *s);
+static __always_inline void proc_seq(struct tcp_data *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s);
+static __always_inline void proc_ooo(struct tcp_data *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s);
+static __always_inline void proc_recv(struct tcp_data *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s);
+static __always_inline void gen_retransmit(struct rto_timeout *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_tx_scratch *s);
+static __always_inline void send_wnd_update(struct app_recv *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_tx_scratch *s);
+static __always_inline void gen_seg(struct app_send *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_tx_scratch *s);
 
 /* ---- proc_ack  [ebpf]----------------------------------- */
-static __always_inline void proc_ack(struct tcp_ack *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_scratch *s)
+static __always_inline void proc_ack(struct tcp_ack *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_scratch *s)
 {
     s->ack_ok = false;
     s->tx_bump = 0;
@@ -49,7 +49,7 @@ static __always_inline void proc_ack(struct tcp_ack *ev, struct tcp_ctx_common *
 }
 
 /* ---- proc_fast_retransmit  [ebpf]----------------------- */
-static __always_inline void proc_fast_retransmit(struct tcp_ack *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_scratch *s)
+static __always_inline void proc_fast_retransmit(struct tcp_ack *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_scratch *s)
 {
     if (!s->ack_ok) {
         return;
@@ -84,7 +84,7 @@ static __always_inline void proc_fast_retransmit(struct tcp_ack *ev, struct tcp_
 }
 
 /* ---- proc_window  [ebpf]-------------------------------- */
-static __always_inline void proc_window(struct tcp_ack *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s)
+static __always_inline void proc_window(struct tcp_ack *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s)
 {
     if (!s->ack_ok) {
         return;
@@ -95,7 +95,7 @@ static __always_inline void proc_window(struct tcp_ack *ev, struct tcp_ctx_commo
 }
 
 /* ---- proc_rtt  [ebpf]----------------------------------- */
-static __always_inline void proc_rtt(struct tcp_ack *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_scratch *s)
+static __always_inline void proc_rtt(struct tcp_ack *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_scratch *s)
 {
     if (!s->ack_ok) {
         return;
@@ -119,7 +119,7 @@ static __always_inline void proc_rtt(struct tcp_ack *ev, struct tcp_ctx_common *
 }
 
 /* ---- proc_seq  [ebpf]----------------------------------- */
-static __always_inline void proc_seq(struct tcp_data *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s)
+static __always_inline void proc_seq(struct tcp_data *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s)
 {
     if (!s->ack_ok) {
         return;
@@ -160,7 +160,7 @@ static __always_inline void proc_seq(struct tcp_data *ev, struct tcp_ctx_common 
 }
 
 /* ---- proc_ooo  [ebpf]----------------------------------- */
-static __always_inline void proc_ooo(struct tcp_data *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s)
+static __always_inline void proc_ooo(struct tcp_data *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s)
 {
     if (s->seg_ok) {
         return;
@@ -188,7 +188,7 @@ static __always_inline void proc_ooo(struct tcp_data *ev, struct tcp_ctx_common 
 }
 
 /* ---- proc_recv  [ebpf]---------------------------------- */
-static __always_inline void proc_recv(struct tcp_data *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s)
+static __always_inline void proc_recv(struct tcp_data *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s)
 {
     if (!s->seg_ok) {
         return;
@@ -246,13 +246,13 @@ static __always_inline void proc_recv(struct tcp_data *ev, struct tcp_ctx_common
 }
 
 /* ---- gen_retransmit  [ebpf]----------------------------- */
-static __always_inline void gen_retransmit(struct rto_timeout *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_tx_scratch *s)
+static __always_inline void gen_retransmit(struct rto_timeout *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_tx_scratch *s)
 {
     s->tx_ok = ctx_ebpf->tx_sent > 0;
 }
 
 /* ---- send_wnd_update  [ebpf]---------------------------- */
-static __always_inline void send_wnd_update(struct app_recv *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_tx_scratch *s)
+static __always_inline void send_wnd_update(struct app_recv *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_tx_scratch *s)
 {
     if (s->rx_bump == 0) {
         return;
@@ -264,7 +264,7 @@ static __always_inline void send_wnd_update(struct app_recv *ev, struct tcp_ctx_
 }
 
 /* ---- gen_seg  [ebpf]------------------------------------ */
-static __always_inline void gen_seg(struct app_send *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_tx_scratch *s)
+static __always_inline void gen_seg(struct app_send *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_tx_scratch *s)
 {
     s->tx_ok = false;
     if (s->tx_pos != ctx_ebpf->tx_next_pos) {

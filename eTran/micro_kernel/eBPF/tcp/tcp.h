@@ -178,14 +178,14 @@ static __always_inline int enqueue_prev_ack(__u32 cpu)
     ack->local_port = c->local_port;
     ack->remote_port = c->remote_port;
 
-    ack->seq = c->tx_next_seq;
-    ack->ack = c->rx_next_seq;
+    ack->seq = c->mtp_ebpf.tx_next_seq;
+    ack->ack = c->mtp_ebpf.rx_next_seq;
 
-    ack->rxwnd = min(c->rx_avail >> TCP_WND_SCALE, 0xFFFF);
+    ack->rxwnd = min(c->mtp_ebpf.rx_avail >> TCP_WND_SCALE, 0xFFFF);
     
     ack->ts_val = now;
-    ack->ts_ecr = c->tx_next_ts;
-    c->tx_next_ts = 0;
+    ack->ts_ecr = c->mtp_ebpf.tx_next_ts;
+    c->mtp_ebpf.tx_next_ts = 0;
 
     TCP_UNLOCK(c);
 
@@ -203,14 +203,14 @@ static __always_inline int enqueue_ack(struct bpf_tcp_conn *c, struct bpf_tcp_ac
     ack->local_port = c->local_port;
     ack->remote_port = c->remote_port;
 
-    ack->seq = c->tx_next_seq;
-    ack->ack = c->rx_next_seq;
+    ack->seq = c->mtp_ebpf.tx_next_seq;
+    ack->ack = c->mtp_ebpf.rx_next_seq;
 
-    ack->rxwnd = min(c->rx_avail >> TCP_WND_SCALE, 0xFFFF);
+    ack->rxwnd = min(c->mtp_ebpf.rx_avail >> TCP_WND_SCALE, 0xFFFF);
     
     ack->ts_val = now;
-    ack->ts_ecr = c->tx_next_ts;
-    c->tx_next_ts = 0;
+    ack->ts_ecr = c->mtp_ebpf.tx_next_ts;
+    c->mtp_ebpf.tx_next_ts = 0;
 
     ack->ecn_flags = ece ? 1 : 0;
 
@@ -221,13 +221,13 @@ static __always_inline int enqueue_ack(struct bpf_tcp_conn *c, struct bpf_tcp_ac
 
 static __always_inline __u32 xsk_budget_avail(const struct bpf_tcp_conn *c)
 {
-    return c->rx_remote_avail;
+    return c->mtp_ebpf.rx_remote_avail;
 }
 
 static __always_inline __u32 tcp_txavail(const struct bpf_tcp_conn *c)
 {
     /* flow control window */
-    return c->rx_remote_avail - c->tx_sent;
+    return c->mtp_ebpf.rx_remote_avail - c->mtp_ebpf.tx_sent;
 }
 
 static __always_inline void set_tcp_flag(struct tcphdr *tcph, __u16 len, __u16 flags)
@@ -265,10 +265,10 @@ static __always_inline void fill_ip_hdr(struct iphdr *iph, __u32 payload_len, bo
 // Fill TCP header excpet for ports
 static __always_inline void fill_tcp_hdr(struct iphdr *iph, struct tcphdr *tcph, struct bpf_tcp_conn *c, __u32 tgt_ts, void *data_end, __u16 flags)
 {
-    __u32 tx_seq = c->tx_next_seq;
-    __u32 rx_wnd = c->rx_avail;
-    __u32 ack_seq = c->rx_next_seq;
-    __u32 ts_ecr = c->tx_next_ts;
+    __u32 tx_seq = c->mtp_ebpf.tx_next_seq;
+    __u32 rx_wnd = c->mtp_ebpf.rx_avail;
+    __u32 ack_seq = c->mtp_ebpf.rx_next_seq;
+    __u32 ts_ecr = c->mtp_ebpf.tx_next_ts;
     struct tcp_timestamp_opt *ts_opt = (struct tcp_timestamp_opt *)(tcph + 1);
     if (ts_opt + 1 > data_end) {
         return;
@@ -295,7 +295,7 @@ static __always_inline void fill_tcp_hdr(struct iphdr *iph, struct tcphdr *tcph,
 static __always_inline __u64 cc_get_desired_tx_ts(struct bpf_cc *cc, __u64 ref_ts, __u32 payload_len)
 {
     // TODO: improve precision
-    __u64 ns_delta = (__u64)1000000000 * payload_len / cc->rate;
+    __u64 ns_delta = (__u64)1000000000 * payload_len / cc->mtp_cc.rate;
     // __u64 ns_delta = (__u64)1000000000 * payload_len / 3125000000; // 25Gbps
     // __u64 ns_delta = (__u64)1000000000 * payload_len / 2500000000; // 20Gbps
     // __u64 ns_delta = (__u64)1000000000 * payload_len / 1250000000; // 10Gbps
@@ -315,34 +315,34 @@ static __always_inline __u64 cc_get_desired_tx_ts(struct bpf_cc *cc, __u64 ref_t
 
 static __always_inline __u32 fast_retransmit(struct bpf_tcp_conn *c, struct bpf_cc *cc)
 {
-    __u32 go_back_bytes = c->tx_sent;
+    __u32 go_back_bytes = c->mtp_ebpf.tx_sent;
     __u32 x;
 
     /* reset flow state as if we never transmitted those segments */
-    c->rx_dupack_cnt = 0;
+    c->mtp_ebpf.rx_dupack_cnt = 0;
 
-    c->tx_next_seq -= go_back_bytes;
-    if (c->tx_next_pos >= go_back_bytes) {
-        c->tx_next_pos -= go_back_bytes;
+    c->mtp_ebpf.tx_next_seq -= go_back_bytes;
+    if (c->mtp_ebpf.tx_next_pos >= go_back_bytes) {
+        c->mtp_ebpf.tx_next_pos -= go_back_bytes;
     } else {
-        x = go_back_bytes - c->tx_next_pos;
-        c->tx_next_pos = c->tx_buf_size - x;
+        x = go_back_bytes - c->mtp_ebpf.tx_next_pos;
+        c->mtp_ebpf.tx_next_pos = c->tx_buf_size - x;
     }
 
-    c->tx_pending = 0;
-    c->rx_remote_avail += go_back_bytes;
+    c->mtp_ebpf.tx_pending = 0;
+    c->mtp_ebpf.rx_remote_avail += go_back_bytes;
 
-    c->tx_sent = 0;
-    cc->txp = 0;
+    c->mtp_ebpf.tx_sent = 0;
+    cc->mtp_cc.txp = 0;
 
     /* cut rate by half if first drop in control interval */
-    if (cc->cnt_tx_drops == 0) {
-        cc->rate >>= 1;
+    if (cc->mtp_cc.cnt_tx_drops == 0) {
+        cc->mtp_cc.rate >>= 1;
     }
 
-    cc->cnt_tx_drops++;
+    cc->mtp_cc.cnt_tx_drops++;
 
-    return c->tx_next_pos;
+    return c->mtp_ebpf.tx_next_pos;
 }
 
 // Caller must hold bpf_spin_lock
@@ -354,11 +354,11 @@ static __always_inline __u32 fast_retransmit(struct bpf_tcp_conn *c, struct bpf_
 
 static __always_inline int tcp_valid_rxack(struct bpf_tcp_conn *c, __u32 ack_seq, __u32 *bump)
 {
-    __u32 exp_ack_first = c->tx_next_seq - c->tx_sent;
-    __u32 exp_ack_last = c->tx_next_seq;
+    __u32 exp_ack_first = c->mtp_ebpf.tx_next_seq - c->mtp_ebpf.tx_sent;
+    __u32 exp_ack_last = c->mtp_ebpf.tx_next_seq;
 
     // allow receving ack that we haven't sent yet, this is probably caused by retransmission
-    exp_ack_last += c->tx_pending;
+    exp_ack_last += c->mtp_ebpf.tx_pending;
 
     if (exp_ack_first <= exp_ack_last) {
         if (ack_seq < exp_ack_first || ack_seq > exp_ack_last)
@@ -399,8 +399,8 @@ static __always_inline bool seq_in_range(__u32 seq, __u32 start, __u32 end, bool
  */
 static __always_inline int tcp_valid_rxseq_ooo(struct bpf_tcp_conn *c, __u32 seq, __u32 payload_len, __u32 *trim_start, __u32 *trim_end)
 {
-    __u32 exp_seq_first = c->rx_next_seq;
-    __u32 exp_seq_last = c->rx_next_seq + c->rx_avail;
+    __u32 exp_seq_first = c->mtp_ebpf.rx_next_seq;
+    __u32 exp_seq_last = c->mtp_ebpf.rx_next_seq + c->mtp_ebpf.rx_avail;
 
     __u32 pkt_seq_first = seq;
     __u32 pkt_seq_last = seq + payload_len;
@@ -438,8 +438,8 @@ static __always_inline int tcp_valid_rxseq_ooo(struct bpf_tcp_conn *c, __u32 seq
  */
 static __always_inline int tcp_valid_rxseq(struct bpf_tcp_conn *c, __u32 seq, __u32 payload_len, __u32 *trim_start, __u32 *trim_end)
 {
-    __u32 exp_seq_first = c->rx_next_seq;
-    __u32 exp_seq_last = c->rx_next_seq + c->rx_avail;
+    __u32 exp_seq_first = c->mtp_ebpf.rx_next_seq;
+    __u32 exp_seq_last = c->mtp_ebpf.rx_next_seq + c->mtp_ebpf.rx_avail;
 
     __u32 pkt_seq_first = seq;
     __u32 pkt_seq_last = seq + payload_len;

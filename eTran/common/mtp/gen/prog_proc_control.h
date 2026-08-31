@@ -25,7 +25,7 @@ static inline void proc_syn_queue(struct tcp_syn *ev, struct tcp_listen_ctx_comm
 static inline void gen_synack(void * ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf);
 static inline void proc_synack(struct tcp_synack *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf);
 static inline void proc_rst(struct tcp_rst *ev, struct tcp_ctx_common *ctx_common);
-static inline void proc_fin(struct tcp_fin *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf);
+static inline void proc_fin(struct tcp_fin *ev, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf);
 static inline void proc_close(struct app_close *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf);
 
 /* ---- sock_bind  [control]------------------------------- */
@@ -396,7 +396,7 @@ static inline void proc_rst(struct tcp_rst *ev, struct tcp_ctx_common *ctx_commo
 }
 
 /* ---- proc_fin  [control]-------------------------------- */
-static inline void proc_fin(struct tcp_fin *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf)
+static inline void proc_fin(struct tcp_fin *ev, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf)
 {
     if (ctx_control->status != CONN_CLOSED) {
         return;

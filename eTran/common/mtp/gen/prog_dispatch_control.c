@@ -52,9 +52,9 @@ static inline void mtp_dispatch_tcp_rst_control(struct tcp_rst *ev, struct tcp_c
     proc_rst(ev, c_tcp_ctx_common);
 }
 
-static inline void mtp_dispatch_tcp_fin_control(struct tcp_fin *ev, struct tcp_ctx_common *c_tcp_ctx_common, struct tcp_ctx_control *c_tcp_ctx_control, struct tcp_ctx_ebpf *c_tcp_ctx_ebpf)
+static inline void mtp_dispatch_tcp_fin_control(struct tcp_fin *ev, struct tcp_ctx_control *c_tcp_ctx_control, struct tcp_ctx_ebpf *c_tcp_ctx_ebpf)
 {
-    proc_fin(ev, c_tcp_ctx_common, c_tcp_ctx_control, c_tcp_ctx_ebpf);
+    proc_fin(ev, c_tcp_ctx_control, c_tcp_ctx_ebpf);
 }
 
 /* ---- start-up------------------------------------------- */

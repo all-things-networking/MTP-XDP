@@ -77,9 +77,9 @@ static __always_inline bool tcp_is_slow_path_event(const struct tcphdr *tcph)
  *     descriptor ring.
  *   - post_data and send_ack, which are the target's epilogue.
  * ------------------------------------------------------------------ */
-#include "gen/prog.h"
-#include "gen/prog_proc_bpf.h"
-#include "gen/prog_dispatch_bpf.h"
+#include "mtp/gen/prog.h"
+#include "mtp/gen/prog_proc_bpf.h"
+#include "mtp/gen/prog_dispatch_bpf.h"
 
 /*
  * The metadata the redirect needs, derived after the chain from the scratchpad
@@ -104,7 +104,7 @@ static __always_inline void mtp_rx_meta(struct bpf_tcp_conn *c, struct meta_info
     else if (s->ooo_fin)  data_meta->rx.ooo_bump = OOO_FIN_MASK;
     else if (s->ooo_seg)  data_meta->rx.ooo_bump = OOO_SEGMENT_MASK;
 
-    if ((c->rx_avail >> TCP_WND_SCALE) == 0)
+    if ((c->mtp_ebpf.rx_avail >> TCP_WND_SCALE) == 0)
         data_meta->rx.qid |= FORCE_RX_BUMP_MASK;
 }
 
@@ -248,7 +248,7 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
     ev_data.ecn_ce = ece;
 
     /* Where the stream stood before the chain, for the metadata below. */
-    __u32 pos0 = c->rx_next_pos, seq0 = c->rx_next_seq;
+    __u32 pos0 = c->mtp_ebpf.rx_next_pos, seq0 = c->mtp_ebpf.rx_next_seq;
 
     /*
      * THE DONOR'S ORDER, WITH THE DONOR'S EARLY EXITS -- and this is a TARGET
@@ -268,15 +268,15 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
      * processor that must not run guards on them -- which is how MTP says
      * "the chain is over" -- and the calls below are ordered to match.
      */
-    proc_ack(&ev_ack, c, cc, &s);
+    proc_ack(&ev_ack, &c->mtp_ebpf, &cc->mtp_cc, &s);
     if (likely(s.ack_ok)) {
-        proc_fast_retransmit(&ev_ack, c, cc, &s);
-        proc_seq(&ev_data, c, &s);
-        proc_ooo(&ev_data, c, &s);
+        proc_fast_retransmit(&ev_ack, &c->mtp_ebpf, &cc->mtp_cc, &s);
+        proc_seq(&ev_data, &c->mtp_ebpf, &s);
+        proc_ooo(&ev_data, &c->mtp_ebpf, &s);
         if (likely(s.seg_ok)) {
-            proc_window(&ev_ack, c, &s);
-            proc_rtt(&ev_ack, c, cc, &s);
-            proc_recv(&ev_data, c, &s);
+            proc_window(&ev_ack, &c->mtp_ebpf, &s);
+            proc_rtt(&ev_ack, &c->mtp_ebpf, &cc->mtp_cc, &s);
+            proc_recv(&ev_data, &c->mtp_ebpf, &s);
         }
     }
     mtp_rx_meta(c, data_meta, &s, pos0, seq0);
@@ -351,7 +351,7 @@ static __always_inline int site_gen_retransmit(struct bpf_tcp_conn *c, struct bp
          * stream goes back to is the target's congestion control, which owns
          * the recovery point -- see fast_retransmit just below. */
         struct rto_timeout ev_to = {0};
-        gen_retransmit(&ev_to, c, s);
+        gen_retransmit(&ev_to, &c->mtp_ebpf, s);
         if (!s->tx_ok) {
             TCP_UNLOCK(c);
             xdp_egress_log("Timeout but no data to retransmit");
@@ -386,7 +386,7 @@ static __always_inline int site_send_wnd_update(struct iphdr *iph, struct tcphdr
      * own. Building the frame and choosing the verdict stay the target's. */
     {
         struct app_recv ev_rcv = {0};
-        send_wnd_update(&ev_rcv, c, s);
+        send_wnd_update(&ev_rcv, &c->mtp_ebpf, s);
     }
 
     /* --- the FLAG_SYNC dummy packet: a frame with no payload sent purely to
@@ -401,7 +401,7 @@ static __always_inline int site_send_wnd_update(struct iphdr *iph, struct tcphdr
             fill_tcp_hdr(iph, tcph, c, s->ref_ts, data_end, TCP_FLAG_ACK);
             fill_ip_hdr(iph, 0, false);
             TCP_UNLOCK(c);
-            xdp_egress_log("Rxwnd is updated from empty to %u, send extra ack", min(c->rx_avail >> TCP_WND_SCALE, 0xFFFF));
+            xdp_egress_log("Rxwnd is updated from empty to %u, send extra ack", min(c->mtp_ebpf.rx_avail >> TCP_WND_SCALE, 0xFFFF));
             return XDP_TX;
         }
         TCP_UNLOCK(c);
@@ -416,7 +416,7 @@ static __always_inline int site_gen_seg(struct iphdr *iph, struct tcphdr *tcph,
                                    struct tcp_tx_scratch *s, __u32 cpu)
 {
 
-    // this is probably caused by fast retransmission as we reset the c->tx_next_pos
+    // this is probably caused by fast retransmission as we reset the c->mtp_ebpf.tx_next_pos
     // but there are pending packets in the queue, simply drop them
     /*
      * The guard and the state advance are BOTH generated, and both happen
@@ -431,8 +431,8 @@ static __always_inline int site_gen_seg(struct iphdr *iph, struct tcphdr *tcph,
 
     if (unlikely(avail < s->payload_len)) {
         // FIXME
-        // bpf_printk("c->rx_remote_avail(%u), c->tx_sent(%u), c->tx_avail(%u), payload_len(%u)", 
-        //     c->rx_remote_avail, c->tx_sent, c->tx_avail, s->payload_len);
+        // bpf_printk("c->mtp_ebpf.rx_remote_avail(%u), c->mtp_ebpf.tx_sent(%u), c->tx_avail(%u), payload_len(%u)", 
+        //     c->mtp_ebpf.rx_remote_avail, c->mtp_ebpf.tx_sent, c->tx_avail, s->payload_len);
         // bpf_printk("avail(%u) < payload_len(%u)", avail, s->payload_len);
     }
 
@@ -447,7 +447,7 @@ static __always_inline int site_gen_seg(struct iphdr *iph, struct tcphdr *tcph,
      * transport does. */
     struct app_send ev_snd = {0};
     ev_snd.len = s->payload_len;
-    gen_seg(&ev_snd, c, cc, s);
+    gen_seg(&ev_snd, &c->mtp_ebpf, &cc->mtp_cc, s);
     if (unlikely(!s->tx_ok)) {
         TCP_UNLOCK(c);
         return XDP_DROP;
@@ -459,21 +459,21 @@ static __always_inline int site_gen_seg(struct iphdr *iph, struct tcphdr *tcph,
     // return XDP_TX;
     
     #ifdef BYPASS_RL
-    if (cc->rate >= LINK_BANDWIDTH && !nr_pkts_in_tw[cpu]) {
+    if (cc->mtp_cc.rate >= LINK_BANDWIDTH && !nr_pkts_in_tw[cpu]) {
         // eRPC recommends to bypass rate limiter
         goto bypass_rl;
     }
     #endif
 
     #ifdef BYPASS_RL
-    if ((!nr_pkts_in_tw[cpu] || c->tx_sent == s->payload_len) && desired_tx_ts <= s->ref_ts) {
+    if ((!nr_pkts_in_tw[cpu] || c->mtp_ebpf.tx_sent == s->payload_len) && desired_tx_ts <= s->ref_ts) {
         goto bypass_rl;
     }
     #endif
 
     TCP_UNLOCK(c);
 
-    // bpf_printk("cc->rate(%lu)", cc->rate);
+    // bpf_printk("cc->mtp_cc.rate(%lu)", cc->mtp_cc.rate);
 
     __u32 key = cpu;
     struct timing_wheel *tw_map = bpf_map_lookup_elem(&tw_outer_map, &key);
@@ -487,7 +487,7 @@ static __always_inline int site_gen_seg(struct iphdr *iph, struct tcphdr *tcph,
         log_panic("idx == POISON_32");
         return XDP_DROP;
     }
-    // bpf_printk("TW idx(%u), tx_ts(%lu), (%u)", idx, desired_tx_ts, cc->rate);
+    // bpf_printk("TW idx(%u), tx_ts(%lu), (%u)", idx, desired_tx_ts, cc->mtp_cc.rate);
 
     return bpf_redirect_map(tw_map, idx, 0);
 

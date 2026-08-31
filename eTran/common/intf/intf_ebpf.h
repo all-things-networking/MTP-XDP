@@ -1,4 +1,5 @@
 #pragma once
+#include "mtp/gen/prog_context.h"   /* the generated context parts */
 /**
  * Common interface for ebpf and microkernel
  */
@@ -103,27 +104,23 @@ struct slow_path_info {
 #define TCP_MAX_RTT 100000
 
 struct bpf_cc {
+    /* The pacing state, which is the TARGET's: when this flow may next send. */
     __u64 prev_desired_tx_ts;
-    /** Bps */
-    __u32 rate;
-    /** Counter drops each control interval */
-    __u16 cnt_tx_drops;
-    /** Counter acks each control interval */
-    __u16 cnt_rx_acks;
-    /** Counter bytes sent each control interval */
-    __u32 cnt_rx_ack_bytes;
-    /** Counter acks marked each control interval */
-    __u32 cnt_rx_ecn_bytes;
-    /** RTT estimate (us) */
-    __u32 rtt_est;
-    /** has pending tx data? */
-    __u32 txp;
+    /*
+     * THE PROGRAM'S, generated: @placement("cc_shared") in tcp.mtp -- the
+     * counters a congestion controller reads, the rate it sets, the RTT
+     * estimate, and whether anything is outstanding.
+     */
+    struct tcp_ctx_cc_shared mtp_cc;
 } __attribute__((packed, aligned(32)));
-#ifdef __cplusplus
-static_assert(sizeof(struct bpf_cc) == 32, "bpf_cc size is not 32 bytes");
-#else
-_Static_assert (sizeof(struct bpf_cc) == 32, "bpf_cc size is not 32 bytes");
-#endif
+/*
+ * THE SIZE ASSERT IS GONE, and deliberately. It pinned this struct at 32 bytes
+ * -- a cache-line decision, and a fair one -- but it pinned it against a field
+ * list this file no longer owns. The program decides what congestion state
+ * exists; if that no longer fits a target's chosen size, that is a conversation
+ * between the two, not something to discover as a build break with no
+ * explanation. Worth reinstating as a WARNING that names the overflow.
+ */
 
 struct bpf_cc_map_user {
     struct bpf_cc entry[MAX_TCP_FLOWS];
@@ -151,32 +148,19 @@ struct bpf_tcp_conn {
     __u32 rx_buf_size;
     __u32 tx_buf_size;
 
-    /** Bytes available for received segments at next position */
-    __u32 rx_avail;
-    /** Bytes available in remote end for received segments */
-    __u32 rx_remote_avail;
-    /** Offset in buffer to place next segment */
-    __u32 rx_next_pos;
-    /** Next sequence number expected */
-    __u32 rx_next_seq;
-
-    /** Duplicate ack count */
-    __u16 rx_dupack_cnt;
-    /* Start of interval of out-of-order received data */
-    __u32 rx_ooo_start;
-    /* Length of interval of out-of-order received data */
-    __u32 rx_ooo_len;
-    /* Number of bytes submitted by AF_XDP but not processed by eBPF yet */
-    __u32 tx_pending;    
-    /** Number of bytes up to next pos in the buffer that were sent but not
-     * acknowledged yet. */
-    __u32 tx_sent;
-    /** Offset in buffer for next segment to be sent */
-    __u32 tx_next_pos;
-    /** Sequence number of next segment to be sent */
-    __u32 tx_next_seq;
-    /** Timestamp to echo in next packet */
-    __u32 tx_next_ts;
+    /*
+     * THE PROTOCOL STATE, GENERATED. These twelve fields used to be written out
+     * here; they are exactly what tcp.mtp declares as @placement("ebpf"), and
+     * they are the program's to name. What is left around them in this struct
+     * is the target's: a lock, an opaque handle, a queue id, the MACs, the
+     * congestion-control index.
+     *
+     * Nesting rather than being pointed at is the whole point. The backend used
+     * to be told "compile against bpf_tcp_conn", which made this file the owner
+     * of protocol state and forced the program to use the names eTran had
+     * picked. Now the program names its fields and this structure holds them.
+     */
+    struct tcp_ctx_ebpf mtp_ebpf;
 
     __u32 cc_idx;
     __u8 ecn_enable;

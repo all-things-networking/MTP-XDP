@@ -22,7 +22,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MTPC="${1:-/tmp/mtpc-dpdk}"
 [ -x "$MTPC/compiler" ] || { echo "no compiler at $MTPC" >&2; exit 2; }
 
-OUT="$ROOT/eTran/micro_kernel/eBPF/tcp/mtp/gen"
+# UNDER common/, BECAUSE BOTH SITES INCLUDE IT. The generated parts of a context
+# are nested by structures on either side of the eBPF boundary -- bpf_tcp_conn in
+# the map, tcp_connection on the control heap -- so the definitions have to be
+# reachable from both. eBPF/tcp/mtp/gen was reachable from one.
+OUT="$ROOT/eTran/common/mtp/gen"
 mkdir -p "$OUT"
 "$MTPC/compiler" --backend=xdp --out="$OUT" "$ROOT/mtp/tcp.mtp"
 echo "generated into $OUT:"
