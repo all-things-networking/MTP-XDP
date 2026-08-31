@@ -15,18 +15,18 @@ static inline struct mtp_ev_list sock_send(struct mtp_sock_op op);
 static inline struct mtp_ev_list sock_recv(struct mtp_sock_op op);
 static inline struct mtp_ev_list sock_close(struct mtp_sock_op op);
 static inline struct mtp_ev_list parse_tcp(pkt_t p, struct ipv4 h);
-static inline void proc_bind(struct app_bind *ev, struct tcp_ctx *ctx);
-static inline void proc_listen(struct app_listen *ev, struct tcp_ctx *bound, struct tcp_listen_ctx *lst);
-static inline void proc_accept(struct app_accept *ev, struct tcp_listen_ctx *lst);
-static inline void proc_connect(struct app_connect *ev, struct tcp_ctx *ctx);
-static inline void gen_syn(struct app_connect *ev, struct tcp_ctx *ctx);
-static inline void proc_passive_open(void * ev, struct tcp_listen_ctx *lst, struct tcp_ctx *ctx);
-static inline void proc_syn_queue(struct tcp_syn *ev, struct tcp_listen_ctx *lst);
-static inline void gen_synack(void * ev, struct tcp_ctx *ctx);
-static inline void proc_synack(struct tcp_synack *ev, struct tcp_ctx *ctx);
-static inline void proc_rst(struct tcp_rst *ev, struct tcp_ctx *ctx);
-static inline void proc_fin(struct tcp_fin *ev, struct tcp_ctx *ctx);
-static inline void proc_close(struct app_close *ev, struct tcp_ctx *ctx);
+static inline void proc_bind(struct app_bind *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control);
+static inline void proc_listen(struct app_listen *ev, struct tcp_ctx_common *bound_common, struct tcp_ctx_control *bound_control, struct tcp_listen_ctx_common *lst_common);
+static inline void proc_accept(struct app_accept *ev, struct tcp_listen_ctx_common *lst_common);
+static inline void proc_connect(struct app_connect *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf);
+static inline void gen_syn(struct app_connect *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf);
+static inline void proc_passive_open(void * ev, struct tcp_listen_ctx_common *lst_common, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf);
+static inline void proc_syn_queue(struct tcp_syn *ev, struct tcp_listen_ctx_common *lst_common);
+static inline void gen_synack(void * ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf);
+static inline void proc_synack(struct tcp_synack *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf);
+static inline void proc_rst(struct tcp_rst *ev, struct tcp_ctx_common *ctx_common);
+static inline void proc_fin(struct tcp_fin *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf);
+static inline void proc_close(struct app_close *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf);
 
 /* ---- sock_bind  [control]------------------------------- */
 static inline struct mtp_ev_list sock_bind(struct mtp_sock_op op)
@@ -194,68 +194,68 @@ static inline struct mtp_ev_list parse_tcp(pkt_t p, struct ipv4 h)
 }
 
 /* ---- proc_bind  [control]------------------------------- */
-static inline void proc_bind(struct app_bind *ev, struct tcp_ctx *ctx)
+static inline void proc_bind(struct app_bind *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control)
 {
-    struct tcp_fid fid = ctx->key;
+    struct tcp_fid fid = ctx_common->key;
     (struct tcp_ctx *)mtp_ctx_new(MTP_CTX_tcp_ctx, &fid);
-    ctx->control.type = TYPE_FAKE;
-    ctx->control.reuseport = ev->reuseport;
-    ctx->control.local_port = ev->local_port;
-    mtp_notify(ctx, MTP_NOTIFY_BOUND);
+    ctx_control->type = TYPE_FAKE;
+    ctx_control->reuseport = ev->reuseport;
+    ctx_control->local_port = ev->local_port;
+    mtp_notify(ctx_common, MTP_NOTIFY_BOUND);
 }
 
 /* ---- proc_listen  [control]----------------------------- */
-static inline void proc_listen(struct app_listen *ev, struct tcp_ctx *bound, struct tcp_listen_ctx *lst)
+static inline void proc_listen(struct app_listen *ev, struct tcp_ctx_common *bound_common, struct tcp_ctx_control *bound_control, struct tcp_listen_ctx_common *lst_common)
 {
-    if (bound->control.type != TYPE_FAKE) {
+    if (bound_control->type != TYPE_FAKE) {
         return;
     }
-    struct tcp_lid lid = tcp_lid(bound->control.local_ip, bound->control.local_port);
+    struct tcp_lid lid = tcp_lid(bound_control->local_ip, bound_control->local_port);
     (struct tcp_listen_ctx *)mtp_ctx_new(MTP_CTX_tcp_listen_ctx, &lid);
-    lst->local_ip = bound->control.local_ip;
-    lst->local_port = bound->control.local_port;
-    lst->pending_cap = ev->pending_cap;
-    lst->pending_n = 0;
-    lst->has_accepted = false;
-    mtp_notify(lst, MTP_NOTIFY_LISTENING);
+    lst_common->local_ip = bound_control->local_ip;
+    lst_common->local_port = bound_control->local_port;
+    lst_common->pending_cap = ev->pending_cap;
+    lst_common->pending_n = 0;
+    lst_common->has_accepted = false;
+    mtp_notify(lst_common, MTP_NOTIFY_LISTENING);
 }
 
 /* ---- proc_accept  [control]----------------------------- */
-static inline void proc_accept(struct app_accept *ev, struct tcp_listen_ctx *lst)
+static inline void proc_accept(struct app_accept *ev, struct tcp_listen_ctx_common *lst_common)
 {
-    if (lst->has_accepted) {
+    if (lst_common->has_accepted) {
         return;
     }
-    lst->has_accepted = true;
+    lst_common->has_accepted = true;
 }
 
 /* ---- proc_connect  [control]---------------------------- */
-static inline void proc_connect(struct app_connect *ev, struct tcp_ctx *ctx)
+static inline void proc_connect(struct app_connect *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf)
 {
-    ctx->control.type = TYPE_NORMAL;
-    ctx->control.remote_ip = ev->remote_ip;
-    ctx->control.remote_port = ev->remote_port;
-    ctx->control.status = CONN_WAIT_TX_SYN;
-    ctx->ebpf.rx_next_seq = 0;
-    ctx->ebpf.tx_next_seq = PARITY_ISN_ACTIVE;
-    ctx->control.syn_attempts = 0;
-    struct tcp_fid fid = ctx->key;
+    ctx_control->type = TYPE_NORMAL;
+    ctx_control->remote_ip = ev->remote_ip;
+    ctx_control->remote_port = ev->remote_port;
+    ctx_control->status = CONN_WAIT_TX_SYN;
+    ctx_ebpf->rx_next_seq = 0;
+    ctx_ebpf->tx_next_seq = PARITY_ISN_ACTIVE;
+    ctx_control->syn_attempts = 0;
+    struct tcp_fid fid = ctx_common->key;
     (struct tcp_ctx *)mtp_ctx_new(MTP_CTX_tcp_ctx, &fid);
-    mtp_notify(ctx, MTP_NOTIFY_CONNECTING);
+    mtp_notify(ctx_common, MTP_NOTIFY_CONNECTING);
 }
 
 /* ---- gen_syn  [control]--------------------------------- */
-static inline void gen_syn(struct app_connect *ev, struct tcp_ctx *ctx)
+static inline void gen_syn(struct app_connect *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf)
 {
-    if (ctx->control.status != CONN_WAIT_TX_SYN) {
+    if (ctx_control->status != CONN_WAIT_TX_SYN) {
         return;
     }
-    ctx->control.status = CONN_WAIT_RX_SYNACK;
-    mtp_timer_start(&ctx->handshake_timer, ((__u64)(tcp_handshake_timeout) * 1000000ULL));
+    ctx_control->status = CONN_WAIT_RX_SYNACK;
+    mtp_timer_start(&ctx_common->handshake_timer, ((__u64)(tcp_handshake_timeout) * 1000000ULL));
     struct TCPBP bp;
-    bp.src_port = ctx->control.local_port;
-    bp.dst_port = ctx->control.remote_port;
-    bp.seq_no = ctx->ebpf.tx_next_seq;
+    bp.src_port = ctx_control->local_port;
+    bp.dst_port = ctx_control->remote_port;
+    bp.seq_no = ctx_ebpf->tx_next_seq;
     bp.ack_seq = 0;
     bp.window = PARITY_CTRL_WINDOW;
     bp.flags = FLAG_SYN | FLAG_ECE | FLAG_CWR;
@@ -265,52 +265,52 @@ static inline void gen_syn(struct app_connect *ev, struct tcp_ctx *ctx)
 }
 
 /* ---- proc_passive_open  [control]----------------------- */
-static inline void proc_passive_open(void * ev, struct tcp_listen_ctx *lst, struct tcp_ctx *ctx)
+static inline void proc_passive_open(void * ev, struct tcp_listen_ctx_common *lst_common, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf)
 {
     struct pending_syn syn;
-    if (!lst->has_accepted) {
-        if (lst->pending_n == 0) {
+    if (!lst_common->has_accepted) {
+        if (lst_common->pending_n == 0) {
             return;
         }
-        mtp_notify(lst, MTP_NOTIFY_NEW_CONN);
+        mtp_notify(lst_common, MTP_NOTIFY_NEW_CONN);
         return;
     }
-    if (lst->pending_n == 0) {
+    if (lst_common->pending_n == 0) {
         return;
     }
-    syn = lst->pending[0];
+    syn = lst_common->pending[0];
     if (!syn.has_ts || !syn.has_mss) {
         return;
     }
-    ctx->control.qid = syn.qid;
-    ctx->control.type = TYPE_NORMAL;
-    ctx->control.local_ip = syn.local_ip;
-    ctx->control.local_port = syn.dport;
-    ctx->control.remote_ip = syn.remote_ip;
-    ctx->control.remote_port = syn.sport;
-    ctx->ebpf.rx_next_seq = syn.seq + 1;
-    ctx->ebpf.tx_next_seq = PARITY_ISN_PASSIVE;
-    ctx->control.syn_ts = syn.ts_val;
+    ctx_control->qid = syn.qid;
+    ctx_control->type = TYPE_NORMAL;
+    ctx_control->local_ip = syn.local_ip;
+    ctx_control->local_port = syn.dport;
+    ctx_control->remote_ip = syn.remote_ip;
+    ctx_control->remote_port = syn.sport;
+    ctx_ebpf->rx_next_seq = syn.seq + 1;
+    ctx_ebpf->tx_next_seq = PARITY_ISN_PASSIVE;
+    ctx_control->syn_ts = syn.ts_val;
     if (syn.ece && syn.cwr) {
-        ctx->ebpf.ecn_enable = true;
+        ctx_ebpf->ecn_enable = true;
     }
-    struct tcp_fid fid = ctx->key;
+    struct tcp_fid fid = ctx_common->key;
     (struct tcp_ctx *)mtp_ctx_new(MTP_CTX_tcp_ctx, &fid);
-    ctx->control.status = CONN_WAIT_TX_SYNACK;
-    lst->has_accepted = false;
+    ctx_control->status = CONN_WAIT_TX_SYNACK;
+    lst_common->has_accepted = false;
     __u32 i = 0;
-    while (i + 1 < lst->pending_n) {
-        lst->pending[i] = lst->pending[i + 1];
+    while (i + 1 < lst_common->pending_n) {
+        lst_common->pending[i] = lst_common->pending[i + 1];
         i = i + 1;
     }
-    lst->pending_n = lst->pending_n - 1;
+    lst_common->pending_n = lst_common->pending_n - 1;
 }
 
 /* ---- proc_syn_queue  [control]-------------------------- */
-static inline void proc_syn_queue(struct tcp_syn *ev, struct tcp_listen_ctx *lst)
+static inline void proc_syn_queue(struct tcp_syn *ev, struct tcp_listen_ctx_common *lst_common)
 {
     struct pending_syn syn;
-    if (lst->pending_n >= lst->pending_cap) {
+    if (lst_common->pending_n >= lst_common->pending_cap) {
         return;
     }
     syn.seq = ev->seq;
@@ -325,105 +325,105 @@ static inline void proc_syn_queue(struct tcp_syn *ev, struct tcp_listen_ctx *lst
     syn.cwr = ev->cwr;
     syn.qid = ev->qid;
     syn.valid = true;
-    lst->pending[lst->pending_n] = syn;
-    lst->pending_n = lst->pending_n + 1;
+    lst_common->pending[lst_common->pending_n] = syn;
+    lst_common->pending_n = lst_common->pending_n + 1;
 }
 
 /* ---- gen_synack  [control]------------------------------ */
-static inline void gen_synack(void * ev, struct tcp_ctx *ctx)
+static inline void gen_synack(void * ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf)
 {
-    if (ctx->control.status != CONN_WAIT_TX_SYNACK) {
+    if (ctx_control->status != CONN_WAIT_TX_SYNACK) {
         return;
     }
-    ctx->control.status = CONN_OPEN;
+    ctx_control->status = CONN_OPEN;
     struct TCPBP bp;
-    bp.src_port = ctx->control.local_port;
-    bp.dst_port = ctx->control.remote_port;
-    bp.seq_no = ctx->ebpf.tx_next_seq;
-    bp.ack_seq = ctx->ebpf.rx_next_seq;
+    bp.src_port = ctx_control->local_port;
+    bp.dst_port = ctx_control->remote_port;
+    bp.seq_no = ctx_ebpf->tx_next_seq;
+    bp.ack_seq = ctx_ebpf->rx_next_seq;
     bp.window = PARITY_CTRL_WINDOW;
     bp.flags = FLAG_SYN | FLAG_ACK;
-    if (ctx->ebpf.ecn_enable) {
+    if (ctx_ebpf->ecn_enable) {
         bp.flags = bp.flags | FLAG_ECE;
     }
     mtp_opt_add(bp.opts.opts, &bp.opts.opts_n, opt_mss(PARITY_MSS));
-    mtp_opt_add(bp.opts.opts, &bp.opts.opts_n, opt_ts(0, ctx->control.syn_ts));
+    mtp_opt_add(bp.opts.opts, &bp.opts.opts_n, opt_ts(0, ctx_control->syn_ts));
     mtp_pkt_gen(&bp, PRIO_CONTROL, false);
-    mtp_notify(ctx, MTP_NOTIFY_ACCEPTED);
+    mtp_notify(ctx_common, MTP_NOTIFY_ACCEPTED);
 }
 
 /* ---- proc_synack  [control]----------------------------- */
-static inline void proc_synack(struct tcp_synack *ev, struct tcp_ctx *ctx)
+static inline void proc_synack(struct tcp_synack *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf)
 {
-    if (ctx->control.status != CONN_WAIT_RX_SYNACK) {
+    if (ctx_control->status != CONN_WAIT_RX_SYNACK) {
         return;
     }
-    ctx->control.qid = ev->qid;
-    mtp_timer_stop(&ctx->handshake_timer);
+    ctx_control->qid = ev->qid;
+    mtp_timer_stop(&ctx_common->handshake_timer);
     if (!ev->has_ts) {
-        ctx->ebpf.rx_next_seq = 0;
-        ctx->ebpf.tx_next_seq = 0;
-        ctx->control.syn_ts = 0;
-        ctx->ebpf.ecn_enable = false;
-        mtp_timer_start(&ctx->handshake_timer, ((__u64)(tcp_handshake_timeout) * 1000000ULL));
+        ctx_ebpf->rx_next_seq = 0;
+        ctx_ebpf->tx_next_seq = 0;
+        ctx_control->syn_ts = 0;
+        ctx_ebpf->ecn_enable = false;
+        mtp_timer_start(&ctx_common->handshake_timer, ((__u64)(tcp_handshake_timeout) * 1000000ULL));
         return;
     }
-    ctx->ebpf.rx_next_seq = ev->seq + 1;
-    ctx->ebpf.tx_next_seq = ev->ack;
-    ctx->control.syn_ts = ev->ts_val;
+    ctx_ebpf->rx_next_seq = ev->seq + 1;
+    ctx_ebpf->tx_next_seq = ev->ack;
+    ctx_control->syn_ts = ev->ts_val;
     if (ev->ece && !ev->cwr) {
-        ctx->ebpf.ecn_enable = true;
+        ctx_ebpf->ecn_enable = true;
     }
-    ctx->control.status = CONN_OPEN;
-    mtp_notify(ctx, MTP_NOTIFY_CONN_OPEN_OK);
+    ctx_control->status = CONN_OPEN;
+    mtp_notify(ctx_common, MTP_NOTIFY_CONN_OPEN_OK);
     struct TCPBP bp;
-    bp.src_port = ctx->control.local_port;
-    bp.dst_port = ctx->control.remote_port;
-    bp.seq_no = ctx->ebpf.tx_next_seq;
-    bp.ack_seq = ctx->ebpf.rx_next_seq;
+    bp.src_port = ctx_control->local_port;
+    bp.dst_port = ctx_control->remote_port;
+    bp.seq_no = ctx_ebpf->tx_next_seq;
+    bp.ack_seq = ctx_ebpf->rx_next_seq;
     bp.window = PARITY_CTRL_WINDOW;
     bp.flags = FLAG_ACK;
-    mtp_opt_add(bp.opts.opts, &bp.opts.opts_n, opt_ts(0, ctx->control.syn_ts));
+    mtp_opt_add(bp.opts.opts, &bp.opts.opts_n, opt_ts(0, ctx_control->syn_ts));
     mtp_pkt_gen(&bp, PRIO_ACK, false);
 }
 
 /* ---- proc_rst  [control]-------------------------------- */
-static inline void proc_rst(struct tcp_rst *ev, struct tcp_ctx *ctx)
+static inline void proc_rst(struct tcp_rst *ev, struct tcp_ctx_common *ctx_common)
 {
-    mtp_notify(ctx, MTP_NOTIFY_PEER_RESET);
-    struct tcp_fid dead = ctx->key;
+    mtp_notify(ctx_common, MTP_NOTIFY_PEER_RESET);
+    struct tcp_fid dead = ctx_common->key;
     mtp_ctx_del(MTP_CTX_tcp_ctx, &dead);
 }
 
 /* ---- proc_fin  [control]-------------------------------- */
-static inline void proc_fin(struct tcp_fin *ev, struct tcp_ctx *ctx)
+static inline void proc_fin(struct tcp_fin *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf)
 {
-    if (ctx->control.status != CONN_CLOSED) {
+    if (ctx_control->status != CONN_CLOSED) {
         return;
     }
     struct TCPBP bp;
-    bp.src_port = ctx->control.local_port;
-    bp.dst_port = ctx->control.remote_port;
-    bp.seq_no = ctx->ebpf.tx_next_seq;
-    bp.ack_seq = ctx->ebpf.rx_next_seq;
+    bp.src_port = ctx_control->local_port;
+    bp.dst_port = ctx_control->remote_port;
+    bp.seq_no = ctx_ebpf->tx_next_seq;
+    bp.ack_seq = ctx_ebpf->rx_next_seq;
     bp.window = PARITY_CTRL_WINDOW;
     bp.flags = FLAG_ACK;
     mtp_pkt_gen(&bp, PRIO_ACK, false);
 }
 
 /* ---- proc_close  [control]------------------------------ */
-static inline void proc_close(struct app_close *ev, struct tcp_ctx *ctx)
+static inline void proc_close(struct app_close *ev, struct tcp_ctx_common *ctx_common, struct tcp_ctx_control *ctx_control, struct tcp_ctx_ebpf *ctx_ebpf)
 {
-    ctx->control.status = CONN_CLOSED;
+    ctx_control->status = CONN_CLOSED;
     struct TCPBP bp;
-    bp.src_port = ctx->control.local_port;
-    bp.dst_port = ctx->control.remote_port;
-    bp.seq_no = ctx->ebpf.tx_next_seq;
-    bp.ack_seq = ctx->ebpf.rx_next_seq;
+    bp.src_port = ctx_control->local_port;
+    bp.dst_port = ctx_control->remote_port;
+    bp.seq_no = ctx_ebpf->tx_next_seq;
+    bp.ack_seq = ctx_ebpf->rx_next_seq;
     bp.flags = FLAG_RST;
     mtp_pkt_gen(&bp, PRIO_CONTROL, false);
-    struct tcp_fid dead = ctx->key;
+    struct tcp_fid dead = ctx_common->key;
     mtp_ctx_del(MTP_CTX_tcp_ctx, &dead);
-    mtp_notify(ctx, MTP_NOTIFY_CLOSED);
+    mtp_notify(ctx_common, MTP_NOTIFY_CLOSED);
 }
 

@@ -7,11 +7,16 @@
 #
 #   mtp/generate.sh [path/to/MTP-compiler-worktree]
 #
-# --ctx-type is what makes the output substitutable rather than parallel: the
-# eBPF group's processors take `struct bpf_tcp_conn *`, the struct eTran already
-# has, so a generated processor drops in beside the hand-written one it replaces
-# with no cast and no copy. A conversion at that boundary would be measured as
-# if it were the cost of generated code.
+# NO TARGET MAPPING. The backend emits one struct per part of a context -- the
+# unplaced fields, and each @placement group -- and THIS TREE nests each part in
+# whatever structure holds it: bpf_tcp_conn nests the ebpf part, bpf_cc the
+# cc_shared part, tcp_connection the common and control parts. A processor is
+# then handed the member, so there is still no cast and no copy in the hot path.
+#
+# It used to pass --ctx-type, which pointed generated code at eTran's own
+# structs. That worked and was backwards: it made the target the owner of
+# protocol state and left the program renaming its fields to match names eTran
+# had chosen.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MTPC="${1:-/tmp/mtpc-dpdk}"
@@ -19,9 +24,6 @@ MTPC="${1:-/tmp/mtpc-dpdk}"
 
 OUT="$ROOT/eTran/micro_kernel/eBPF/tcp/mtp/gen"
 mkdir -p "$OUT"
-"$MTPC/compiler" --backend=xdp --out="$OUT" \
-    --ctx-type=tcp_ctx.ebpf=bpf_tcp_conn \
-    --ctx-type=tcp_ctx.cc_shared=bpf_cc \
-    "$ROOT/mtp/tcp.mtp"
+"$MTPC/compiler" --backend=xdp --out="$OUT" "$ROOT/mtp/tcp.mtp"
 echo "generated into $OUT:"
 ls "$OUT"

@@ -76,11 +76,16 @@ struct tcp_ctx_ebpf {
     __u32 tx_next_ts;
 };
 
-/* ---- tcp_ctx -- ungrouped (control path)---------------- */
-struct tcp_ctx {
+/* ---- tcp_ctx -- unplaced-------------------------------- */
+struct tcp_ctx_common {
     struct tcp_fid key;
     struct mtp_timer handshake_timer;
     struct mtp_timer rto_timer;
+};
+
+/* ---- tcp_ctx -- composite (a target with one memory)---- */
+struct tcp_ctx {
+    struct tcp_ctx_common common;
     struct tcp_ctx_app app;
     struct tcp_ctx_cc_shared cc_shared;
     struct tcp_ctx_control control;
@@ -93,8 +98,8 @@ static inline void tcp_ctx_init(struct tcp_ctx *c)
     c->control.status = CONN_WAIT_RX_SYN;
 }
 
-/* ---- tcp_listen_ctx -- ungrouped (control path)--------- */
-struct tcp_listen_ctx {
+/* ---- tcp_listen_ctx -- unplaced------------------------- */
+struct tcp_listen_ctx_common {
     struct tcp_lid key;
     __u32 local_ip;
     __u16 local_port;
@@ -103,6 +108,11 @@ struct tcp_listen_ctx {
     struct pending_syn pending[PROG_MAX_BACKLOG];
     struct tcp_fid accepted;
     bool has_accepted;
+};
+
+/* ---- tcp_listen_ctx -- composite (a target with one memory)- */
+struct tcp_listen_ctx {
+    struct tcp_listen_ctx_common common;
 };
 
 static inline void tcp_listen_ctx_init(struct tcp_listen_ctx *c)
