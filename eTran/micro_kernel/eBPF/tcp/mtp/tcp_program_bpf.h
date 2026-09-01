@@ -457,7 +457,13 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
      * events' lists back to back would be a different program; see the comment
      * on the scratchpad above.
      */
-    /* The two events this packet raises, built from the header once. */
+    /*
+     * THE EVENTS ARE BUILT ONLY IF SOMETHING READS THEM. With every RX group
+     * hand-written they are dead stores, and this asks whether building them
+     * is what caps this tree at ~16 Gbps -- the hand-written base is capped
+     * too, so the cost is not in the processor bodies.
+     */
+#if defined(MTP_GEN_ACK) || defined(MTP_GEN_SEQOOO) || defined(MTP_GEN_WINRTT) || defined(MTP_GEN_RECV)
     struct tcp_ack  ev_ack  = {0};
     struct tcp_data ev_data = {0};
     ev_ack.seq  = s.seq;   ev_ack.ack  = s.ack_seq;
@@ -470,6 +476,8 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
     ev_data.ts_val = s.ts_val; ev_data.ts_ecr = s.ts_ecr;
     ev_data.payload_len = s.payload_len;
     ev_data.ecn_ce = ece;
+
+#endif
 
     /* Where the stream stood before the chain, for the metadata below. */
     __u32 pos0 = c->rx_next_pos, seq0 = c->rx_next_seq;
