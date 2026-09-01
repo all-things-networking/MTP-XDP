@@ -30,6 +30,16 @@
 #include "nic.h"
 #include "mtp/mtp_target.h"
 
+/*
+ * `site_` PREFIXES THE TARGET'S TRANSITIONAL EVENT SHIMS.
+ *
+ * These carry a packet, its options and a queue id -- what THIS target hands a
+ * processor -- and are not the program's events, which carry parsed protocol
+ * fields and are generated. Both were called tcp_syn, and once the generated
+ * context parts were nested into intf_ebpf.h the two definitions met in one
+ * translation unit. It is the program's name that should win.
+ */
+
 /* eTran's own control-path services, used by the processors below. These are
  * TARGET services, not protocol logic: port allocation and the LRPC notify
  * channel exist for every program this target compiles. */
@@ -203,7 +213,7 @@ struct net_event {
     uint32_t qid;
 };
 
-struct tcp_syn : net_event {};
+struct site_tcp_syn : net_event {};
 
 /*
  * event tcp_synack : net_event { ... }
@@ -212,7 +222,7 @@ struct tcp_syn : net_event {};
  * eTran does in tcp_connection_pkt before dispatching -- a state write, not
  * bookkeeping: qid is the NIC queue the connection's eBPF state is keyed to.
  */
-struct tcp_synack : net_event {};
+struct site_tcp_synack : net_event {};
 
 /* event tcp_rst : net_event { } */
 struct tcp_rst : net_event {};
@@ -753,7 +763,7 @@ static inline void proc_passive_open(struct tcp_listener *lst)
  * donor logs -- a SYN that is dropped for a full backlog or as a duplicate looks
  * identical to one that never arrived.
  */
-static inline void proc_backlog(const tcp_syn &ev, struct tcp_listener *lst)
+static inline void proc_backlog(const site_tcp_syn &ev, struct tcp_listener *lst)
 {
     struct pkt_tcp *p = ev.pkt;
 
@@ -807,7 +817,7 @@ static inline void proc_backlog(const tcp_syn &ev, struct tcp_listener *lst)
  * ACK is emitted. By the time that ACK leaves, connect() has already returned
  * and the fast path is live.
  */
-static inline int proc_synack(const tcp_synack &ev, struct tcp_connection *ctx)
+static inline int proc_synack(const site_tcp_synack &ev, struct tcp_connection *ctx)
 {
     struct pkt_tcp *p = ev.pkt;
     const uint32_t ecn_flags = TCPH_FLAGS(&p->tcp) & (TCP_ECE | TCP_CWR);
@@ -879,7 +889,7 @@ static inline int proc_synack(const tcp_synack &ev, struct tcp_connection *ctx)
  * otherwise; it does not, because gen_synack marked the connection OPEN without
  * ever waiting for that ACK.
  */
-static inline void proc_syn_retransmit(const tcp_syn &ev, struct tcp_connection *ctx)
+static inline void proc_syn_retransmit(const site_tcp_syn &ev, struct tcp_connection *ctx)
 {
     struct pkt_tcp *p = ev.pkt;
 
@@ -1220,7 +1230,7 @@ static inline int dispatch_net(struct app_ctx *actx, struct pkt_tcp *p, uint32_t
          * SYN-ACK arm is ported so far; the rest still go to eTran's
          * state-then-flags cascade. */
         if (ctx->status == CONN_WAIT_RX_SYNACK) {
-            tcp_synack ev;
+            site_tcp_synack ev;
             ev.pkt = p; ev.opts = &opts; ev.qid = qid;
             if (proc_synack(ev, ctx))
                 fprintf(stderr, "proc_synack() failed\n");
@@ -1236,7 +1246,7 @@ static inline int dispatch_net(struct app_ctx *actx, struct pkt_tcp *p, uint32_t
          * donor tested `(flags & ~ecn_flags) == TCP_SYN` with ecn_flags still
          * zero at that point, so the mask did nothing: it is an exact-SYN test. */
         if (ctx->status == CONN_OPEN && TCPH_FLAGS(&p->tcp) == TCP_SYN) {
-            tcp_syn ev;
+            site_tcp_syn ev;
             ev.pkt = p; ev.opts = &opts; ev.qid = qid;
             proc_syn_retransmit(ev, ctx);
             return 0;
@@ -1256,7 +1266,7 @@ static inline int dispatch_net(struct app_ctx *actx, struct pkt_tcp *p, uint32_t
 
     /* Otherwise a listening context may. */
     if (struct tcp_listener *lst = select_listen_ctx(p)) {
-        tcp_syn ev;
+        site_tcp_syn ev;
         ev.pkt = p; ev.opts = &opts; ev.qid = qid;
         proc_backlog(ev, lst);
         return 0;
