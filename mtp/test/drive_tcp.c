@@ -20,7 +20,7 @@ int main(void)
     struct tcp_ctx *c = (struct tcp_ctx *)mtp_ctx_new(MTP_CTX_tcp_ctx, &fid);
     if (!c) { printf("no context\n"); return 1; }
     tcp_ctx_init(c);
-    c->key = fid;
+    c->common.key = fid;
 
     printf("status after init      : %u  (CONN_WAIT_RX_SYN = %u)\n",
            c->control.status, (unsigned)CONN_WAIT_RX_SYN);
