@@ -605,12 +605,16 @@ static __always_inline int site_gen_retransmit(struct bpf_tcp_conn *c, struct bp
     /* --- gen_retransmit (EVENT-TIMER-RTO 1.3): the RTO's dummy packet ----- */
     /* Timeout packet from slowpath, process it first */
     if (unlikely(data_meta->tx.flag & FLAG_TO)) {
+#ifdef MTP_GEN_RETRANSMIT
         /* GENERATED: whether there is anything outstanding to resend. Where the
          * stream goes back to is the target's congestion control, which owns
          * the recovery point -- see fast_retransmit just below. */
         struct rto_timeout ev_to = {0};
         gen_retransmit(&ev_to, c, s);
         if (!s->tx_ok) {
+#else
+        if (!c->tx_sent) {          /* the donor's own test */
+#endif
             TCP_UNLOCK(c);
             xdp_egress_log("Timeout but no data to retransmit");
             return XDP_DROP;
@@ -640,12 +644,20 @@ static __always_inline int site_send_wnd_update(struct iphdr *iph, struct tcphdr
 {
     /* --- send_wnd_update (EVENT-APP-RECV 1.3) ----------------------------- */
     /* update receving buffer space */
+#ifdef MTP_GEN_WNDUPD
     /* GENERATED: the window has moved, and whether that is worth a packet of its
      * own. Building the frame and choosing the verdict stay the target's. */
     {
         struct app_recv ev_rcv = {0};
         send_wnd_update(&ev_rcv, c, s);
     }
+#else
+    if (s->rx_bump) {               /* the donor's own, inline */
+        if (c->tx_pending == 0)
+            s->wnd_upd = true;
+        c->rx_avail += s->rx_bump;
+    }
+#endif
 
     /* --- the FLAG_SYNC dummy packet: a frame with no payload sent purely to
      *     make this site run. The paper's "fake packets with the event metadata"
@@ -700,6 +712,7 @@ static __always_inline int site_gen_seg(struct iphdr *iph, struct tcphdr *tcph,
 
     fill_ip_hdr(iph, s->payload_len, c->ecn_enable);
 
+#ifdef MTP_GEN_SEG
     /* GENERATED: everything a segment going out advances, and the consistency
      * check between where the application believes the stream is and where the
      * transport does. */
@@ -710,6 +723,23 @@ static __always_inline int site_gen_seg(struct iphdr *iph, struct tcphdr *tcph,
         TCP_UNLOCK(c);
         return XDP_DROP;
     }
+#else
+    /* The donor's own, inline. Note it checks FIRST and advances last, where a
+     * generated processor is one function and must do both together. */
+    if (unlikely(s->tx_pos != c->tx_next_pos)) {
+        TCP_UNLOCK(c);
+        return XDP_DROP;
+    }
+    if (s->tx_pending)
+        c->tx_pending += s->tx_pending;
+    c->tx_next_seq += s->payload_len;
+    c->tx_next_pos += s->payload_len;
+    if (c->tx_next_pos >= c->tx_buf_size)
+        c->tx_next_pos -= c->tx_buf_size;
+    c->tx_sent += s->payload_len;
+    cc->txp = c->tx_sent > 0;
+    c->tx_pending -= s->payload_len;
+#endif
 
     // /*** NO CC ***/
     // TCP_UNLOCK(c);

@@ -14,3 +14,13 @@
 /* #define MTP_GEN_SEQOOO */   /* proc_seq + proc_ooo             */
 /* #define MTP_GEN_WINRTT */   /* proc_window + proc_rtt          */
 /* #define MTP_GEN_RECV   */   /* proc_recv                       */
+
+/*
+ * AND THE EGRESS SITE. Left out of the first draft on the grounds that on
+ * hp100 the TX swap cost about one point of eleven -- but that was a different
+ * reservation and a deficit of 11%, where this one is 27%. Carrying a result
+ * across nodes as an assumption is what the server-thread mix-up was made of.
+ */
+/* #define MTP_GEN_RETRANSMIT */  /* gen_retransmit   */
+/* #define MTP_GEN_WNDUPD     */  /* send_wnd_update  */
+/* #define MTP_GEN_SEG        */  /* gen_seg          */
