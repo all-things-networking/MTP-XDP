@@ -13,6 +13,15 @@
  */
 
 #include "mtp_target_bpf.h"   /* same directory */
+/*
+ * STEP 1 of the probe: the generated headers, INCLUDED AND OTHERWISE UNUSED.
+ * Not one line of this file's own code changes. If throughput drops from 21 to
+ * 16 on this alone, the cost is in what including them does -- not in any
+ * generated processor, which is what every measurement so far has been unable
+ * to pin down.
+ */
+#include "gen/prog.h"
+#include "gen/prog_proc_bpf.h"
 
 /* ------------------------------------------------------------------ *
  * flow_id tcp_fid : (uint32, uint32, uint16, uint16)
@@ -64,23 +73,7 @@ static __always_inline bool tcp_is_slow_path_event(const struct tcphdr *tcph)
  * a single 290-line function; naming them is what makes the processor boundaries
  * below mean anything.
  * ------------------------------------------------------------------ */
-struct tcp_scratch {
-    __u32 seq;
-    __u32 ack_seq;
-    __u32 ts_val;
-    __u32 ts_ecr;
-    __u32 now;
-    __u32 payload_off;
-    __u32 payload_len;
-    __u32 rx_bump;
-    __u32 tx_bump;
-    __u32 go_back_pos;
-    __u32 trim_start;
-    __u32 trim_end;
-    bool  trigger_ack;
-    bool  clear_ooo;
-    bool  drop;
-};
+/* tcp_scratch comes from the generated headers in this probe. */
 
 /*
  * dispatch: tcp_ack -> { proc_ack, proc_fast_retransmit, proc_window, proc_rtt }
@@ -126,7 +119,7 @@ struct tcp_scratch {
  * sitting close enough to the verifier's limits that a compiler change pushes it
  * over.
  */
-static __always_inline bool proc_ack(struct tcphdr *tcph, struct bpf_tcp_conn *c,
+static __always_inline bool hand_proc_ack(struct tcphdr *tcph, struct bpf_tcp_conn *c,
                                      struct bpf_cc *cc, struct tcp_scratch *s)
 {
     /* --- proc_ack + proc_fast_retransmit (EVENT-ACK 1.3) ------------------ */
@@ -173,7 +166,7 @@ static __always_inline bool proc_ack(struct tcphdr *tcph, struct bpf_tcp_conn *c
     return true;
 }
 
-static __always_inline bool proc_seq_ooo(struct tcphdr *tcph, struct bpf_tcp_conn *c,
+static __always_inline bool hand_proc_seq_ooo(struct tcphdr *tcph, struct bpf_tcp_conn *c,
                                          struct meta_info *data_meta, struct tcp_scratch *s)
 {
     /* --- proc_seq + proc_ooo (EVENT-DATA 1.3) ----------------------------- */
@@ -244,7 +237,7 @@ static __always_inline bool proc_seq_ooo(struct tcphdr *tcph, struct bpf_tcp_con
     return true;
 }
 
-static __always_inline void proc_window_rtt(struct tcphdr *tcph, struct bpf_tcp_conn *c,
+static __always_inline void hand_proc_window_rtt(struct tcphdr *tcph, struct bpf_tcp_conn *c,
                                             struct bpf_cc *cc, struct tcp_scratch *s)
 {
     /* --- proc_window (EVENT-ACK 1.3) --- */
@@ -275,7 +268,7 @@ static __always_inline void proc_window_rtt(struct tcphdr *tcph, struct bpf_tcp_
 
 }
 
-static __always_inline void proc_recv(struct bpf_tcp_conn *c, struct meta_info *data_meta,
+static __always_inline void hand_proc_recv(struct bpf_tcp_conn *c, struct meta_info *data_meta,
                                       struct tcp_scratch *s)
 {
     /* --- proc_recv (EVENT-DATA 1.3) --------------------------------------- */
@@ -457,10 +450,10 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
      * on the scratchpad above.
      */
     do {
-        if (!proc_ack(tcph, c, cc, &s))                 break;   /* tcp_ack  */
-        if (!proc_seq_ooo(tcph, c, data_meta, &s))      break;   /* tcp_data */
-        proc_window_rtt(tcph, c, cc, &s);                        /* tcp_ack  */
-        proc_recv(c, data_meta, &s);                             /* tcp_data */
+        if (!hand_proc_ack(tcph, c, cc, &s))                 break;   /* tcp_ack  */
+        if (!hand_proc_seq_ooo(tcph, c, data_meta, &s))      break;   /* tcp_data */
+        hand_proc_window_rtt(tcph, c, cc, &s);                        /* tcp_ack  */
+        hand_proc_recv(c, data_meta, &s);                             /* tcp_data */
     } while (0);
 
     post_data(c, data_meta, &s);
@@ -474,14 +467,7 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
 /* ------------------------------------------------------------------ *
  * scratchpad_t tcp_tx_scratch { ... }   -- app_send's processors share these.
  * ------------------------------------------------------------------ */
-struct tcp_tx_scratch {
-    __u32 rx_bump;
-    __u32 payload_len;
-    __u32 tx_pending;
-    __u32 tx_pos;
-    __u64 ref_ts;
-    bool  wnd_upd;
-};
+/* tcp_tx_scratch comes from the generated headers in this probe. */
 
 /*
  * dispatch: app_send -> { record_data, gen_seg }
@@ -522,7 +508,7 @@ struct tcp_tx_scratch {
  */
 #define MTP_TX_NEXT (-1)
 
-static __always_inline int gen_retransmit(struct bpf_tcp_conn *c, struct bpf_cc *cc,
+static __always_inline int site_gen_retransmit(struct bpf_tcp_conn *c, struct bpf_cc *cc,
                                           struct meta_info *data_meta, struct tcp_tx_scratch *s)
 {
     /* --- gen_retransmit (EVENT-TIMER-RTO 1.3): the RTO's dummy packet ----- */
@@ -551,7 +537,7 @@ static __always_inline int gen_retransmit(struct bpf_tcp_conn *c, struct bpf_cc 
     return MTP_TX_NEXT;
 }
 
-static __always_inline int send_wnd_update(struct iphdr *iph, struct tcphdr *tcph,
+static __always_inline int site_send_wnd_update(struct iphdr *iph, struct tcphdr *tcph,
                                            struct bpf_tcp_conn *c, void *data_end,
                                            struct meta_info *data_meta,
                                            struct tcp_tx_scratch *s)
@@ -587,7 +573,7 @@ static __always_inline int send_wnd_update(struct iphdr *iph, struct tcphdr *tcp
     return MTP_TX_NEXT;
 }
 
-static __always_inline int gen_seg(struct iphdr *iph, struct tcphdr *tcph,
+static __always_inline int site_gen_seg(struct iphdr *iph, struct tcphdr *tcph,
                                    struct bpf_tcp_conn *c, struct bpf_cc *cc,
                                    void *data_end, struct meta_info *data_meta,
                                    struct tcp_tx_scratch *s, __u32 cpu)
@@ -713,13 +699,13 @@ static __always_inline int dispatch_tcp_tx(struct iphdr *iph, struct tcphdr *tcp
      * Every one of them releases the lock this dispatch took -- see the note on
      * the processors above; gen_seg drops it partway through on purpose.
      */
-    int v = gen_retransmit(c, cc, data_meta, &s);          /* FLAG_TO   */
+    int v = site_gen_retransmit(c, cc, data_meta, &s);          /* FLAG_TO   */
     if (v != MTP_TX_NEXT)
         return v;
 
-    v = send_wnd_update(iph, tcph, c, data_end, data_meta, &s);   /* FLAG_SYNC */
+    v = site_send_wnd_update(iph, tcph, c, data_end, data_meta, &s);   /* FLAG_SYNC */
     if (v != MTP_TX_NEXT)
         return v;
 
-    return gen_seg(iph, tcph, c, cc, data_end, data_meta, &s, cpu);
+    return site_gen_seg(iph, tcph, c, cc, data_end, data_meta, &s, cpu);
 }
