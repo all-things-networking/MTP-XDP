@@ -117,7 +117,14 @@ const uint32 TCP_MAX_RTT           = 1000000;
 const uint32 TCP_WND_SCALE         = 12;
 /* Serialisation is subtracted from the RTT sample: the time to put the
  * acknowledged bytes on the wire is not the peer's delay. Bits per second. */
-const uint32 LINK_BANDWIDTH        = 25000000000;
+/*
+ * BITS PER SECOND, AND SIXTY-FOUR OF THEM. Declared uint32 and it wrapped to
+ * 3525163520 -- and because the backend emitted it as a #define it then
+ * SHADOWED eTran's own LINK_BANDWIDTH, moving the rate-limiter bypass
+ * threshold in the donor's send path. That was the 27% throughput cap, and it
+ * had nothing to do with any generated processor. docs/RESULTS.md 2026-09-01.
+ */
+const uint64 LINK_BANDWIDTH        = 25000000000;
 
 /**************************** parameters ****************************/
 
