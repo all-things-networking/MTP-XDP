@@ -13,6 +13,7 @@
  */
 
 #include "mtp_target_bpf.h"   /* same directory */
+#include "bisect_config.h"   /* which RX groups are generated */
 
 /* ------------------------------------------------------------------ *
  * flow_id tcp_fid : (uint32, uint32, uint16, uint16)
@@ -80,6 +81,229 @@ static __always_inline bool tcp_is_slow_path_event(const struct tcphdr *tcph)
 #include "gen/prog.h"
 #include "gen/prog_proc_bpf.h"
 #include "gen/prog_dispatch_bpf.h"
+
+
+/* ==================================================================== *
+ * BISECTION: the hand-written RX processors, kept beside the generated
+ * ones so that either can be selected at COMPILE time.
+ *
+ * The hand-written port measures at eTran's ceiling and the generated one
+ * is pinned ~27% below it. Rather than theorise about why, the difference
+ * is bisected the same way the port was built in the first place: one
+ * group at a time, measure, fix, move on.
+ *
+ * Four groups, because that is how the two forms line up:
+ *
+ *   MTP_GEN_ACK     hand proc_ack        <-> gen proc_ack + proc_fast_retransmit
+ *   MTP_GEN_SEQOOO  hand proc_seq_ooo    <-> gen proc_seq + proc_ooo
+ *   MTP_GEN_WINRTT  hand proc_window_rtt <-> gen proc_window + proc_rtt
+ *   MTP_GEN_RECV    hand proc_recv       <-> gen proc_recv
+ *
+ * Define none and this is the hand-written port; define all four and it is
+ * the generated one. A bisection step is a -D and a build, not an edit,
+ * so nothing else can drift between measurements.
+ * ==================================================================== */
+static __always_inline bool hand_proc_ack(struct tcphdr *tcph, struct bpf_tcp_conn *c,
+                                     struct bpf_cc *cc, struct tcp_scratch *s)
+{
+    /* --- proc_ack + proc_fast_retransmit (EVENT-ACK 1.3) ------------------ */
+    if (tcph->ack == 1) {
+        // update CC
+        cc->cnt_rx_acks++;
+        if (likely(tcp_valid_rxack(c, s->ack_seq, &s->tx_bump)) == 0) {
+            if (unlikely(s->tx_bump > c->tx_sent)) {
+                s->tx_bump = 0;
+                /* this is probably caused by retransmission */
+                s->trigger_ack = false;
+                return false;
+            }
+            cc->cnt_rx_ack_bytes += s->tx_bump;
+            if (unlikely(tcph->ece == 1))
+                cc->cnt_rx_ecn_bytes += s->tx_bump;
+            
+            c->tx_sent -= s->tx_bump;
+            cc->txp = c->tx_sent > 0;
+
+            if (likely(s->tx_bump)) {
+                c->rx_dupack_cnt = 0;
+            } 
+            /*
+            * Fast retransmit -> detect a duplicate ACK if:
+            * 1. The ACK number is the same as the largest seen: tcp_valid_rxack() returns 0
+            * 2. There is unacknowledged data pending: tx_sent > 0
+            * 3. There is no data payload included with the ACK: s->payload_len == 0
+            * 4. There is no window update: c->rx_remote_avail == ((bpf_ntohs(tcph->window)) << TCP_WND_SCALE)
+            */
+            /* duplicate ack ? */
+            else if (unlikely(c->tx_sent && s->payload_len == 0 && (c->rx_remote_avail == ((bpf_ntohs(tcph->window)) << TCP_WND_SCALE)) && ++c->rx_dupack_cnt == 3)) {
+                s->go_back_pos = fast_retransmit(c, cc);
+                xdp_log("Duplicate ACK triggers fast retransmission");
+                return false;
+            }
+        } else {
+            s->trigger_ack = false;
+            xdp_log_err("Bad ack");
+            return false;
+        }
+    }
+
+    return true;
+}
+static __always_inline bool hand_proc_seq_ooo(struct tcphdr *tcph, struct bpf_tcp_conn *c,
+                                         struct meta_info *data_meta, struct tcp_scratch *s)
+{
+    /* --- proc_seq + proc_ooo (EVENT-DATA 1.3) ----------------------------- */
+    /* Payload validation */
+    #ifdef OOO_RECV
+    if (unlikely(tcp_valid_rxseq_ooo(c, s->seq, s->payload_len, &s->trim_start, &s->trim_end))) {
+        s->trigger_ack = false;
+        xdp_log_err("Bad seq");
+        return false;
+    }
+
+    s->payload_off += s->trim_start;
+    if (likely(s->payload_len >= s->trim_start + s->trim_end))
+        s->payload_len -= s->trim_start + s->trim_end;
+    data_meta->rx.poff = s->payload_off;
+    data_meta->rx.plen = s->payload_len;
+
+    s->seq += s->trim_start;
+    data_meta->rx.rx_pos = c->rx_next_pos + (s->seq - c->rx_next_seq);
+    if (data_meta->rx.rx_pos >= c->rx_buf_size)
+        data_meta->rx.rx_pos -= c->rx_buf_size;
+
+    /* check if we can add it to the out of order interval */
+    if (unlikely(s->seq != c->rx_next_seq)) {
+        if (!s->payload_len) return false;
+        xdp_log("OOO packet, seq(%u), c->rx_next_seq(%u)", s->seq, c->rx_next_seq);
+        if (c->rx_ooo_len == 0) {
+            c->rx_ooo_start = s->seq;
+            c->rx_ooo_len = s->payload_len;
+            xdp_log("New segment, ooo_start(%u), ooo_len(%u)", c->rx_ooo_start, c->rx_ooo_len);
+        } else if (s->seq + s->payload_len == c->rx_ooo_start) {
+            c->rx_ooo_start = s->seq;
+            c->rx_ooo_len += s->payload_len;
+            xdp_log("Merge segment, ooo_start(%u), ooo_len(%u)", c->rx_ooo_start, c->rx_ooo_len);
+        } else if (c->rx_ooo_start + c->rx_ooo_len == s->seq) {
+            c->rx_ooo_len += s->payload_len;
+            xdp_log("Merge segment, ooo_start(%u), ooo_len(%u)", c->rx_ooo_start, c->rx_ooo_len);
+        } else {
+            // unfortunately, we can't accept this payload
+            s->payload_len = 0;
+            data_meta->rx.plen = POISON_16;
+            xdp_log("Drop packet, ooo_start(%u), ooo_len(%u)", c->rx_ooo_start, c->rx_ooo_len);
+        }
+        // mark this packet is an out-of-order segment
+        data_meta->rx.ooo_bump = OOO_SEGMENT_MASK;
+
+        return false;
+    }
+
+    #else
+        if (unlikely(tcp_valid_rxseq(c, s->seq, s->payload_len, &s->trim_start, &s->trim_end))) {
+            s->trigger_ack = false;
+            xdp_log_err("Bad seq");
+            return false;
+        }
+
+        s->payload_off += s->trim_start;
+        s->payload_len -= s->trim_start + s->trim_end;
+        data_meta->rx.poff = s->payload_off;
+        data_meta->rx.plen = s->payload_len;
+        data_meta->rx.rx_pos = c->rx_next_pos;
+
+        xdp_log("Good seq, payload_off(%u), payload_len(%u), trim_start(%u), trim_end(%u)", 
+            s->payload_off, s->payload_len, s->trim_start, s->trim_end);
+
+    #endif
+
+    return true;
+}
+static __always_inline void hand_proc_window_rtt(struct tcphdr *tcph, struct bpf_tcp_conn *c,
+                                            struct bpf_cc *cc, struct tcp_scratch *s)
+{
+    /* --- proc_window (EVENT-ACK 1.3) --- */
+    /* The window is refreshed when this ACK advanced anything, or when the
+     * advertised window is larger than what we believed. */
+    if (likely(s->tx_bump || (c->rx_remote_avail < ((bpf_ntohs(tcph->window)) << TCP_WND_SCALE)))) {
+        /* update TCP receive window */
+        c->rx_remote_avail = (bpf_ntohs(tcph->window)) << TCP_WND_SCALE;
+    }
+    
+    /* --- proc_rtt (EVENT-ACK 1.3) ----------------------------------------- */
+    /* update RTT estimate */
+    if (s->payload_len && !c->tx_next_ts)
+        c->tx_next_ts = s->ts_val;
+    if (likely(tcph->ack == 1 && s->ts_ecr && s->tx_bump)) {
+        // RTT = t{completion} - t{sent} - t{serialization}
+        __u32 rtt = (s->now - s->ts_ecr);
+        rtt /= 1000; // microseconds
+        rtt -= (s->tx_bump * 1000000) / LINK_BANDWIDTH;
+        // bpf_printk("CPU#%u, RTT: %u us", bpf_get_smp_processor_id(), rtt);
+        if (likely(rtt < TCP_MAX_RTT)) {
+            if (likely(cc->rtt_est))
+                cc->rtt_est = (cc->rtt_est * 7 + rtt) / 8;
+            else
+                cc->rtt_est = rtt;
+        }
+    }
+
+}
+static __always_inline void hand_proc_recv(struct bpf_tcp_conn *c, struct meta_info *data_meta,
+                                      struct tcp_scratch *s)
+{
+    /* --- proc_recv (EVENT-DATA 1.3) --------------------------------------- */
+    /* update TCP state if we have payload */
+    if (likely(s->payload_len)) {
+        s->rx_bump = s->payload_len;
+        c->rx_avail -= s->payload_len;
+        c->rx_next_pos += s->payload_len;
+        if (c->rx_next_pos >= c->rx_buf_size)
+            c->rx_next_pos -= c->rx_buf_size;
+        c->rx_next_seq += s->payload_len;
+
+        // xdp_log("seq(%u), payload_len(%u), c->rx_avail(%u), c->rx_next_pos(%u), c->rx_next_seq(%u)", s->seq, s->payload_len, c->rx_avail, c->rx_next_pos, c->rx_next_seq);
+        
+        /* handle existing out-of-order segments */
+        if (unlikely(c->rx_ooo_len)) {
+            if (tcp_valid_rxseq_ooo(c, c->rx_ooo_start, c->rx_ooo_len, &s->trim_start, &s->trim_end)) {
+                /* completely superfluous: s->drop out of order interval */
+                c->rx_ooo_len = 0;
+                data_meta->rx.ooo_bump = OOO_CLEAR_MASK;
+                s->trigger_ack = false;
+                s->clear_ooo = true;
+            } else {
+                c->rx_ooo_start += s->trim_start;
+                c->rx_ooo_len -= s->trim_start + s->trim_end;
+
+                // accept out-of-order segments
+                if (c->rx_ooo_len && c->rx_ooo_start == c->rx_next_seq) {
+                    xdp_log("c->rx_ooo_len(%u), c->rx_ooo_start(%u), c->rx_next_seq(%u)", c->rx_ooo_len, c->rx_ooo_start, c->rx_next_seq);
+                    s->rx_bump += c->rx_ooo_len;
+                    c->rx_avail -= c->rx_ooo_len;
+                    c->rx_next_pos += c->rx_ooo_len;
+                    if (c->rx_next_pos >= c->rx_buf_size)
+                        c->rx_next_pos -= c->rx_buf_size;
+                    c->rx_next_seq += c->rx_ooo_len;
+
+                    c->rx_ooo_len = 0;
+                    // out-of-order segment is processed
+                    data_meta->rx.ooo_bump = OOO_FIN_MASK;
+                    xdp_log("Out-of-order segment is processed");
+                }
+            }
+        }
+
+        if (unlikely((c->rx_avail >> TCP_WND_SCALE) == 0)) {
+            // ebpf realized that the receive buffer is empty,
+            // piggyback a signal to lib, once application releases the buffer, force it sync with us
+            data_meta->rx.qid |= FORCE_RX_BUMP_MASK;
+            // bpf_printk("force");
+        }
+        // bpf_printk("c->rx_avail = %u", c->rx_avail);
+    }
+
+}
 
 /*
  * The metadata the redirect needs, derived after the chain from the scratchpad
@@ -268,18 +492,52 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
      * processor that must not run guards on them -- which is how MTP says
      * "the chain is over" -- and the calls below are ordered to match.
      */
+    /*
+     * ONE GROUP AT A TIME. The two forms differ in how they END the chain --
+     * the hand-written ones return false, the generated ones set a flag a
+     * guard reads -- so each branch carries its own termination and the
+     * observable behaviour is the same either way.
+     */
+    bool live = true;
+
+#ifdef MTP_GEN_ACK
     proc_ack(&ev_ack, c, cc, &s);
-    if (likely(s.ack_ok)) {
-        proc_fast_retransmit(&ev_ack, c, cc, &s);
+    live = s.ack_ok;
+    if (live) proc_fast_retransmit(&ev_ack, c, cc, &s);
+#else
+    live = hand_proc_ack(tcph, c, cc, &s);
+    s.ack_ok = live;
+#endif
+
+    if (live) {
+#ifdef MTP_GEN_SEQOOO
         proc_seq(&ev_data, c, &s);
         proc_ooo(&ev_data, c, &s);
-        if (likely(s.seg_ok)) {
-            proc_window(&ev_ack, c, &s);
-            proc_rtt(&ev_ack, c, cc, &s);
-            proc_recv(&ev_data, c, &s);
-        }
+        live = s.seg_ok;
+#else
+        live = hand_proc_seq_ooo(tcph, c, data_meta, &s);
+        s.seg_ok = live;
+#endif
     }
+
+    if (live) {
+#ifdef MTP_GEN_WINRTT
+        proc_window(&ev_ack, c, &s);
+        proc_rtt(&ev_ack, c, cc, &s);
+#else
+        hand_proc_window_rtt(tcph, c, cc, &s);
+#endif
+#ifdef MTP_GEN_RECV
+        proc_recv(&ev_data, c, &s);
+#else
+        hand_proc_recv(c, data_meta, &s);
+#endif
+    }
+#if defined(MTP_GEN_SEQOOO) || defined(MTP_GEN_RECV)
+    /* Only the generated processors leave the metadata for the target to
+     * derive; the hand-written ones write it themselves as they go. */
     mtp_rx_meta(c, data_meta, &s, pos0, seq0);
+#endif
 
     post_data(c, data_meta, &s);
     send_ack(c, &s, ece, cpu);
