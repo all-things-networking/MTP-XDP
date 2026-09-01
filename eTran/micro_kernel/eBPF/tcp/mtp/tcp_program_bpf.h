@@ -20,8 +20,12 @@
  * generated processor, which is what every measurement so far has been unable
  * to pin down.
  */
+/* STEP 4: TYPES ONLY. No function bodies -- neither the generated processors
+ * nor the contract's inline half. If this is fast, the cost is in the function
+ * bodies the compiler was asked to consider; if it is slow, it is the types,
+ * which would point at stack depth or layout rather than code. */
+#define MTP_CONTRACT_NO_IMPL 1
 #include "gen/prog.h"
-#include "gen/prog_proc_bpf.h"
 
 /* ------------------------------------------------------------------ *
  * flow_id tcp_fid : (uint32, uint32, uint16, uint16)
