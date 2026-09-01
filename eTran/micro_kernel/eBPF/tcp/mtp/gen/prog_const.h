@@ -41,5 +41,5 @@
 #define LINK_BANDWIDTH ((__u32)-769803776)
 
 /* ---- param -- defaults; configuration may override------ */
-static __attribute__((unused)) __u32 tcp_handshake_timeout = 50;
-static __attribute__((unused)) __u32 tcp_close_timeout = 100;
+#define tcp_handshake_timeout (50)
+#define tcp_close_timeout (100)
