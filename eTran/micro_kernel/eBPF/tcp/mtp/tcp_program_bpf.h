@@ -233,19 +233,35 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
      * events' lists back to back would be a different program; see the comment
      * on the scratchpad above.
      */
-    /* The two events this packet raises, built from the header once. */
-    struct tcp_ack  ev_ack  = {0};
-    struct tcp_data ev_data = {0};
-    ev_ack.seq  = s.seq;   ev_ack.ack  = s.ack_seq;
-    ev_ack.window = bpf_ntohs(tcph->window);
-    ev_ack.ts_val = s.ts_val; ev_ack.ts_ecr = s.ts_ecr;
+    /*
+     * DIAGNOSTIC (2026-09-01): is the 11% at 128 KB the cost of MATERIALISING
+     * EVENTS? This is the same construction, reduced to the minimum that is
+     * still correct -- no zero-init, and only the fields the generated
+     * processors actually read:
+     *
+     *   tcp_ack  : ack, ecn_ce, payload_len, window, ts_ecr, ts_val   (6)
+     *   tcp_data : payload_len, seq                                   (2)
+     *
+     * Against 2 memsets and 14 stores before. Every field read is still
+     * assigned, so dropping = {0} is safe -- checked processor by processor
+     * against the generated code, not assumed.
+     *
+     * If throughput moves toward eTran's ceiling, materialisation is the cost
+     * and the fix is an event-field mapping in the compiler, so `ev->seq`
+     * compiles to a read of the header in place and no struct exists at all.
+     * If it does not move, the cost is elsewhere and this is one build spent
+     * to rule out the leading hypothesis.
+     */
+    struct tcp_ack  ev_ack;
+    struct tcp_data ev_data;
+    ev_ack.ack         = s.ack_seq;
+    ev_ack.ecn_ce      = ece;
     ev_ack.payload_len = s.payload_len;
-    ev_ack.ecn_ce = ece;
-    ev_data.seq = s.seq;   ev_data.ack = s.ack_seq;
-    ev_data.window = ev_ack.window;
-    ev_data.ts_val = s.ts_val; ev_data.ts_ecr = s.ts_ecr;
+    ev_ack.window      = bpf_ntohs(tcph->window);
+    ev_ack.ts_ecr      = s.ts_ecr;
+    ev_ack.ts_val      = s.ts_val;
     ev_data.payload_len = s.payload_len;
-    ev_data.ecn_ce = ece;
+    ev_data.seq         = s.seq;
 
     /* Where the stream stood before the chain, for the metadata below. */
     __u32 pos0 = c->rx_next_pos, seq0 = c->rx_next_seq;
