@@ -38,7 +38,7 @@ struct ipv4 {
     __u8 tos;
 };
 
-struct tcp_tx_scratch {
+struct gen_tcp_tx_scratch {
     __u32 rx_bump;
     __u32 payload_len;
     __u32 tx_pending;
@@ -48,7 +48,7 @@ struct tcp_tx_scratch {
     bool tx_ok;
 };
 
-struct tcp_scratch {
+struct gen_tcp_scratch {
     __u32 seq;
     __u32 ack_seq;
     __u32 ts_val;

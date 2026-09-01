@@ -73,7 +73,18 @@ static __always_inline bool tcp_is_slow_path_event(const struct tcphdr *tcph)
  * a single 290-line function; naming them is what makes the processor boundaries
  * below mean anything.
  * ------------------------------------------------------------------ */
-/* tcp_scratch comes from the generated headers in this probe. */
+/* THE DONOR'S SCRATCHPADS, restored: step 1 had replaced them with the
+ * generated ones, which is a second variable. */
+struct tcp_scratch {
+    __u32 seq; __u32 ack_seq; __u32 ts_val; __u32 ts_ecr; __u32 now;
+    __u32 payload_off; __u32 payload_len; __u32 rx_bump; __u32 tx_bump;
+    __u32 go_back_pos; __u32 trim_start; __u32 trim_end;
+    bool  trigger_ack; bool clear_ooo; bool drop;
+};
+struct tcp_tx_scratch {
+    __u32 rx_bump; __u32 payload_len; __u32 tx_pending; __u32 tx_pos;
+    __u64 ref_ts; bool wnd_upd;
+};
 
 /*
  * dispatch: tcp_ack -> { proc_ack, proc_fast_retransmit, proc_window, proc_rtt }
@@ -467,7 +478,6 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
 /* ------------------------------------------------------------------ *
  * scratchpad_t tcp_tx_scratch { ... }   -- app_send's processors share these.
  * ------------------------------------------------------------------ */
-/* tcp_tx_scratch comes from the generated headers in this probe. */
 
 /*
  * dispatch: app_send -> { record_data, gen_seg }
