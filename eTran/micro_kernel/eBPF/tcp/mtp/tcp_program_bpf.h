@@ -586,7 +586,15 @@ static __always_inline int hand_gen_retransmit(struct bpf_tcp_conn *c, struct bp
     /* --- hand_gen_retransmit (EVENT-TIMER-RTO 1.3): the RTO's dummy packet ----- */
     /* Timeout packet from slowpath, process it first */
     if (unlikely(data_meta->tx.flag & FLAG_TO)) {
+#ifdef MTP_GEN_RETRANSMIT
+        /* GENERATED: whether anything is outstanding to resend. WHERE the
+         * stream goes back to stays the target's congestion control. */
+        struct rto_timeout ev_to = {0};
+        gen_retransmit(&ev_to, &c->mtp, s);
+        if (!s->tx_ok) {
+#else
         if (!c->mtp.tx_sent) {
+#endif
             TCP_UNLOCK(c);
             xdp_egress_log("Timeout but no data to retransmit");
             return XDP_DROP;
@@ -616,11 +624,21 @@ static __always_inline int hand_send_wnd_update(struct iphdr *iph, struct tcphdr
 {
     /* --- hand_send_wnd_update (EVENT-APP-RECV 1.3) ----------------------------- */
     /* update receving buffer space */
+#ifdef MTP_GEN_WNDUPD
+    /* GENERATED: the window has moved, and whether that is worth a packet of
+     * its own. Building the frame and choosing the verdict stay the target's. */
+    {
+        struct app_recv ev_rcv = {0};
+        send_wnd_update(&ev_rcv, &c->mtp, s);
+    }
+    if (0) {
+#else
     if (s->rx_bump) {
         // if ((c->mtp.rx_avail >> TCP_WND_SCALE) == 0 && c->tx_avail == 0)
         if (c->mtp.tx_pending == 0)
             s->wnd_upd = true;
         c->mtp.rx_avail += s->rx_bump;
+#endif
         xdp_egress_log("Rxwnd is updated from %u to %u", min((c->mtp.rx_avail - s->rx_bump) >> TCP_WND_SCALE, 0xFFFF), c->mtp.rx_avail);
     }
 

@@ -8,3 +8,5 @@
 /* #define MTP_GEN_SEQOOO */   /* proc_seq + proc_ooo */
 /* #define MTP_GEN_WINRTT */   /* proc_window + proc_rtt */
 /* #define MTP_GEN_RECV */     /* proc_recv */
+/* #define MTP_GEN_RETRANSMIT */
+/* #define MTP_GEN_WNDUPD */
