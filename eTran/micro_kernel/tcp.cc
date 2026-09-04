@@ -660,11 +660,11 @@ void snapshot_cc(struct bpf_cc_snapshot *stats, uint32_t cc_idx)
     stats->c_acks = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.cnt_rx_acks;
     stats->c_ackb = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.cnt_rx_ack_bytes;
     stats->c_ecnb = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.cnt_rx_ecn_bytes;
-    stats->mtp.txp = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.txp;
+    stats->txp = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.txp;
     stats->rtt = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.rtt_est;
     // // dump all above stats
     // printf("cc_idx (%u): c_drops = %u, c_acks = %u, c_ackb = %u, c_ecnb = %u, txp = %u, rtt = %u\n",
-    //     cc_idx, stats->c_drops, stats->c_acks, stats->c_ackb, stats->c_ecnb, stats->mtp.txp, stats->rtt);
+    //     cc_idx, stats->c_drops, stats->c_acks, stats->c_ackb, stats->c_ecnb, stats->txp, stats->rtt);
 }
 
 // convert kbps to Bps
@@ -720,7 +720,7 @@ void handle_retransmission(struct tcp_connection *c, struct bpf_cc_snapshot *sta
     uint32_t rtt = (stats->rtt ? stats->rtt : TCP_RTT_INIT);
 
     /* check for re-transmits */
-    if (stats->mtp.txp && stats->c_ackb == 0)
+    if (stats->txp && stats->c_ackb == 0)
     {
         if (c->cnt_tx_pending++ == 0)
         {
