@@ -1455,9 +1455,29 @@ void send_wnd_update(app_recv ev, tcp_ctx ctx, tcp_tx_scratch s) {
  * is; they disagree only if a frame arrived out of order behind our back, and
  * then the frame is not ours to send.
  */
-void gen_seg(app_send ev, tcp_ctx ctx, tcp_tx_scratch s) {
+/*
+ * SPLIT IN TWO, BECAUSE THE DONOR SEPARATES THEM AND SOMETHING DEPENDS ON IT.
+ * eTran checks the stream position, then computes pacing, then advances:
+ *
+ *     if (s->tx_pos != c->tx_next_pos) return XDP_DROP;
+ *     avail = tcp_txavail(c);                  // rx_remote_avail - tx_sent
+ *     desired_tx_ts = cc_get_desired_tx_ts(cc, ...);
+ *     c->tx_next_seq += len;  c->tx_sent += len;  ...
+ *
+ * tcp_txavail READS tx_sent and the advance WRITES it, so pacing is computed
+ * against the window before this segment counts as sent. One fused processor
+ * has to run entirely before or entirely after the pacing, and both are wrong.
+ * Two processors let the target call each at the donor's own point.
+ */
+void check_seg(app_send ev, tcp_ctx ctx, tcp_tx_scratch s) {
     s.tx_ok = false;
     if (s.tx_pos != ctx.tx_next_pos)
+        return;
+    s.tx_ok = true;
+}
+
+void gen_seg(app_send ev, tcp_ctx ctx, tcp_tx_scratch s) {
+    if (!s.tx_ok)
         return;
 
     if (s.tx_pending > 0)
@@ -1482,7 +1502,7 @@ dispatch tcp_dispatch {
     app_connect -> { proc_connect, gen_syn };
     app_close   -> { proc_close };
 
-    app_send    -> { record_data, gen_seg };
+    app_send    -> { record_data, check_seg, gen_seg };
     app_recv    -> { proc_drain, send_wnd_update };
 
     tcp_syn     -> { proc_syn_queue, proc_passive_open, gen_synack };

@@ -16,6 +16,7 @@ static __always_inline void proc_ooo(struct tcp_data *ev, struct tcp_ctx_ebpf *c
 static __always_inline void proc_recv(struct tcp_data *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s);
 static __always_inline void gen_retransmit(struct rto_timeout *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_tx_scratch *s);
 static __always_inline void send_wnd_update(struct app_recv *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_tx_scratch *s);
+static __always_inline void check_seg(struct app_send *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_tx_scratch *s);
 static __always_inline void gen_seg(struct app_send *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_tx_scratch *s);
 
 /* ---- proc_ack  [ebpf]----------------------------------- */
@@ -264,11 +265,20 @@ static __always_inline void send_wnd_update(struct app_recv *ev, struct tcp_ctx_
     ctx_ebpf->rx_avail = ctx_ebpf->rx_avail + s->rx_bump;
 }
 
-/* ---- gen_seg  [ebpf]------------------------------------ */
-static __always_inline void gen_seg(struct app_send *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_tx_scratch *s)
+/* ---- check_seg  [ebpf]---------------------------------- */
+static __always_inline void check_seg(struct app_send *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_tx_scratch *s)
 {
     s->tx_ok = false;
     if (s->tx_pos != ctx_ebpf->tx_next_pos) {
+        return;
+    }
+    s->tx_ok = true;
+}
+
+/* ---- gen_seg  [ebpf]------------------------------------ */
+static __always_inline void gen_seg(struct app_send *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_tx_scratch *s)
+{
+    if (!s->tx_ok) {
         return;
     }
     if (s->tx_pending > 0) {

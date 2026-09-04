@@ -10,6 +10,7 @@
 /* ---- dispatch [ebpf]------------------------------------ */
 static inline void mtp_dispatch_app_send_ebpf(struct app_send *ev, struct tcp_ctx_ebpf *c_tcp_ctx_ebpf, struct tcp_ctx_cc_shared *c_tcp_ctx_cc_shared, struct tcp_tx_scratch *s)
 {
+    check_seg(ev, c_tcp_ctx_ebpf, s);
     gen_seg(ev, c_tcp_ctx_ebpf, c_tcp_ctx_cc_shared, s);
 }
 

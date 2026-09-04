@@ -671,15 +671,26 @@ static __always_inline int hand_gen_seg(struct iphdr *iph, struct tcphdr *tcph,
 
     // this is probably caused by fast retransmission as we reset the c->mtp.tx_next_pos
     // but there are pending packets in the queue, simply drop them
+#ifdef MTP_GEN_SEG
+    /* GENERATED: the check only. The advance is the second processor, below,
+     * after the pacing the donor computes in between. */
+    struct app_send ev_snd = {0};
+    ev_snd.len = s->payload_len;
+    check_seg(&ev_snd, &c->mtp, s);
+    if (unlikely(!s->tx_ok)) {
+#else
     if (unlikely(s->tx_pos != c->mtp.tx_next_pos)) {
+#endif
         TCP_UNLOCK(c);
         xdp_egress_log("tx_pos(%u) != c->mtp.tx_next_pos(%u)", s->tx_pos, c->mtp.tx_next_pos);
         // bpf_printk("tx_pos(%u) != c->mtp.tx_next_pos(%u)", s->tx_pos, c->mtp.tx_next_pos);
         return XDP_DROP;
     }
 
+#ifndef MTP_GEN_SEG
     if (s->tx_pending)
         c->mtp.tx_pending += s->tx_pending;
+#endif
 
     __u32 avail = tcp_txavail(c);
 
@@ -696,6 +707,11 @@ static __always_inline int hand_gen_seg(struct iphdr *iph, struct tcphdr *tcph,
 
     fill_ip_hdr(iph, s->payload_len, c->ecn_enable);
 
+#ifdef MTP_GEN_SEG
+    /* GENERATED: the advance, at the donor's own point -- AFTER tcp_txavail
+     * read tx_sent, which the advance is about to change. */
+    gen_seg(&ev_snd, &c->mtp, &cc->mtp, s);
+#else
     c->mtp.tx_next_seq += s->payload_len;
     c->mtp.tx_next_pos += s->payload_len;
     if (c->mtp.tx_next_pos >= c->mtp.tx_buf_size)
@@ -703,6 +719,7 @@ static __always_inline int hand_gen_seg(struct iphdr *iph, struct tcphdr *tcph,
     c->mtp.tx_sent += s->payload_len;
     cc->mtp.txp = c->mtp.tx_sent > 0;
     c->mtp.tx_pending -= s->payload_len;
+#endif
 
     // /*** NO CC ***/
     // TCP_UNLOCK(c);
