@@ -13,6 +13,9 @@
  */
 
 #include "mtp_target_bpf.h"   /* same directory */
+#include "bisect_config.h"    /* which groups are generated */
+#include "mtp/gen/prog_context.h"
+#include "mtp/gen/prog_proc_bpf.h"
 
 /* ------------------------------------------------------------------ *
  * flow_id tcp_fid : (uint32, uint32, uint16, uint16)
@@ -64,27 +67,10 @@ static __always_inline bool tcp_is_slow_path_event(const struct tcphdr *tcph)
  * a single 290-line function; naming them is what makes the processor boundaries
  * below mean anything.
  * ------------------------------------------------------------------ */
-struct tcp_scratch {
-    __u32 seq;
-    __u32 ack_seq;
-    __u32 ts_val;
-    __u32 ts_ecr;
-    __u32 now;
-    __u32 payload_off;
-    __u32 payload_len;
-    __u32 rx_bump;
-    __u32 tx_bump;
-    __u32 go_back_pos;
-    __u32 trim_start;
-    __u32 trim_end;
-    bool  trigger_ack;
-    bool  clear_ooo;
-    bool  drop;
-};
 
 /*
- * dispatch: tcp_ack -> { proc_ack, proc_fast_retransmit, proc_window, proc_rtt }
- *           tcp_data -> { proc_seq, proc_ooo, proc_recv, post_data, send_ack }
+ * dispatch: tcp_ack -> { hand_proc_ack, proc_fast_retransmit, proc_window, proc_rtt }
+ *           tcp_data -> { proc_seq, proc_ooo, hand_proc_recv, post_data, send_ack }
  *
  * WHY THIS IS ONE FUNCTION AND NOT TEN, AND WHAT THAT SAYS ABOUT THE DOC.
  *
@@ -92,10 +78,10 @@ struct tcp_scratch {
  * processor lists. eTran does not run them that way, and the difference is not
  * cosmetic: **the two lists interleave**. In execution order the code does
  *
- *     proc_ack / proc_fast_retransmit   (tcp_ack)
+ *     hand_proc_ack / proc_fast_retransmit   (tcp_ack)
  *     proc_seq / proc_ooo               (tcp_data)
  *     proc_window / proc_rtt            (tcp_ack again)
- *     proc_recv                         (tcp_data)
+ *     hand_proc_recv                         (tcp_data)
  *     post_data, send_ack               (shared epilogue)
  *
  * so tcp_ack's window and RTT updates run AFTER tcp_data's sequence validation
@@ -126,10 +112,10 @@ struct tcp_scratch {
  * sitting close enough to the verifier's limits that a compiler change pushes it
  * over.
  */
-static __always_inline bool proc_ack(struct tcphdr *tcph, struct bpf_tcp_conn *c,
+static __always_inline bool hand_proc_ack(struct tcphdr *tcph, struct bpf_tcp_conn *c,
                                      struct bpf_cc *cc, struct tcp_scratch *s)
 {
-    /* --- proc_ack + proc_fast_retransmit (EVENT-ACK 1.3) ------------------ */
+    /* --- hand_proc_ack + proc_fast_retransmit (EVENT-ACK 1.3) ------------------ */
     if (tcph->ack == 1) {
         // update CC
         cc->mtp.cnt_rx_acks++;
@@ -173,7 +159,7 @@ static __always_inline bool proc_ack(struct tcphdr *tcph, struct bpf_tcp_conn *c
     return true;
 }
 
-static __always_inline bool proc_seq_ooo(struct tcphdr *tcph, struct bpf_tcp_conn *c,
+static __always_inline bool hand_proc_seq_ooo(struct tcphdr *tcph, struct bpf_tcp_conn *c,
                                          struct meta_info *data_meta, struct tcp_scratch *s)
 {
     /* --- proc_seq + proc_ooo (EVENT-DATA 1.3) ----------------------------- */
@@ -244,7 +230,7 @@ static __always_inline bool proc_seq_ooo(struct tcphdr *tcph, struct bpf_tcp_con
     return true;
 }
 
-static __always_inline void proc_window_rtt(struct tcphdr *tcph, struct bpf_tcp_conn *c,
+static __always_inline void hand_proc_window_rtt(struct tcphdr *tcph, struct bpf_tcp_conn *c,
                                             struct bpf_cc *cc, struct tcp_scratch *s)
 {
     /* --- proc_window (EVENT-ACK 1.3) --- */
@@ -275,10 +261,10 @@ static __always_inline void proc_window_rtt(struct tcphdr *tcph, struct bpf_tcp_
 
 }
 
-static __always_inline void proc_recv(struct bpf_tcp_conn *c, struct meta_info *data_meta,
+static __always_inline void hand_proc_recv(struct bpf_tcp_conn *c, struct meta_info *data_meta,
                                       struct tcp_scratch *s)
 {
-    /* --- proc_recv (EVENT-DATA 1.3) --------------------------------------- */
+    /* --- hand_proc_recv (EVENT-DATA 1.3) --------------------------------------- */
     /* update TCP state if we have payload */
     if (likely(s->payload_len)) {
         s->rx_bump = s->payload_len;
@@ -456,11 +442,35 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
      * events' lists back to back would be a different program; see the comment
      * on the scratchpad above.
      */
+    /* The events the generated processors take. The parser is the target's:
+     * these are the same fields the hand-written forms read off tcph. */
+    struct tcp_ack  ev_ack  = {0};
+    struct tcp_data ev_data = {0};
+    ev_ack.seq = s.seq;   ev_ack.ack = s.ack_seq;
+    ev_ack.window = bpf_ntohs(tcph->window);
+    ev_ack.ts_val = s.ts_val; ev_ack.ts_ecr = s.ts_ecr;
+    ev_ack.payload_len = s.payload_len;
+    ev_ack.ecn_ce = ece;
+    ev_data.seq = s.seq;  ev_data.ack = s.ack_seq;
+    ev_data.window = ev_ack.window;
+    ev_data.ts_val = s.ts_val; ev_data.ts_ecr = s.ts_ecr;
+    ev_data.payload_len = s.payload_len;
+    ev_data.ecn_ce = ece;
+    (void)ev_data;
+
     do {
-        if (!proc_ack(tcph, c, cc, &s))                 break;   /* tcp_ack  */
-        if (!proc_seq_ooo(tcph, c, data_meta, &s))      break;   /* tcp_data */
-        proc_window_rtt(tcph, c, cc, &s);                        /* tcp_ack  */
-        proc_recv(c, data_meta, &s);                             /* tcp_data */
+#ifdef MTP_GEN_ACK
+        /* The two forms END the chain differently: the hand-written one returns
+         * false, the generated one sets ack_ok for a guard to read. */
+        proc_ack(&ev_ack, &c->mtp, &cc->mtp, &s);
+        if (!s.ack_ok)                                       break;
+        proc_fast_retransmit(&ev_ack, &c->mtp, &cc->mtp, &s);
+#else
+        if (!hand_proc_ack(tcph, c, cc, &s))                 break;   /* tcp_ack  */
+#endif
+        if (!hand_proc_seq_ooo(tcph, c, data_meta, &s))      break;   /* tcp_data */
+        hand_proc_window_rtt(tcph, c, cc, &s);                        /* tcp_ack  */
+        hand_proc_recv(c, data_meta, &s);                             /* tcp_data */
     } while (0);
 
     post_data(c, data_meta, &s);
