@@ -98,7 +98,10 @@ const unsigned int TCP_CLOSE_TIMEOUT = 100;
  * identity in those four fields. When the context declaration itself is ported
  * this becomes a generated struct.
  * ------------------------------------------------------------------ */
-using tcp_fid = struct flow_tuple;
+/* THE GENERATED TYPE STANDS. prog_flow_id.h defines struct tcp_fid and a
+ * constructor macro with the same positional order; aliasing eTran's
+ * flow_tuple over it collided with that definition. eTran's own uses of
+ * flow_tuple elsewhere are untouched. */
 
 /*
  * The bound-but-not-connected flow id, built from the application's socket
@@ -155,7 +158,7 @@ static inline tcp_ctx_store &ctxs()
  * an id selects the instance, so this is the one place the program cannot be
  * written as MTP describes -- recorded as [GAP: REUSEPORT].
  * ------------------------------------------------------------------ */
-using tcp_lid = struct listen_tuple;
+/* Same as tcp_fid above. */
 
 struct tcp_listen_ctx_init {
     void operator()(struct tcp_listener *l, const tcp_lid &id) const {

@@ -421,12 +421,12 @@ int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen)
 
     /* initialize eBPF CC state */
     etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].prev_desired_tx_ts = 0;
-    etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].rate = CC_DCTCP_MIN;
-    etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_tx_drops = 0;
-    etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_rx_acks = 0;
-    etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_rx_ack_bytes = 0;
-    etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_rx_ecn_bytes = 0;
-    etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].rtt_est = 0;
+    etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.rate = CC_DCTCP_MIN;
+    etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.cnt_tx_drops = 0;
+    etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.cnt_rx_acks = 0;
+    etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.cnt_rx_ack_bytes = 0;
+    etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.cnt_rx_ecn_bytes = 0;
+    etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.rtt_est = 0;
 
     /* initialize eBPF state */
     ebpf_c.opaque_connection = OPAQUE(c->opaque_connection);
@@ -656,12 +656,12 @@ void notify_app_tcp_status_close(struct app_ctx_per_thread *tctx, opaque_ptr c, 
 
 void snapshot_cc(struct bpf_cc_snapshot *stats, uint32_t cc_idx)
 {
-    stats->c_drops = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_tx_drops;
-    stats->c_acks = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_rx_acks;
-    stats->c_ackb = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_rx_ack_bytes;
-    stats->c_ecnb = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_rx_ecn_bytes;
-    stats->mtp.txp = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].txp;
-    stats->rtt = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].rtt_est;
+    stats->c_drops = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.cnt_tx_drops;
+    stats->c_acks = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.cnt_rx_acks;
+    stats->c_ackb = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.cnt_rx_ack_bytes;
+    stats->c_ecnb = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.cnt_rx_ecn_bytes;
+    stats->mtp.txp = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.txp;
+    stats->rtt = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.rtt_est;
     // // dump all above stats
     // printf("cc_idx (%u): c_drops = %u, c_acks = %u, c_ackb = %u, c_ecnb = %u, txp = %u, rtt = %u\n",
     //     cc_idx, stats->c_drops, stats->c_acks, stats->c_ackb, stats->c_ecnb, stats->mtp.txp, stats->rtt);
@@ -673,7 +673,7 @@ void set_cc_rate(uint32_t cc_idx, uint32_t new_rate)
     uint32_t v = new_rate * 1e3 / 8;
     if (v > 3125000000)
         v = 3125000000; // 25Gbps
-    etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].rate = v;
+    etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].mtp.rate = v;
 }
 
 /**
