@@ -91,17 +91,17 @@ const unsigned int TCP_HANDSHAKE_TIMEOUT = 50;
 const unsigned int TCP_CLOSE_TIMEOUT = 100;
 
 /* ------------------------------------------------------------------ *
- * flow_id tcp_fid : (uint32, uint16, uint32, uint16)
+ * flow_id flow_tuple : (uint32, uint16, uint32, uint16)
  *
  * Emitted as an alias of eTran's flow_tuple rather than as a fresh struct,
  * because the context (below) is still eTran's tcp_connection and stores its
  * identity in those four fields. When the context declaration itself is ported
  * this becomes a generated struct.
  * ------------------------------------------------------------------ */
-/* THE GENERATED TYPE STANDS. prog_flow_id.h defines struct tcp_fid and a
- * constructor macro with the same positional order; aliasing eTran's
- * flow_tuple over it collided with that definition. eTran's own uses of
- * flow_tuple elsewhere are untouched. */
+/* NO ALIAS. prog_flow_id.h defines struct flow_tuple and a constructor macro of
+ * the same name, so aliasing eTran's flow_tuple onto it collides. The control
+ * path is still on the old convention -- the flow id is deferred -- so it uses
+ * eTran's type under eTran's own name and leaves the program's name alone. */
 
 /*
  * The bound-but-not-connected flow id, built from the application's socket
@@ -113,9 +113,9 @@ const unsigned int TCP_CLOSE_TIMEOUT = 100;
  * here because the same fabrication has to be reproduced by listen() and
  * close(), which have not been ported yet and still read these fields directly.
  */
-static inline tcp_fid tcp_fid_from_handle(opaque_ptr h, uint16_t local_port)
+static inline flow_tuple tcp_fid_from_handle(opaque_ptr h, uint16_t local_port)
 {
-    return tcp_fid(/* remote_ip   */ (uint16_t)(h >> 16),
+    return flow_tuple(/* remote_ip   */ (uint16_t)(h >> 16),
                    /* remote_port */ (uint16_t)h,
                    /* local_ip    */ (uint16_t)(h >> 32),
                    /* local_port  */ local_port);
@@ -124,12 +124,12 @@ static inline tcp_fid tcp_fid_from_handle(opaque_ptr h, uint16_t local_port)
 /* KeyOf / IdInit -- the pair the target needs to key a context by itself and to
  * stamp a fresh context with its id. Inverses by construction. */
 struct tcp_key_of {
-    tcp_fid operator()(const struct tcp_connection *c) const {
-        return tcp_fid(c->remote_ip, c->remote_port, c->local_ip, c->local_port);
+    flow_tuple operator()(const struct tcp_connection *c) const {
+        return flow_tuple(c->remote_ip, c->remote_port, c->local_ip, c->local_port);
     }
 };
 struct tcp_ctx_init {
-    void operator()(struct tcp_connection *c, const tcp_fid &id) const {
+    void operator()(struct tcp_connection *c, const flow_tuple &id) const {
         c->remote_ip = id.remote_ip; c->remote_port = id.remote_port;
         c->local_ip  = id.local_ip;  c->local_port  = id.local_port;
         /* The target's per-context destructor hook. eTran sets this on every
@@ -139,7 +139,7 @@ struct tcp_ctx_init {
     }
 };
 
-using tcp_ctx_store = mtp::ctx_store<tcp_fid, struct tcp_connection,
+using tcp_ctx_store = mtp::ctx_store<flow_tuple, struct tcp_connection,
                                      flow_tuple_hash, flow_tuple_equal,
                                      tcp_key_of, tcp_ctx_init>;
 
@@ -150,7 +150,7 @@ static inline tcp_ctx_store &ctxs()
 }
 
 /* ------------------------------------------------------------------ *
- * flow_id tcp_lid : (uint32, uint16)   -- the listening endpoint
+ * flow_id listen_tuple : (uint32, uint16)   -- the listening endpoint
  *
  * A SEPARATE context declaration with its own id shape, and a BAG rather than a
  * store: SO_REUSEPORT puts several listening contexts under one id and an
@@ -158,10 +158,10 @@ static inline tcp_ctx_store &ctxs()
  * an id selects the instance, so this is the one place the program cannot be
  * written as MTP describes -- recorded as [GAP: REUSEPORT].
  * ------------------------------------------------------------------ */
-/* Same as tcp_fid above. */
+/* Same as above. */
 
 struct tcp_listen_ctx_init {
-    void operator()(struct tcp_listener *l, const tcp_lid &id) const {
+    void operator()(struct tcp_listener *l, const listen_tuple &id) const {
         l->listen_port = id.local_port;
         /* id.local_ip is not stored on the listener: eTran keys the bag by the
          * node's single configured address and the listener carries only its
@@ -169,7 +169,7 @@ struct tcp_listen_ctx_init {
     }
 };
 
-using tcp_listen_bag = mtp::ctx_bag<tcp_lid, struct tcp_listener,
+using tcp_listen_bag = mtp::ctx_bag<listen_tuple, struct tcp_listener,
                                     listen_tuple_hash, listen_tuple_equal,
                                     tcp_listen_ctx_init>;
 
@@ -306,7 +306,7 @@ struct app_accept : app_event {
  * ------------------------------------------------------------------ */
 static inline void sock_bind(struct app_ctx_per_thread *tctx,
                              const struct appout_tcp_bind_t *op,
-                             app_bind &ev, tcp_fid &fid)
+                             app_bind &ev, flow_tuple &fid)
 {
     ev.tctx       = tctx;
     ev.handle     = op->opaque_connection;
@@ -373,15 +373,15 @@ static inline void sock_accept(struct app_ctx_per_thread *tctx,
  * remote half. eTran writes the same expression inline in tcp_conn_lookup
  * (tcp.cc:688).
  * ------------------------------------------------------------------ */
-static inline tcp_fid tcp_fid_of_pkt(const struct pkt_tcp *p)
+static inline flow_tuple tcp_fid_of_pkt(const struct pkt_tcp *p)
 {
-    return tcp_fid(ntohl(p->ip.src), ntohs(p->tcp.src),
+    return flow_tuple(ntohl(p->ip.src), ntohs(p->tcp.src),
                    ntohl(p->ip.dest), ntohs(p->tcp.dest));
 }
 
-static inline tcp_lid tcp_lid_of_pkt(const struct pkt_tcp *p)
+static inline listen_tuple tcp_lid_of_pkt(const struct pkt_tcp *p)
 {
-    return tcp_lid(ntohl(p->ip.dest), ntohs(p->tcp.dest));
+    return listen_tuple(ntohl(p->ip.dest), ntohs(p->tcp.dest));
 }
 
 /*
@@ -424,7 +424,7 @@ static inline void proc_passive_open(struct tcp_listener *lst);
  * unshared and unreachable -- so the only difference is that the failure paths
  * no longer allocate and free.
  */
-static inline int proc_bind(const app_bind &ev, const tcp_fid &fid)
+static inline int proc_bind(const app_bind &ev, const flow_tuple &fid)
 {
     /* exists(ctx) -> ERROR. By app handle, not by id: eTran resolves a socket
      * call by scanning for its opaque handle, and a bound socket rebinding to a
@@ -493,7 +493,7 @@ static inline int proc_listen(const app_listen &ev)
 
     /* The listening id uses the node's single configured address, not anything
      * the application asked for -- consistent with bind discarding local_ip. */
-    tcp_lid lid(etran_nic->_local_ip, bound->local_port);
+    listen_tuple lid(etran_nic->_local_ip, bound->local_port);
 
     struct tcp_listener *l = listen_ctxs().new_ctx(lid, [&](struct tcp_listener *nl) {
         nl->opaque_listener   = ev.listener_handle;
@@ -546,7 +546,7 @@ static inline int proc_connect(const app_connect &ev)
         record_port(ev.tctx->actx, fresh_port, ev.remote_port);
     }
 
-    const tcp_fid fid(ev.remote_ip, ev.remote_port, etran_nic->_local_ip,
+    const flow_tuple fid(ev.remote_ip, ev.remote_port, etran_nic->_local_ip,
                       ctx ? ctx->local_port : fresh_port);
 
     auto fill = [&](struct tcp_connection *c) {
@@ -718,7 +718,7 @@ static inline void proc_passive_open(struct tcp_listener *lst)
     ctx->qid = slot->qid;
 
     /* The flow id, from the SYN. */
-    const tcp_fid fid(ntohl(pkt->ip.src), ntohs(pkt->tcp.src),
+    const flow_tuple fid(ntohl(pkt->ip.src), ntohs(pkt->tcp.src),
                       etran_nic->_local_ip, lst->listen_port);
     tcp_ctx_init{}(ctx, fid);
 
@@ -799,7 +799,7 @@ static inline void proc_backlog(const tcp_syn &ev, struct tcp_listener *lst)
  * The doc splits this into proc_synack / open_ctx / notify_connect / gen_ack.
  * Two notes where it does not match the code:
  *
- *  - `open_ctx` is written as `new_ctx(tcp_fid(...))`, but the context already
+ *  - `open_ctx` is written as `new_ctx(flow_tuple(...))`, but the context already
  *    exists -- proc_connect made it. What happens here is that its eBPF halves
  *    (classes a and b) are created. In MTP there is ONE context, so a program
  *    cannot say "new_ctx" twice for it; the storage split is the target's.
@@ -974,7 +974,7 @@ static inline void dispatch_app_bind(struct app_ctx_per_thread *tctx,
                                      const struct appout_tcp_bind_t *op)
 {
     app_bind ev;
-    tcp_fid fid(0, 0, 0, 0);
+    flow_tuple fid(0, 0, 0, 0);
     sock_bind(tctx, op, ev, fid);
 
     if (proc_bind(ev, fid) != 0)
