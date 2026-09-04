@@ -91,15 +91,15 @@ const unsigned int TCP_HANDSHAKE_TIMEOUT = 50;
 const unsigned int TCP_CLOSE_TIMEOUT = 100;
 
 /* ------------------------------------------------------------------ *
- * flow_id flow_tuple : (uint32, uint16, uint32, uint16)
+ * flow_id tcp_fid : (uint32, uint16, uint32, uint16)
  *
  * Emitted as an alias of eTran's flow_tuple rather than as a fresh struct,
  * because the context (below) is still eTran's tcp_connection and stores its
  * identity in those four fields. When the context declaration itself is ported
  * this becomes a generated struct.
  * ------------------------------------------------------------------ */
-/* NO ALIAS. prog_flow_id.h defines struct flow_tuple and a constructor macro of
- * the same name, so aliasing eTran's flow_tuple onto it collides. The control
+/* NO ALIAS. prog_flow_id.h defines struct tcp_fid and a constructor macro of
+ * that name, so aliasing eTran's flow_tuple onto tcp_fid collides. The control
  * path is still on the old convention -- the flow id is deferred -- so it uses
  * eTran's type under eTran's own name and leaves the program's name alone. */
 
