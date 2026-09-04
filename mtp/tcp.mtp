@@ -1123,6 +1123,15 @@ void proc_fast_retransmit(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
     if (ctx.cnt_tx_drops == 0)
         ctx.rate = ctx.rate >> 1;
     ctx.cnt_tx_drops = ctx.cnt_tx_drops + 1;
+
+    /* THE CHAIN ENDS HERE, as it does in the donor. eTran's proc_ack returns
+     * false once fast retransmit fires, so proc_seq, proc_window, proc_rtt and
+     * proc_recv do NOT run for that duplicate acknowledgement. Without this the
+     * generated chain carried on and updated the receive window from a segment
+     * the donor ignores. ack_ok is the flag every later processor already
+     * guards on, so saying it here is the program's way of saying `return
+     * false`. */
+    s.ack_ok = false;
 }
 
 /*

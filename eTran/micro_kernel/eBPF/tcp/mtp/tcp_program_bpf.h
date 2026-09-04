@@ -465,6 +465,10 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
         proc_ack(&ev_ack, &c->mtp, &cc->mtp, &s);
         if (!s.ack_ok)                                       break;
         proc_fast_retransmit(&ev_ack, &c->mtp, &cc->mtp, &s);
+        /* It clears ack_ok when it fires, which is the program saying what the
+         * donor says by returning false: nothing after this runs for that
+         * duplicate acknowledgement. */
+        if (!s.ack_ok)                                       break;
 #else
         if (!hand_proc_ack(tcph, c, cc, &s))                 break;   /* tcp_ack  */
 #endif

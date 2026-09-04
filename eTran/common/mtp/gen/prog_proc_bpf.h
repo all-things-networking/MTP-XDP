@@ -81,6 +81,7 @@ static __always_inline void proc_fast_retransmit(struct tcp_ack *ev, struct tcp_
         ctx_cc_shared->rate = ctx_cc_shared->rate >> 1;
     }
     ctx_cc_shared->cnt_tx_drops = ctx_cc_shared->cnt_tx_drops + 1;
+    s->ack_ok = false;
 }
 
 /* ---- proc_window  [ebpf]-------------------------------- */
