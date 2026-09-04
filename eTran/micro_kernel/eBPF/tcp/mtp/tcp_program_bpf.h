@@ -510,8 +510,17 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
 #else
         if (!hand_proc_seq_ooo(tcph, c, data_meta, &s))      break;   /* tcp_data */
 #endif
-        hand_proc_window_rtt(tcph, c, cc, &s);                        /* tcp_ack  */
-        hand_proc_recv(c, data_meta, &s);                             /* tcp_data */
+#ifdef MTP_GEN_WINRTT
+        proc_window(&ev_ack, &c->mtp, &s);
+        proc_rtt(&ev_ack, &c->mtp, &cc->mtp, &s);
+#else
+        hand_proc_window_rtt(tcph, c, cc, &s);
+#endif                        /* tcp_ack  */
+#ifdef MTP_GEN_RECV
+        proc_recv(&ev_data, &c->mtp, &s);
+#else
+        hand_proc_recv(c, data_meta, &s);
+#endif                             /* tcp_data */
     } while (0);
 
 #if defined(MTP_GEN_SEQOOO) || defined(MTP_GEN_RECV)
