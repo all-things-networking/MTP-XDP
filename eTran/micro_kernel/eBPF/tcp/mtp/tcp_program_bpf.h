@@ -9,7 +9,7 @@
  *
  * Ported so far:  the ingress flow id, its parser, the context store, and the
  *                 RX event processing (tcp_ack + tcp_data), and the TX site
- *                 (app_send's gen_seg, plus the two dummy-packet events).
+ *                 (app_send's hand_gen_seg, plus the two dummy-packet events).
  */
 
 #include "mtp_target_bpf.h"   /* same directory */
@@ -484,17 +484,9 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
 /* ------------------------------------------------------------------ *
  * scratchpad_t tcp_tx_scratch { ... }   -- app_send's processors share these.
  * ------------------------------------------------------------------ */
-struct tcp_tx_scratch {
-    __u32 rx_bump;
-    __u32 payload_len;
-    __u32 tx_pending;
-    __u32 tx_pos;
-    __u64 ref_ts;
-    bool  wnd_upd;
-};
 
 /*
- * dispatch: app_send -> { record_data, gen_seg }
+ * dispatch: app_send -> { record_data, hand_gen_seg }
  *
  * The XDP_EGRESS site (K2), which runs once per descriptor the application
  * submits. It is where a frame the application has already filled with payload
@@ -507,9 +499,9 @@ struct tcp_tx_scratch {
  * this program run, which is the mechanism the paper describes as "fake packets
  * with the event metadata" (appendix C):
  *
- *   FLAG_TO    the control path's retransmission timeout  -> gen_retransmit
- *   FLAG_SYNC  the application's window update            -> send_wnd_update
- *   neither    an actual segment to send                  -> gen_seg
+ *   FLAG_TO    the control path's retransmission timeout  -> hand_gen_retransmit
+ *   FLAG_SYNC  the application's window update            -> hand_send_wnd_update
+ *   neither    an actual segment to send                  -> hand_gen_seg
  *
  * So a compiler targeting this backend has to know that one execution site is
  * the landing point for three events distinguished by a metadata flag, and that
@@ -523,7 +515,7 @@ struct tcp_tx_scratch {
  * by a metadata flag, and the flag tests stay inside the processors they select.
  *
  * THE LOCK IS NOT THE TARGET'S HERE, and that is deliberate. eTran acquires the
- * connection lock in the dispatch and each processor releases it -- but gen_seg
+ * connection lock in the dispatch and each processor releases it -- but hand_gen_seg
  * releases it PARTWAY THROUGH, before the timing-wheel insert, because that work
  * does not need the connection. MTP leaves state consistency to the target
  * (paper 4.1), and a target that owned locking uniformly would hold this lock
@@ -532,10 +524,10 @@ struct tcp_tx_scratch {
  */
 #define MTP_TX_NEXT (-1)
 
-static __always_inline int gen_retransmit(struct bpf_tcp_conn *c, struct bpf_cc *cc,
+static __always_inline int hand_gen_retransmit(struct bpf_tcp_conn *c, struct bpf_cc *cc,
                                           struct meta_info *data_meta, struct tcp_tx_scratch *s)
 {
-    /* --- gen_retransmit (EVENT-TIMER-RTO 1.3): the RTO's dummy packet ----- */
+    /* --- hand_gen_retransmit (EVENT-TIMER-RTO 1.3): the RTO's dummy packet ----- */
     /* Timeout packet from slowpath, process it first */
     if (unlikely(data_meta->tx.flag & FLAG_TO)) {
         if (!c->mtp.tx_sent) {
@@ -561,12 +553,12 @@ static __always_inline int gen_retransmit(struct bpf_tcp_conn *c, struct bpf_cc 
     return MTP_TX_NEXT;
 }
 
-static __always_inline int send_wnd_update(struct iphdr *iph, struct tcphdr *tcph,
+static __always_inline int hand_send_wnd_update(struct iphdr *iph, struct tcphdr *tcph,
                                            struct bpf_tcp_conn *c, void *data_end,
                                            struct meta_info *data_meta,
                                            struct tcp_tx_scratch *s)
 {
-    /* --- send_wnd_update (EVENT-APP-RECV 1.3) ----------------------------- */
+    /* --- hand_send_wnd_update (EVENT-APP-RECV 1.3) ----------------------------- */
     /* update receving buffer space */
     if (s->rx_bump) {
         // if ((c->mtp.rx_avail >> TCP_WND_SCALE) == 0 && c->tx_avail == 0)
@@ -597,7 +589,7 @@ static __always_inline int send_wnd_update(struct iphdr *iph, struct tcphdr *tcp
     return MTP_TX_NEXT;
 }
 
-static __always_inline int gen_seg(struct iphdr *iph, struct tcphdr *tcph,
+static __always_inline int hand_gen_seg(struct iphdr *iph, struct tcphdr *tcph,
                                    struct bpf_tcp_conn *c, struct bpf_cc *cc,
                                    void *data_end, struct meta_info *data_meta,
                                    struct tcp_tx_scratch *s, __u32 cpu)
@@ -718,18 +710,18 @@ static __always_inline int dispatch_tcp_tx(struct iphdr *iph, struct tcphdr *tcp
 
     /*
      * The selector. Each processor tests the flag that selects it and returns
-     * MTP_TX_NEXT if it is not the one. gen_seg is last and always answers.
+     * MTP_TX_NEXT if it is not the one. hand_gen_seg is last and always answers.
      *
      * Every one of them releases the lock this dispatch took -- see the note on
-     * the processors above; gen_seg drops it partway through on purpose.
+     * the processors above; hand_gen_seg drops it partway through on purpose.
      */
-    int v = gen_retransmit(c, cc, data_meta, &s);          /* FLAG_TO   */
+    int v = hand_gen_retransmit(c, cc, data_meta, &s);          /* FLAG_TO   */
     if (v != MTP_TX_NEXT)
         return v;
 
-    v = send_wnd_update(iph, tcph, c, data_end, data_meta, &s);   /* FLAG_SYNC */
+    v = hand_send_wnd_update(iph, tcph, c, data_end, data_meta, &s);   /* FLAG_SYNC */
     if (v != MTP_TX_NEXT)
         return v;
 
-    return gen_seg(iph, tcph, c, cc, data_end, data_meta, &s, cpu);
+    return hand_gen_seg(iph, tcph, c, cc, data_end, data_meta, &s, cpu);
 }
