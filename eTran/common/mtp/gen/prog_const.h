@@ -1,4 +1,4 @@
-/* GENERATED from /tmp/claude-11465/-home-mtahmasb-mtp-xdp-session-tmp-mtp-pass/ef347694-90cd-4c3c-80ee-6c5e3721d8a4/scratchpad/src/tcp-newconv.mtp by the MTP compiler's XDP backend.
+/* GENERATED from /tmp/claude-11465/-home-mtahmasb-mtp-xdp-session-tmp-mtp-pass/ef347694-90cd-4c3c-80ee-6c5e3721d8a4/scratchpad/src/tcp-bisect.mtp by the MTP compiler's XDP backend.
  * Do not edit: regenerate. The target runtime this is compiled against
  * (mtp_target.h, mtp_target_bpf.h) is NOT generated and is not touched.
  */
@@ -16,12 +16,13 @@
 #define MTP_FLAG_CWR ((__u8)128)
 #define MTP_CONN_WAIT_RX_SYN ((__u8)0)
 #define MTP_CONN_WAIT_TX_SYNACK ((__u8)1)
-#define MTP_CONN_WAIT_RX_SYNACK ((__u8)2)
-#define MTP_CONN_WAIT_TX_SYN ((__u8)3)
+#define MTP_CONN_WAIT_TX_SYN ((__u8)2)
+#define MTP_CONN_WAIT_RX_SYNACK ((__u8)3)
 #define MTP_CONN_OPEN ((__u8)4)
 #define MTP_CONN_CLOSED ((__u8)5)
-#define MTP_TYPE_FAKE ((__u8)0)
-#define MTP_TYPE_NORMAL ((__u8)1)
+#define MTP_CONN_FAILED ((__u8)6)
+#define MTP_TYPE_NORMAL ((__u8)0)
+#define MTP_TYPE_FAKE ((__u8)1)
 #define MTP_PARITY_ISN_ACTIVE ((__u32)0)
 #define MTP_PARITY_ISN_PASSIVE ((__u32)1)
 #define MTP_PARITY_CTRL_WINDOW ((__u16)11680)

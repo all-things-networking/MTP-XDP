@@ -46,12 +46,21 @@ const uint8  FLAG_CWR = 0x80;
  * accept() has created but no SYN has yet claimed -- the one state whose
  * contexts are deliberately NOT in the connection map.
  */
+/*
+ * THE DONOR'S VALUES, IN THE DONOR'S ORDER. These were 0,1,2,3,4,5 in the order
+ * they read best, which put CONN_WAIT_TX_SYN and CONN_WAIT_RX_SYNACK the wrong
+ * way round -- eTran's enum interleaves the accept() pair and the open() pair.
+ * A constant that does not match is invisible until a generated processor
+ * writes it into the donor's struct, and then the connect path is simply
+ * broken. Checked against runtime/tcp.h:98.
+ */
 const uint8  CONN_WAIT_RX_SYN    = 0;
 const uint8  CONN_WAIT_TX_SYNACK = 1;
-const uint8  CONN_WAIT_RX_SYNACK = 2;
-const uint8  CONN_WAIT_TX_SYN    = 3;
+const uint8  CONN_WAIT_TX_SYN    = 2;
+const uint8  CONN_WAIT_RX_SYNACK = 3;
 const uint8  CONN_OPEN           = 4;
 const uint8  CONN_CLOSED         = 5;
+const uint8  CONN_FAILED         = 6;
 
 /*
  * The KIND of a context, which eTran keeps separately from its state. A bound
@@ -60,8 +69,10 @@ const uint8  CONN_CLOSED         = 5;
  * ST_BOUND and ST_LISTEN do not exist in the donor, and earlier versions of the
  * event documents invented them for exactly the two events that have none.
  */
-const uint8  TYPE_FAKE   = 0;
-const uint8  TYPE_NORMAL = 1;
+/* Also the donor's, and also the other way round from what was written here:
+ * TCP_CONN_TYPE_NORMAL is 0 and TCP_CONN_TYPE_FAKE is 1 (runtime/tcp.h:255). */
+const uint8  TYPE_NORMAL = 0;
+const uint8  TYPE_FAKE   = 1;
 
 /* PARITY: both initial sequence numbers are constants and neither is
  * randomised. The active open sends 0, the passive open sends 1. Reproduce,
@@ -259,15 +270,18 @@ context tcp_ctx {
      */
     @placement("control") {
         uint8  type = TYPE_FAKE;
-        uint8  state = CONN_WAIT_RX_SYN;
+        /* `status`, WHICH IS THE DONOR'S NAME. It was `state`; a name that does
+         * not match is a rename at every swap, and the whole point of the
+         * placement groups is that a generated processor drops in beside the
+         * hand-written one -- which needs the field to be the same field. */
+        uint8  status = CONN_WAIT_RX_SYN;
         bool   reuseport;
         uint16 local_port, remote_port;
         uint32 local_ip, remote_ip;
         uint32 syn_ts;
         uint32 syn_attempts;
-        uint32 next_timeout;
+        uint64 next_timeout_tsc;   /* the donor's name, and a TSC needs 64 bits */
         uint32 qid;
-        bool   ecn_enable;
     }
 
     /*
@@ -281,6 +295,11 @@ context tcp_ctx {
          * donor keeps them in the map entry precisely because the fast path
          * needs them, and without the wrap the position walks off the ring. */
         uint32 rx_buf_size, tx_buf_size;
+        /* THE HEADER BUILDER READS IT, so it lives where the header is built.
+         * Placed on the control path first, which is where the socket option
+         * arrives -- but placement is about which memory holds it at run time,
+         * not about who first sets it. */
+        bool ecn_enable;
         uint32 rx_avail, rx_remote_avail;
         uint32 rx_next_pos, rx_next_seq;
         uint16 rx_dupack_cnt;
@@ -378,6 +397,28 @@ context tcp_listen_ctx {
  * live, which the donor says by returning false. MTP has no way to refuse
  * (docs/REFUSAL.md), so it is carried.
  */
+/*
+ * The TX site's scratchpad. Separate from tcp_scratch because it is a different
+ * site with a different event: these are the values the egress processors hand
+ * one another, and the donor keeps them in their own struct for the same reason.
+ *
+ * `ref_ts` is the time of this transmission, established once by the target --
+ * see the note on s.now in proc_rtt. `tx_pos` is where the application believes
+ * the stream is, which the target reads off the frame and the program checks.
+ */
+scratchpad_t tcp_tx_scratch {
+    uint32 rx_bump;
+    uint32 payload_len;
+    uint32 tx_pending;
+    uint32 tx_pos;
+    /* NANOSECONDS, so 64 bits. Declared uint32 first, which truncates a
+     * monotonic clock roughly every four seconds -- the pacing decision it
+     * feeds would have gone wrong once per wrap and looked like jitter. */
+    uint64 ref_ts;
+    bool   wnd_upd;
+    bool   tx_ok;
+}
+
 scratchpad_t tcp_scratch {
     uint32 seq;
     uint32 ack_seq;
@@ -395,6 +436,18 @@ scratchpad_t tcp_scratch {
     bool   clear_ooo;
     bool   drop;
     bool   seg_ok;
+    /* WHICH OOO THING HAPPENED. The target has to tell its data path apart --
+     * a segment held, a held interval discarded, a held interval delivered --
+     * and only the program knows which of the three it was. Everything else the
+     * target needs about this packet it can derive from the fields above and
+     * the state before the chain ran; these two it cannot. */
+    bool   ooo_seg;
+    bool   ooo_fin;
+    /* THE ACKNOWLEDGEMENT WAS USABLE. The donor says this by returning false
+     * from proc_ack, which ends the chain -- and ending a chain is the one
+     * thing MTP cannot say (docs/REFUSAL.md). Carried, so the processors that
+     * must not run can guard on it and the target can stop early. */
+    bool   ack_ok;
 }
 
 /**************************** the app parser ****************************/
@@ -706,7 +759,7 @@ void proc_connect(app_connect ev, tcp_ctx ctx) {
     ctx.type        = TYPE_NORMAL;
     ctx.remote_ip   = ev.remote_ip;
     ctx.remote_port = ev.remote_port;
-    ctx.state       = CONN_WAIT_TX_SYN;
+    ctx.status       = CONN_WAIT_TX_SYN;
     ctx.rx_next_seq = 0;
     ctx.tx_next_seq = PARITY_ISN_ACTIVE;
     ctx.syn_attempts = 0;
@@ -726,10 +779,10 @@ void proc_connect(app_connect ev, tcp_ctx ctx) {
  * why this is a separate processor rather than the tail of proc_connect.
  */
 void gen_syn(app_connect ev, tcp_ctx ctx) {
-    if (ctx.state != CONN_WAIT_TX_SYN)
+    if (ctx.status != CONN_WAIT_TX_SYN)
         return;
 
-    ctx.state = CONN_WAIT_RX_SYNACK;
+    ctx.status = CONN_WAIT_RX_SYNACK;
     timer_start_instr(ctx.handshake_timer, millisecond(tcp_handshake_timeout));
 
     TCPBP bp;
@@ -801,7 +854,7 @@ void proc_passive_open(event_t ev, tcp_listen_ctx lst, tcp_ctx ctx) {
     tcp_fid fid = ctx.key;
     new_ctx_instr(fid);
 
-    ctx.state = CONN_WAIT_TX_SYNACK;
+    ctx.status = CONN_WAIT_TX_SYNACK;
     lst.has_accepted = false;
 
     /* THE SYN IS SPENT. Both halves of the rendezvous are consumed together --
@@ -851,10 +904,10 @@ void proc_syn_queue(tcp_syn ev, tcp_listen_ctx lst) {
 /* `event_t`, because tcp_syn and app_accept both end here -- and it reads
  * nothing off the event anyway: a SYN-ACK is built entirely from the context. */
 void gen_synack(event_t ev, tcp_ctx ctx) {
-    if (ctx.state != CONN_WAIT_TX_SYNACK)
+    if (ctx.status != CONN_WAIT_TX_SYNACK)
         return;
 
-    ctx.state = CONN_OPEN;
+    ctx.status = CONN_OPEN;
 
     TCPBP bp;
     bp.src_port = ctx.local_port;
@@ -880,7 +933,7 @@ void gen_synack(event_t ev, tcp_ctx ctx) {
  * returned and the fast path is running.
  */
 void proc_synack(tcp_synack ev, tcp_ctx ctx) {
-    if (ctx.state != CONN_WAIT_RX_SYNACK)
+    if (ctx.status != CONN_WAIT_RX_SYNACK)
         return;
 
     /* The NIC queue this connection's eBPF half will be keyed to. A state
@@ -908,7 +961,7 @@ void proc_synack(tcp_synack ev, tcp_ctx ctx) {
     if (ev.ece && !ev.cwr)
         ctx.ecn_enable = true;
 
-    ctx.state = CONN_OPEN;
+    ctx.status = CONN_OPEN;
     notify(ctx, CONN_OPEN_OK);
 
     TCPBP bp;
@@ -939,7 +992,7 @@ void proc_rst(tcp_rst ev, tcp_ctx ctx) {
  * the puzzlement. No FIN ever advances a connection here.
  */
 void proc_fin(tcp_fin ev, tcp_ctx ctx) {
-    if (ctx.state != CONN_CLOSED)
+    if (ctx.status != CONN_CLOSED)
         return;
 
     TCPBP bp;
@@ -958,7 +1011,7 @@ void proc_fin(tcp_fin ev, tcp_ctx ctx) {
  * resets the connection.
  */
 void proc_close(app_close ev, tcp_ctx ctx) {
-    ctx.state = CONN_CLOSED;
+    ctx.status = CONN_CLOSED;
 
     TCPBP bp;
     bp.src_port = ctx.local_port;
@@ -992,6 +1045,7 @@ void proc_close(app_close ev, tcp_ctx ctx) {
  * tx_next_seq - tx_sent to tx_next_seq + tx_pending rather than to tx_next_seq.
  */
 void proc_ack(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
+    s.ack_ok = false;
     s.tx_bump = 0;
     s.trigger_ack = ev.payload_len > 0;
 
@@ -1020,6 +1074,9 @@ void proc_ack(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
 
     if (s.tx_bump > 0)
         ctx.rx_dupack_cnt = 0;
+
+    /* Reached the end: everything after this may run. */
+    s.ack_ok = true;
 }
 
 /*
@@ -1029,13 +1086,24 @@ void proc_ack(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
  * duplicate. Only then is a third duplicate a loss signal.
  */
 void proc_fast_retransmit(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
+    /* The donor ends the chain when the acknowledgement is unusable; MTP says
+     * the same thing as a guard at the top of everything that follows. */
+    if (!s.ack_ok)
+        return;
+
     if (s.tx_bump > 0)
         return;
     if (ctx.tx_sent == 0)
         return;
     if (ev.payload_len != 0)
         return;
-    if (ctx.rx_remote_avail != ev.window)
+    /* SCALED, for the same reason proc_window shifts: rx_remote_avail is STORED
+     * shifted, and ev.window is the sixteen bits off the wire. Comparing the two
+     * unshifted made this test essentially never true, so the dup-ack count never
+     * advanced and FAST RETRANSMIT NEVER FIRED -- the donor's condition 4 is
+     * `c->rx_remote_avail == ((bpf_ntohs(tcph->window)) << TCP_WND_SCALE)`.
+     * proc_window had already been corrected and this sibling was missed. */
+    if (ctx.rx_remote_avail != (uint32(ev.window) << TCP_WND_SCALE))
         return;
 
     ctx.rx_dupack_cnt = ctx.rx_dupack_cnt + 1;
@@ -1064,6 +1132,11 @@ void proc_fast_retransmit(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
  * though the window is ACK state. That is the donor's braid, not a simplification.
  */
 void proc_window(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
+    /* The donor ends the chain when the acknowledgement is unusable; MTP says
+     * the same thing as a guard at the top of everything that follows. */
+    if (!s.ack_ok)
+        return;
+
     /* SCALED. `ev.window` is the sixteen bits off the wire; what the sender may
      * have outstanding is that shifted. The program said `ev.window` and would
      * have advertised 1/4096 of the real window. */
@@ -1077,6 +1150,11 @@ void proc_window(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
 }
 
 void proc_rtt(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
+    /* The donor ends the chain when the acknowledgement is unusable; MTP says
+     * the same thing as a guard at the top of everything that follows. */
+    if (!s.ack_ok)
+        return;
+
     /* THE TIMESTAMP TO ECHO, taken from the first segment that carried data and
      * not replaced until it has been sent. The program omitted this entirely,
      * so every outgoing segment would have echoed zero and the peer's own RTT
@@ -1094,7 +1172,13 @@ void proc_rtt(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
      * converted to microseconds, less the time it took to put the acknowledged
      * bytes on the wire, which is ours and not the peer's delay.
      */
-    uint32 rtt = (now() - ev.ts_ecr) / 1000;
+    /* `s.now` AND NOT `now()`. The time of this packet is established once, at
+     * the top of its processing, and every processor that needs it reads the
+     * same value -- which is both cheaper and more correct than each asking the
+     * clock again. On this target `now()` is a helper call and the donor caches
+     * it per CPU for exactly that reason; calling it here put the call back,
+     * once per acknowledgement, in the fast path. */
+    uint32 rtt = (s.now - ev.ts_ecr) / 1000;
     rtt = rtt - (s.tx_bump * 1000000) / LINK_BANDWIDTH;
     if (rtt >= TCP_MAX_RTT)
         return;
@@ -1125,6 +1209,11 @@ void proc_rtt(tcp_ack ev, tcp_ctx ctx, tcp_scratch s) {
  * that survives the wrap, and it is why these fields must be unsigned.
  */
 void proc_seq(tcp_data ev, tcp_ctx ctx, tcp_scratch s) {
+    /* The donor ends the chain when the acknowledgement is unusable; MTP says
+     * the same thing as a guard at the top of everything that follows. */
+    if (!s.ack_ok)
+        return;
+
     uint32 exp_first = ctx.rx_next_seq;
     uint32 exp_last  = ctx.rx_next_seq + ctx.rx_avail;
     uint32 pkt_first = ev.seq;
@@ -1193,6 +1282,7 @@ void proc_ooo(tcp_data ev, tcp_ctx ctx, tcp_scratch s) {
     if (s.payload_len == 0)
         return;
 
+    s.ooo_seg = true;
     if (ctx.rx_ooo_len == 0) {
         ctx.rx_ooo_start = s.seq;
         ctx.rx_ooo_len = s.payload_len;
@@ -1282,6 +1372,7 @@ void proc_recv(tcp_data ev, tcp_ctx ctx, tcp_scratch s) {
                     ctx.rx_next_pos = ctx.rx_next_pos - ctx.rx_buf_size;
                 ctx.rx_next_seq = ctx.rx_next_seq + ctx.rx_ooo_len;
                 ctx.rx_ooo_len = 0;
+                s.ooo_fin = true;
             }
         }
     }
@@ -1316,6 +1407,65 @@ void proc_drain(app_recv ev, tcp_ctx ctx) {
  * AFTER tcp_data's sequence validation, and are skipped by its early exits.
  * Declaring them as two independent chains would be a different program.
  */
+/*============================================================================*
+ * The egress site
+ *
+ * These run where the packet is built, which on this target is a second eBPF
+ * program. Each is SMALL, and that is the point: almost everything the donor
+ * does at this site is target machinery -- filling headers, pacing against a
+ * timing wheel, taking and dropping a lock, choosing an XDP verdict -- and none
+ * of it is protocol. What is protocol is the state the transport advances when
+ * a segment goes out, and that is what is here.
+ *============================================================================*/
+
+/*
+ * The retransmission timer fired. The only decision is whether there is
+ * anything outstanding to resend; where the stream goes back to is computed by
+ * the target's congestion control, which owns the recovery point.
+ */
+void gen_retransmit(rto_timeout ev, tcp_ctx ctx, tcp_tx_scratch s) {
+    s.tx_ok = ctx.tx_sent > 0;
+}
+
+/*
+ * The application freed receive buffer, so the window has moved. A window
+ * update goes out on its own ONLY if nothing else is about to carry it --
+ * an update riding on a segment costs nothing, one on its own costs a packet.
+ */
+void send_wnd_update(app_recv ev, tcp_ctx ctx, tcp_tx_scratch s) {
+    if (s.rx_bump == 0)
+        return;
+    if (ctx.tx_pending == 0)
+        s.wnd_upd = true;
+    ctx.rx_avail = ctx.rx_avail + s.rx_bump;
+}
+
+/*
+ * A segment goes out. The guard is a consistency check between what the
+ * application believes it has written and where the transport thinks the stream
+ * is; they disagree only if a frame arrived out of order behind our back, and
+ * then the frame is not ours to send.
+ */
+void gen_seg(app_send ev, tcp_ctx ctx, tcp_tx_scratch s) {
+    s.tx_ok = false;
+    if (s.tx_pos != ctx.tx_next_pos)
+        return;
+
+    if (s.tx_pending > 0)
+        ctx.tx_pending = ctx.tx_pending + s.tx_pending;
+
+    ctx.tx_next_seq = ctx.tx_next_seq + s.payload_len;
+    ctx.tx_next_pos = ctx.tx_next_pos + s.payload_len;
+    /* The send ring wraps, exactly as the receive ring does. */
+    if (ctx.tx_next_pos >= ctx.tx_buf_size)
+        ctx.tx_next_pos = ctx.tx_next_pos - ctx.tx_buf_size;
+    ctx.tx_sent = ctx.tx_sent + s.payload_len;
+    ctx.txp = ctx.tx_sent > 0;
+    ctx.tx_pending = ctx.tx_pending - s.payload_len;
+
+    s.tx_ok = true;
+}
+
 dispatch tcp_dispatch {
     app_bind    -> { proc_bind };
     app_listen  -> { proc_listen };
@@ -1323,8 +1473,8 @@ dispatch tcp_dispatch {
     app_connect -> { proc_connect, gen_syn };
     app_close   -> { proc_close };
 
-    app_send    -> { record_data };
-    app_recv    -> { proc_drain };
+    app_send    -> { record_data, gen_seg };
+    app_recv    -> { proc_drain, send_wnd_update };
 
     tcp_syn     -> { proc_syn_queue, proc_passive_open, gen_synack };
     tcp_synack  -> { proc_synack };
@@ -1341,4 +1491,6 @@ dispatch tcp_dispatch {
      */
     tcp_ack     -> { proc_ack, proc_fast_retransmit, proc_window, proc_rtt };
     tcp_data    -> { proc_seq, proc_ooo, proc_recv };
+
+    rto_timeout -> { gen_retransmit };
 }

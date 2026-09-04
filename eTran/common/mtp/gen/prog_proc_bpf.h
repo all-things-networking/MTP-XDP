@@ -1,4 +1,4 @@
-/* GENERATED from /tmp/claude-11465/-home-mtahmasb-mtp-xdp-session-tmp-mtp-pass/ef347694-90cd-4c3c-80ee-6c5e3721d8a4/scratchpad/src/tcp-newconv.mtp by the MTP compiler's XDP backend.
+/* GENERATED from /tmp/claude-11465/-home-mtahmasb-mtp-xdp-session-tmp-mtp-pass/ef347694-90cd-4c3c-80ee-6c5e3721d8a4/scratchpad/src/tcp-bisect.mtp by the MTP compiler's XDP backend.
  * Do not edit: regenerate. The target runtime this is compiled against
  * (mtp_target.h, mtp_target_bpf.h) is NOT generated and is not touched.
  */
@@ -14,10 +14,14 @@ static __always_inline void proc_rtt(struct tcp_ack *ev, struct tcp_ctx_ebpf *ct
 static __always_inline void proc_seq(struct tcp_data *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s);
 static __always_inline void proc_ooo(struct tcp_data *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s);
 static __always_inline void proc_recv(struct tcp_data *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s);
+static __always_inline void gen_retransmit(struct rto_timeout *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_tx_scratch *s);
+static __always_inline void send_wnd_update(struct app_recv *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_tx_scratch *s);
+static __always_inline void gen_seg(struct app_send *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_tx_scratch *s);
 
 /* ---- proc_ack  [ebpf]----------------------------------- */
 static __always_inline void proc_ack(struct tcp_ack *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_scratch *s)
 {
+    s->ack_ok = false;
     s->tx_bump = 0;
     s->trigger_ack = ev->payload_len > 0;
     ctx_cc_shared->cnt_rx_acks = ctx_cc_shared->cnt_rx_acks + 1;
@@ -41,11 +45,15 @@ static __always_inline void proc_ack(struct tcp_ack *ev, struct tcp_ctx_ebpf *ct
     if (s->tx_bump > 0) {
         ctx_ebpf->rx_dupack_cnt = 0;
     }
+    s->ack_ok = true;
 }
 
 /* ---- proc_fast_retransmit  [ebpf]----------------------- */
 static __always_inline void proc_fast_retransmit(struct tcp_ack *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_scratch *s)
 {
+    if (!s->ack_ok) {
+        return;
+    }
     if (s->tx_bump > 0) {
         return;
     }
@@ -55,7 +63,7 @@ static __always_inline void proc_fast_retransmit(struct tcp_ack *ev, struct tcp_
     if (ev->payload_len != 0) {
         return;
     }
-    if (ctx_ebpf->rx_remote_avail != ev->window) {
+    if (ctx_ebpf->rx_remote_avail != ((__u32)(ev->window) << MTP_TCP_WND_SCALE)) {
         return;
     }
     ctx_ebpf->rx_dupack_cnt = ctx_ebpf->rx_dupack_cnt + 1;
@@ -78,6 +86,9 @@ static __always_inline void proc_fast_retransmit(struct tcp_ack *ev, struct tcp_
 /* ---- proc_window  [ebpf]-------------------------------- */
 static __always_inline void proc_window(struct tcp_ack *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s)
 {
+    if (!s->ack_ok) {
+        return;
+    }
     if (s->tx_bump > 0 || ctx_ebpf->rx_remote_avail < ((__u32)(ev->window) << MTP_TCP_WND_SCALE)) {
         ctx_ebpf->rx_remote_avail = (__u32)(ev->window) << MTP_TCP_WND_SCALE;
     }
@@ -86,13 +97,16 @@ static __always_inline void proc_window(struct tcp_ack *ev, struct tcp_ctx_ebpf 
 /* ---- proc_rtt  [ebpf]----------------------------------- */
 static __always_inline void proc_rtt(struct tcp_ack *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_scratch *s)
 {
+    if (!s->ack_ok) {
+        return;
+    }
     if (ev->payload_len > 0 && ctx_ebpf->tx_next_ts == 0) {
         ctx_ebpf->tx_next_ts = ev->ts_val;
     }
     if (ev->ts_ecr == 0 || s->tx_bump == 0) {
         return;
     }
-    __u32 rtt = (mtp_now() - ev->ts_ecr) / 1000;
+    __u32 rtt = (s->now - ev->ts_ecr) / 1000;
     rtt = rtt - (s->tx_bump * 1000000) / MTP_LINK_BANDWIDTH;
     if (rtt >= MTP_TCP_MAX_RTT) {
         return;
@@ -107,6 +121,9 @@ static __always_inline void proc_rtt(struct tcp_ack *ev, struct tcp_ctx_ebpf *ct
 /* ---- proc_seq  [ebpf]----------------------------------- */
 static __always_inline void proc_seq(struct tcp_data *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_scratch *s)
 {
+    if (!s->ack_ok) {
+        return;
+    }
     __u32 exp_first = ctx_ebpf->rx_next_seq;
     __u32 exp_last = ctx_ebpf->rx_next_seq + ctx_ebpf->rx_avail;
     __u32 pkt_first = ev->seq;
@@ -151,6 +168,7 @@ static __always_inline void proc_ooo(struct tcp_data *ev, struct tcp_ctx_ebpf *c
     if (s->payload_len == 0) {
         return;
     }
+    s->ooo_seg = true;
     if (ctx_ebpf->rx_ooo_len == 0) {
         ctx_ebpf->rx_ooo_start = s->seq;
         ctx_ebpf->rx_ooo_len = s->payload_len;
@@ -221,8 +239,48 @@ static __always_inline void proc_recv(struct tcp_data *ev, struct tcp_ctx_ebpf *
                 }
                 ctx_ebpf->rx_next_seq = ctx_ebpf->rx_next_seq + ctx_ebpf->rx_ooo_len;
                 ctx_ebpf->rx_ooo_len = 0;
+                s->ooo_fin = true;
             }
         }
     }
+}
+
+/* ---- gen_retransmit  [ebpf]----------------------------- */
+static __always_inline void gen_retransmit(struct rto_timeout *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_tx_scratch *s)
+{
+    s->tx_ok = ctx_ebpf->tx_sent > 0;
+}
+
+/* ---- send_wnd_update  [ebpf]---------------------------- */
+static __always_inline void send_wnd_update(struct app_recv *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_tx_scratch *s)
+{
+    if (s->rx_bump == 0) {
+        return;
+    }
+    if (ctx_ebpf->tx_pending == 0) {
+        s->wnd_upd = true;
+    }
+    ctx_ebpf->rx_avail = ctx_ebpf->rx_avail + s->rx_bump;
+}
+
+/* ---- gen_seg  [ebpf]------------------------------------ */
+static __always_inline void gen_seg(struct app_send *ev, struct tcp_ctx_ebpf *ctx_ebpf, struct tcp_ctx_cc_shared *ctx_cc_shared, struct tcp_tx_scratch *s)
+{
+    s->tx_ok = false;
+    if (s->tx_pos != ctx_ebpf->tx_next_pos) {
+        return;
+    }
+    if (s->tx_pending > 0) {
+        ctx_ebpf->tx_pending = ctx_ebpf->tx_pending + s->tx_pending;
+    }
+    ctx_ebpf->tx_next_seq = ctx_ebpf->tx_next_seq + s->payload_len;
+    ctx_ebpf->tx_next_pos = ctx_ebpf->tx_next_pos + s->payload_len;
+    if (ctx_ebpf->tx_next_pos >= ctx_ebpf->tx_buf_size) {
+        ctx_ebpf->tx_next_pos = ctx_ebpf->tx_next_pos - ctx_ebpf->tx_buf_size;
+    }
+    ctx_ebpf->tx_sent = ctx_ebpf->tx_sent + s->payload_len;
+    ctx_cc_shared->txp = ctx_ebpf->tx_sent > 0;
+    ctx_ebpf->tx_pending = ctx_ebpf->tx_pending - s->payload_len;
+    s->tx_ok = true;
 }
 

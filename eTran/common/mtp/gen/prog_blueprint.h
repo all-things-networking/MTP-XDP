@@ -1,4 +1,4 @@
-/* GENERATED from /tmp/claude-11465/-home-mtahmasb-mtp-xdp-session-tmp-mtp-pass/ef347694-90cd-4c3c-80ee-6c5e3721d8a4/scratchpad/src/tcp-newconv.mtp by the MTP compiler's XDP backend.
+/* GENERATED from /tmp/claude-11465/-home-mtahmasb-mtp-xdp-session-tmp-mtp-pass/ef347694-90cd-4c3c-80ee-6c5e3721d8a4/scratchpad/src/tcp-bisect.mtp by the MTP compiler's XDP backend.
  * Do not edit: regenerate. The target runtime this is compiled against
  * (mtp_target.h, mtp_target_bpf.h) is NOT generated and is not touched.
  */
@@ -38,6 +38,16 @@ struct ipv4 {
     __u8 tos;
 };
 
+struct tcp_tx_scratch {
+    __u32 rx_bump;
+    __u32 payload_len;
+    __u32 tx_pending;
+    __u32 tx_pos;
+    __u64 ref_ts;
+    bool wnd_upd;
+    bool tx_ok;
+};
+
 struct tcp_scratch {
     __u32 seq;
     __u32 ack_seq;
@@ -55,6 +65,9 @@ struct tcp_scratch {
     bool clear_ooo;
     bool drop;
     bool seg_ok;
+    bool ooo_seg;
+    bool ooo_fin;
+    bool ack_ok;
 };
 
 struct TCPBP {

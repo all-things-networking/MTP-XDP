@@ -1,4 +1,4 @@
-/* GENERATED from /tmp/claude-11465/-home-mtahmasb-mtp-xdp-session-tmp-mtp-pass/ef347694-90cd-4c3c-80ee-6c5e3721d8a4/scratchpad/src/tcp-newconv.mtp by the MTP compiler's XDP backend.
+/* GENERATED from /tmp/claude-11465/-home-mtahmasb-mtp-xdp-session-tmp-mtp-pass/ef347694-90cd-4c3c-80ee-6c5e3721d8a4/scratchpad/src/tcp-bisect.mtp by the MTP compiler's XDP backend.
  * Do not edit: regenerate. The target runtime this is compiled against
  * (mtp_target.h, mtp_target_bpf.h) is NOT generated and is not touched.
  */
@@ -62,7 +62,7 @@ struct tcp_ctx_cc_shared {
 /* ---- tcp_ctx -- @placement("control")------------------- */
 struct tcp_ctx_control {
     __u8 type;
-    __u8 state;
+    __u8 status;
     bool reuseport;
     __u16 local_port;
     __u16 remote_port;
@@ -70,15 +70,15 @@ struct tcp_ctx_control {
     __u32 remote_ip;
     __u32 syn_ts;
     __u32 syn_attempts;
-    __u32 next_timeout;
+    __u64 next_timeout_tsc;
     __u32 qid;
-    bool ecn_enable;
 };
 
 /* ---- tcp_ctx -- @placement("ebpf")---------------------- */
 struct tcp_ctx_ebpf {
     __u32 rx_buf_size;
     __u32 tx_buf_size;
+    bool ecn_enable;
     __u32 rx_avail;
     __u32 rx_remote_avail;
     __u32 rx_next_pos;
@@ -112,7 +112,7 @@ struct tcp_ctx {
 static inline void tcp_ctx_init(struct tcp_ctx *c)
 {
     c->control.type = MTP_TYPE_FAKE;
-    c->control.state = MTP_CONN_WAIT_RX_SYN;
+    c->control.status = MTP_CONN_WAIT_RX_SYN;
 }
 
 /* ---- tcp_listen_ctx -- unplaced------------------------- */
