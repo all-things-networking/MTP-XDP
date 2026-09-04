@@ -442,6 +442,37 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
      * events' lists back to back would be a different program; see the comment
      * on the scratchpad above.
      */
+
+/*
+ * WHAT THE GENERATED PROCESSORS LEAVE FOR THE TARGET. The hand-written forms
+ * write the packet metadata as they go; the generated ones record the outcome in
+ * the scratchpad and this derives the rest. Only the out-of-order OUTCOME cannot
+ * be derived -- which of the three happened is the program's knowledge -- so the
+ * program says it and this only translates.
+ */
+static __always_inline void mtp_rx_meta(struct bpf_tcp_conn *c, struct meta_info *data_meta,
+                                        struct tcp_scratch *s, __u32 pos0, __u32 seq0)
+{
+    data_meta->rx.poff = s->payload_off;
+    data_meta->rx.plen = s->payload_len;
+
+    __u32 pos = pos0 + (s->seq - seq0);
+    if (pos >= c->mtp.rx_buf_size)
+        pos -= c->mtp.rx_buf_size;
+    data_meta->rx.rx_pos = pos;
+
+    if (s->clear_ooo)     data_meta->rx.ooo_bump = OOO_CLEAR_MASK;
+    else if (s->ooo_fin)  data_meta->rx.ooo_bump = OOO_FIN_MASK;
+    else if (s->ooo_seg)  data_meta->rx.ooo_bump = OOO_SEGMENT_MASK;
+
+    if ((c->mtp.rx_avail >> TCP_WND_SCALE) == 0)
+        data_meta->rx.qid |= FORCE_RX_BUMP_MASK;
+}
+
+    /* Where the ring stood before the chain, so the metadata can be derived
+     * afterwards rather than written as we go. */
+    __u32 pos0 = c->mtp.rx_next_pos, seq0 = c->mtp.rx_next_seq;
+
     /* The events the generated processors take. The parser is the target's:
      * these are the same fields the hand-written forms read off tcph. */
     struct tcp_ack  ev_ack  = {0};
@@ -472,10 +503,22 @@ static __always_inline int dispatch_tcp_rx(struct tcphdr *tcph, struct bpf_tcp_c
 #else
         if (!hand_proc_ack(tcph, c, cc, &s))                 break;   /* tcp_ack  */
 #endif
+#ifdef MTP_GEN_SEQOOO
+        proc_seq(&ev_data, &c->mtp, &s);
+        proc_ooo(&ev_data, &c->mtp, &s);
+        if (!s.seg_ok)                                       break;
+#else
         if (!hand_proc_seq_ooo(tcph, c, data_meta, &s))      break;   /* tcp_data */
+#endif
         hand_proc_window_rtt(tcph, c, cc, &s);                        /* tcp_ack  */
         hand_proc_recv(c, data_meta, &s);                             /* tcp_data */
     } while (0);
+
+#if defined(MTP_GEN_SEQOOO) || defined(MTP_GEN_RECV)
+    mtp_rx_meta(c, data_meta, &s, pos0, seq0);
+#else
+    (void)pos0; (void)seq0;
+#endif
 
     post_data(c, data_meta, &s);
     send_ack(c, &s, ece, cpu);
