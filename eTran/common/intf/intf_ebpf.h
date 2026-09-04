@@ -1,4 +1,5 @@
 #pragma once
+#include "mtp/gen/prog_context.h"
 /**
  * Common interface for ebpf and microkernel
  */
@@ -104,20 +105,10 @@ struct slow_path_info {
 
 struct bpf_cc {
     __u64 prev_desired_tx_ts;
-    /** Bps */
-    __u32 rate;
-    /** Counter drops each control interval */
-    __u16 cnt_tx_drops;
-    /** Counter acks each control interval */
-    __u16 cnt_rx_acks;
-    /** Counter bytes sent each control interval */
-    __u32 cnt_rx_ack_bytes;
-    /** Counter acks marked each control interval */
-    __u32 cnt_rx_ecn_bytes;
-    /** RTT estimate (us) */
-    __u32 rtt_est;
-    /** has pending tx data? */
-    __u32 txp;
+    /* Same nesting as bpf_tcp_conn. prev_desired_tx_ts above is the TARGET's
+     * own pacing state and stays here; everything below it is the program's
+     * @placement("cc_shared") group. 8 + 24 = 32, so the size assert holds. */
+    struct tcp_ctx_cc_shared mtp;
 } __attribute__((packed, aligned(32)));
 #ifdef __cplusplus
 static_assert(sizeof(struct bpf_cc) == 32, "bpf_cc size is not 32 bytes");
@@ -148,35 +139,11 @@ struct bpf_tcp_conn {
     __u16 local_port;
     __u16 remote_port;
 
-    __u32 rx_buf_size;
-    __u32 tx_buf_size;
-
-    /** Bytes available for received segments at next position */
-    __u32 rx_avail;
-    /** Bytes available in remote end for received segments */
-    __u32 rx_remote_avail;
-    /** Offset in buffer to place next segment */
-    __u32 rx_next_pos;
-    /** Next sequence number expected */
-    __u32 rx_next_seq;
-
-    /** Duplicate ack count */
-    __u16 rx_dupack_cnt;
-    /* Start of interval of out-of-order received data */
-    __u32 rx_ooo_start;
-    /* Length of interval of out-of-order received data */
-    __u32 rx_ooo_len;
-    /* Number of bytes submitted by AF_XDP but not processed by eBPF yet */
-    __u32 tx_pending;    
-    /** Number of bytes up to next pos in the buffer that were sent but not
-     * acknowledged yet. */
-    __u32 tx_sent;
-    /** Offset in buffer for next segment to be sent */
-    __u32 tx_next_pos;
-    /** Sequence number of next segment to be sent */
-    __u32 tx_next_seq;
-    /** Timestamp to echo in next packet */
-    __u32 tx_next_ts;
+    /* THE PROGRAM'S OWN STATE, nested rather than spelled out here. The
+     * compiler emits struct tcp_ctx_ebpf from tcp.mtp's @placement("ebpf")
+     * group; this struct holds it instead of duplicating its fields, so there
+     * is one definition and generated processors take &c->mtp directly. */
+    struct tcp_ctx_ebpf mtp;
 
     __u32 cc_idx;
     __u8 ecn_enable;

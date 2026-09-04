@@ -97,15 +97,15 @@ const uint8  PRIO_ACK     = 1;    /* pure acknowledgements */
 const uint8  PRIO_DATA    = 0;    /* payload */
 
 const uint32 PARITY_DUP_ACK_THRESH = 3;      /* the donor acts on the third */
-const uint32 TCP_MAX_RTT           = 1000000;
+const uint32 TCP_MAX_RTT           = 100000;
 /* The receive window on the wire is SCALED. The donor shifts by a fixed amount
  * rather than negotiating it, and a program that forgets the shift advertises a
  * window 4096x too small -- which throttles the sender and reads as a transport
  * that is simply slow. */
-const uint32 TCP_WND_SCALE         = 12;
+const uint32 TCP_WND_SCALE         = 3;
 /* Serialisation is subtracted from the RTT sample: the time to put the
  * acknowledged bytes on the wire is not the peer's delay. Bits per second. */
-const uint32 LINK_BANDWIDTH        = 25000000000;
+const uint64 LINK_BANDWIDTH        = 3125000000;
 
 /**************************** parameters ****************************/
 
@@ -283,7 +283,7 @@ context tcp_ctx {
         uint32 rx_buf_size, tx_buf_size;
         uint32 rx_avail, rx_remote_avail;
         uint32 rx_next_pos, rx_next_seq;
-        uint32 rx_dupack_cnt;
+        uint16 rx_dupack_cnt;
         uint32 rx_ooo_start, rx_ooo_len;
         uint32 tx_pending, tx_sent;
         uint32 tx_next_pos, tx_next_seq;
@@ -295,11 +295,11 @@ context tcp_ctx {
      * each variable has exactly one writer.
      */
     @placement("cc_shared") {
-        uint32 cnt_tx_drops, cnt_rx_acks;
+        uint16 cnt_tx_drops, cnt_rx_acks;
         uint32 cnt_rx_ack_bytes, cnt_rx_ecn_bytes;
         uint32 rtt_est;
         uint32 rate;
-        bool   txp;
+        uint32 txp;
     }
 
     /*

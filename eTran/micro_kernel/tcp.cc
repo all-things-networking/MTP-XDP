@@ -438,22 +438,22 @@ int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen)
     ebpf_c.local_port = c->local_port;
     ebpf_c.remote_port = c->remote_port;
 
-    ebpf_c.rx_buf_size = etran_tcp->_trans_params.tcp.rx_buf_size;
-    ebpf_c.tx_buf_size = etran_tcp->_trans_params.tcp.tx_buf_size;
-    ebpf_c.rx_avail = std::min(etran_tcp->_trans_params.tcp.rx_buf_size, (unsigned int)(0xffff << TCP_WND_SCALE));
-    ebpf_c.rx_remote_avail = std::min(etran_tcp->_trans_params.tcp.rx_buf_size, (unsigned int)(0xffff << TCP_WND_SCALE));
-    ebpf_c.rx_next_pos = 0;
-    ebpf_c.rx_next_seq = c->remote_seq;
+    ebpf_c.mtp.rx_buf_size = etran_tcp->_trans_params.tcp.rx_buf_size;
+    ebpf_c.mtp.tx_buf_size = etran_tcp->_trans_params.tcp.tx_buf_size;
+    ebpf_c.mtp.rx_avail = std::min(etran_tcp->_trans_params.tcp.rx_buf_size, (unsigned int)(0xffff << TCP_WND_SCALE));
+    ebpf_c.mtp.rx_remote_avail = std::min(etran_tcp->_trans_params.tcp.rx_buf_size, (unsigned int)(0xffff << TCP_WND_SCALE));
+    ebpf_c.mtp.rx_next_pos = 0;
+    ebpf_c.mtp.rx_next_seq = c->remote_seq;
 
-    ebpf_c.rx_dupack_cnt = 0;
-    ebpf_c.rx_ooo_start = 0;
-    ebpf_c.rx_ooo_len = 0;
+    ebpf_c.mtp.rx_dupack_cnt = 0;
+    ebpf_c.mtp.rx_ooo_start = 0;
+    ebpf_c.mtp.rx_ooo_len = 0;
 
-    ebpf_c.tx_pending = 0;
-    ebpf_c.tx_sent = 0;
-    ebpf_c.tx_next_pos = 0;
-    ebpf_c.tx_next_seq = listen ? c->local_seq + 1 : c->local_seq;
-    ebpf_c.tx_next_ts = 0;
+    ebpf_c.mtp.tx_pending = 0;
+    ebpf_c.mtp.tx_sent = 0;
+    ebpf_c.mtp.tx_next_pos = 0;
+    ebpf_c.mtp.tx_next_seq = listen ? c->local_seq + 1 : c->local_seq;
+    ebpf_c.mtp.tx_next_ts = 0;
 
     ebpf_c.cc_idx = cc_idx;
     ebpf_c.ecn_enable = c->flags & ECN_ENABLE;
@@ -660,11 +660,11 @@ void snapshot_cc(struct bpf_cc_snapshot *stats, uint32_t cc_idx)
     stats->c_acks = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_rx_acks;
     stats->c_ackb = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_rx_ack_bytes;
     stats->c_ecnb = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_rx_ecn_bytes;
-    stats->txp = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].txp;
+    stats->mtp.txp = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].txp;
     stats->rtt = etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].rtt_est;
     // // dump all above stats
     // printf("cc_idx (%u): c_drops = %u, c_acks = %u, c_ackb = %u, c_ecnb = %u, txp = %u, rtt = %u\n",
-    //     cc_idx, stats->c_drops, stats->c_acks, stats->c_ackb, stats->c_ecnb, stats->txp, stats->rtt);
+    //     cc_idx, stats->c_drops, stats->c_acks, stats->c_ackb, stats->c_ecnb, stats->mtp.txp, stats->rtt);
 }
 
 // convert kbps to Bps
@@ -720,7 +720,7 @@ void handle_retransmission(struct tcp_connection *c, struct bpf_cc_snapshot *sta
     uint32_t rtt = (stats->rtt ? stats->rtt : TCP_RTT_INIT);
 
     /* check for re-transmits */
-    if (stats->txp && stats->c_ackb == 0)
+    if (stats->mtp.txp && stats->c_ackb == 0)
     {
         if (c->cnt_tx_pending++ == 0)
         {

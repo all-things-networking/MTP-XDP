@@ -132,33 +132,33 @@ static __always_inline bool proc_ack(struct tcphdr *tcph, struct bpf_tcp_conn *c
     /* --- proc_ack + proc_fast_retransmit (EVENT-ACK 1.3) ------------------ */
     if (tcph->ack == 1) {
         // update CC
-        cc->cnt_rx_acks++;
+        cc->mtp.cnt_rx_acks++;
         if (likely(tcp_valid_rxack(c, s->ack_seq, &s->tx_bump)) == 0) {
-            if (unlikely(s->tx_bump > c->tx_sent)) {
+            if (unlikely(s->tx_bump > c->mtp.tx_sent)) {
                 s->tx_bump = 0;
                 /* this is probably caused by retransmission */
                 s->trigger_ack = false;
                 return false;
             }
-            cc->cnt_rx_ack_bytes += s->tx_bump;
+            cc->mtp.cnt_rx_ack_bytes += s->tx_bump;
             if (unlikely(tcph->ece == 1))
-                cc->cnt_rx_ecn_bytes += s->tx_bump;
+                cc->mtp.cnt_rx_ecn_bytes += s->tx_bump;
             
-            c->tx_sent -= s->tx_bump;
-            cc->txp = c->tx_sent > 0;
+            c->mtp.tx_sent -= s->tx_bump;
+            cc->mtp.txp = c->mtp.tx_sent > 0;
 
             if (likely(s->tx_bump)) {
-                c->rx_dupack_cnt = 0;
+                c->mtp.rx_dupack_cnt = 0;
             } 
             /*
             * Fast retransmit -> detect a duplicate ACK if:
             * 1. The ACK number is the same as the largest seen: tcp_valid_rxack() returns 0
             * 2. There is unacknowledged data pending: tx_sent > 0
             * 3. There is no data payload included with the ACK: s->payload_len == 0
-            * 4. There is no window update: c->rx_remote_avail == ((bpf_ntohs(tcph->window)) << TCP_WND_SCALE)
+            * 4. There is no window update: c->mtp.rx_remote_avail == ((bpf_ntohs(tcph->window)) << TCP_WND_SCALE)
             */
             /* duplicate ack ? */
-            else if (unlikely(c->tx_sent && s->payload_len == 0 && (c->rx_remote_avail == ((bpf_ntohs(tcph->window)) << TCP_WND_SCALE)) && ++c->rx_dupack_cnt == 3)) {
+            else if (unlikely(c->mtp.tx_sent && s->payload_len == 0 && (c->mtp.rx_remote_avail == ((bpf_ntohs(tcph->window)) << TCP_WND_SCALE)) && ++c->mtp.rx_dupack_cnt == 3)) {
                 s->go_back_pos = fast_retransmit(c, cc);
                 xdp_log("Duplicate ACK triggers fast retransmission");
                 return false;
@@ -192,30 +192,30 @@ static __always_inline bool proc_seq_ooo(struct tcphdr *tcph, struct bpf_tcp_con
     data_meta->rx.plen = s->payload_len;
 
     s->seq += s->trim_start;
-    data_meta->rx.rx_pos = c->rx_next_pos + (s->seq - c->rx_next_seq);
-    if (data_meta->rx.rx_pos >= c->rx_buf_size)
-        data_meta->rx.rx_pos -= c->rx_buf_size;
+    data_meta->rx.rx_pos = c->mtp.rx_next_pos + (s->seq - c->mtp.rx_next_seq);
+    if (data_meta->rx.rx_pos >= c->mtp.rx_buf_size)
+        data_meta->rx.rx_pos -= c->mtp.rx_buf_size;
 
     /* check if we can add it to the out of order interval */
-    if (unlikely(s->seq != c->rx_next_seq)) {
+    if (unlikely(s->seq != c->mtp.rx_next_seq)) {
         if (!s->payload_len) return false;
-        xdp_log("OOO packet, seq(%u), c->rx_next_seq(%u)", s->seq, c->rx_next_seq);
-        if (c->rx_ooo_len == 0) {
-            c->rx_ooo_start = s->seq;
-            c->rx_ooo_len = s->payload_len;
-            xdp_log("New segment, ooo_start(%u), ooo_len(%u)", c->rx_ooo_start, c->rx_ooo_len);
-        } else if (s->seq + s->payload_len == c->rx_ooo_start) {
-            c->rx_ooo_start = s->seq;
-            c->rx_ooo_len += s->payload_len;
-            xdp_log("Merge segment, ooo_start(%u), ooo_len(%u)", c->rx_ooo_start, c->rx_ooo_len);
-        } else if (c->rx_ooo_start + c->rx_ooo_len == s->seq) {
-            c->rx_ooo_len += s->payload_len;
-            xdp_log("Merge segment, ooo_start(%u), ooo_len(%u)", c->rx_ooo_start, c->rx_ooo_len);
+        xdp_log("OOO packet, seq(%u), c->mtp.rx_next_seq(%u)", s->seq, c->mtp.rx_next_seq);
+        if (c->mtp.rx_ooo_len == 0) {
+            c->mtp.rx_ooo_start = s->seq;
+            c->mtp.rx_ooo_len = s->payload_len;
+            xdp_log("New segment, ooo_start(%u), ooo_len(%u)", c->mtp.rx_ooo_start, c->mtp.rx_ooo_len);
+        } else if (s->seq + s->payload_len == c->mtp.rx_ooo_start) {
+            c->mtp.rx_ooo_start = s->seq;
+            c->mtp.rx_ooo_len += s->payload_len;
+            xdp_log("Merge segment, ooo_start(%u), ooo_len(%u)", c->mtp.rx_ooo_start, c->mtp.rx_ooo_len);
+        } else if (c->mtp.rx_ooo_start + c->mtp.rx_ooo_len == s->seq) {
+            c->mtp.rx_ooo_len += s->payload_len;
+            xdp_log("Merge segment, ooo_start(%u), ooo_len(%u)", c->mtp.rx_ooo_start, c->mtp.rx_ooo_len);
         } else {
             // unfortunately, we can't accept this payload
             s->payload_len = 0;
             data_meta->rx.plen = POISON_16;
-            xdp_log("Drop packet, ooo_start(%u), ooo_len(%u)", c->rx_ooo_start, c->rx_ooo_len);
+            xdp_log("Drop packet, ooo_start(%u), ooo_len(%u)", c->mtp.rx_ooo_start, c->mtp.rx_ooo_len);
         }
         // mark this packet is an out-of-order segment
         data_meta->rx.ooo_bump = OOO_SEGMENT_MASK;
@@ -234,7 +234,7 @@ static __always_inline bool proc_seq_ooo(struct tcphdr *tcph, struct bpf_tcp_con
         s->payload_len -= s->trim_start + s->trim_end;
         data_meta->rx.poff = s->payload_off;
         data_meta->rx.plen = s->payload_len;
-        data_meta->rx.rx_pos = c->rx_next_pos;
+        data_meta->rx.rx_pos = c->mtp.rx_next_pos;
 
         xdp_log("Good seq, payload_off(%u), payload_len(%u), trim_start(%u), trim_end(%u)", 
             s->payload_off, s->payload_len, s->trim_start, s->trim_end);
@@ -250,15 +250,15 @@ static __always_inline void proc_window_rtt(struct tcphdr *tcph, struct bpf_tcp_
     /* --- proc_window (EVENT-ACK 1.3) --- */
     /* The window is refreshed when this ACK advanced anything, or when the
      * advertised window is larger than what we believed. */
-    if (likely(s->tx_bump || (c->rx_remote_avail < ((bpf_ntohs(tcph->window)) << TCP_WND_SCALE)))) {
+    if (likely(s->tx_bump || (c->mtp.rx_remote_avail < ((bpf_ntohs(tcph->window)) << TCP_WND_SCALE)))) {
         /* update TCP receive window */
-        c->rx_remote_avail = (bpf_ntohs(tcph->window)) << TCP_WND_SCALE;
+        c->mtp.rx_remote_avail = (bpf_ntohs(tcph->window)) << TCP_WND_SCALE;
     }
     
     /* --- proc_rtt (EVENT-ACK 1.3) ----------------------------------------- */
     /* update RTT estimate */
-    if (s->payload_len && !c->tx_next_ts)
-        c->tx_next_ts = s->ts_val;
+    if (s->payload_len && !c->mtp.tx_next_ts)
+        c->mtp.tx_next_ts = s->ts_val;
     if (likely(tcph->ack == 1 && s->ts_ecr && s->tx_bump)) {
         // RTT = t{completion} - t{sent} - t{serialization}
         __u32 rtt = (s->now - s->ts_ecr);
@@ -266,10 +266,10 @@ static __always_inline void proc_window_rtt(struct tcphdr *tcph, struct bpf_tcp_
         rtt -= (s->tx_bump * 1000000) / LINK_BANDWIDTH;
         // bpf_printk("CPU#%u, RTT: %u us", bpf_get_smp_processor_id(), rtt);
         if (likely(rtt < TCP_MAX_RTT)) {
-            if (likely(cc->rtt_est))
-                cc->rtt_est = (cc->rtt_est * 7 + rtt) / 8;
+            if (likely(cc->mtp.rtt_est))
+                cc->mtp.rtt_est = (cc->mtp.rtt_est * 7 + rtt) / 8;
             else
-                cc->rtt_est = rtt;
+                cc->mtp.rtt_est = rtt;
         }
     }
 
@@ -282,37 +282,37 @@ static __always_inline void proc_recv(struct bpf_tcp_conn *c, struct meta_info *
     /* update TCP state if we have payload */
     if (likely(s->payload_len)) {
         s->rx_bump = s->payload_len;
-        c->rx_avail -= s->payload_len;
-        c->rx_next_pos += s->payload_len;
-        if (c->rx_next_pos >= c->rx_buf_size)
-            c->rx_next_pos -= c->rx_buf_size;
-        c->rx_next_seq += s->payload_len;
+        c->mtp.rx_avail -= s->payload_len;
+        c->mtp.rx_next_pos += s->payload_len;
+        if (c->mtp.rx_next_pos >= c->mtp.rx_buf_size)
+            c->mtp.rx_next_pos -= c->mtp.rx_buf_size;
+        c->mtp.rx_next_seq += s->payload_len;
 
-        // xdp_log("seq(%u), payload_len(%u), c->rx_avail(%u), c->rx_next_pos(%u), c->rx_next_seq(%u)", s->seq, s->payload_len, c->rx_avail, c->rx_next_pos, c->rx_next_seq);
+        // xdp_log("seq(%u), payload_len(%u), c->mtp.rx_avail(%u), c->mtp.rx_next_pos(%u), c->mtp.rx_next_seq(%u)", s->seq, s->payload_len, c->mtp.rx_avail, c->mtp.rx_next_pos, c->mtp.rx_next_seq);
         
         /* handle existing out-of-order segments */
-        if (unlikely(c->rx_ooo_len)) {
-            if (tcp_valid_rxseq_ooo(c, c->rx_ooo_start, c->rx_ooo_len, &s->trim_start, &s->trim_end)) {
+        if (unlikely(c->mtp.rx_ooo_len)) {
+            if (tcp_valid_rxseq_ooo(c, c->mtp.rx_ooo_start, c->mtp.rx_ooo_len, &s->trim_start, &s->trim_end)) {
                 /* completely superfluous: s->drop out of order interval */
-                c->rx_ooo_len = 0;
+                c->mtp.rx_ooo_len = 0;
                 data_meta->rx.ooo_bump = OOO_CLEAR_MASK;
                 s->trigger_ack = false;
                 s->clear_ooo = true;
             } else {
-                c->rx_ooo_start += s->trim_start;
-                c->rx_ooo_len -= s->trim_start + s->trim_end;
+                c->mtp.rx_ooo_start += s->trim_start;
+                c->mtp.rx_ooo_len -= s->trim_start + s->trim_end;
 
                 // accept out-of-order segments
-                if (c->rx_ooo_len && c->rx_ooo_start == c->rx_next_seq) {
-                    xdp_log("c->rx_ooo_len(%u), c->rx_ooo_start(%u), c->rx_next_seq(%u)", c->rx_ooo_len, c->rx_ooo_start, c->rx_next_seq);
-                    s->rx_bump += c->rx_ooo_len;
-                    c->rx_avail -= c->rx_ooo_len;
-                    c->rx_next_pos += c->rx_ooo_len;
-                    if (c->rx_next_pos >= c->rx_buf_size)
-                        c->rx_next_pos -= c->rx_buf_size;
-                    c->rx_next_seq += c->rx_ooo_len;
+                if (c->mtp.rx_ooo_len && c->mtp.rx_ooo_start == c->mtp.rx_next_seq) {
+                    xdp_log("c->mtp.rx_ooo_len(%u), c->mtp.rx_ooo_start(%u), c->mtp.rx_next_seq(%u)", c->mtp.rx_ooo_len, c->mtp.rx_ooo_start, c->mtp.rx_next_seq);
+                    s->rx_bump += c->mtp.rx_ooo_len;
+                    c->mtp.rx_avail -= c->mtp.rx_ooo_len;
+                    c->mtp.rx_next_pos += c->mtp.rx_ooo_len;
+                    if (c->mtp.rx_next_pos >= c->mtp.rx_buf_size)
+                        c->mtp.rx_next_pos -= c->mtp.rx_buf_size;
+                    c->mtp.rx_next_seq += c->mtp.rx_ooo_len;
 
-                    c->rx_ooo_len = 0;
+                    c->mtp.rx_ooo_len = 0;
                     // out-of-order segment is processed
                     data_meta->rx.ooo_bump = OOO_FIN_MASK;
                     xdp_log("Out-of-order segment is processed");
@@ -320,13 +320,13 @@ static __always_inline void proc_recv(struct bpf_tcp_conn *c, struct meta_info *
             }
         }
 
-        if (unlikely((c->rx_avail >> TCP_WND_SCALE) == 0)) {
+        if (unlikely((c->mtp.rx_avail >> TCP_WND_SCALE) == 0)) {
             // ebpf realized that the receive buffer is empty,
             // piggyback a signal to lib, once application releases the buffer, force it sync with us
             data_meta->rx.qid |= FORCE_RX_BUMP_MASK;
             // bpf_printk("force");
         }
-        // bpf_printk("c->rx_avail = %u", c->rx_avail);
+        // bpf_printk("c->mtp.rx_avail = %u", c->mtp.rx_avail);
     }
 
 }
@@ -528,7 +528,7 @@ static __always_inline int gen_retransmit(struct bpf_tcp_conn *c, struct bpf_cc 
     /* --- gen_retransmit (EVENT-TIMER-RTO 1.3): the RTO's dummy packet ----- */
     /* Timeout packet from slowpath, process it first */
     if (unlikely(data_meta->tx.flag & FLAG_TO)) {
-        if (!c->tx_sent) {
+        if (!c->mtp.tx_sent) {
             TCP_UNLOCK(c);
             xdp_egress_log("Timeout but no data to retransmit");
             return XDP_DROP;
@@ -559,11 +559,11 @@ static __always_inline int send_wnd_update(struct iphdr *iph, struct tcphdr *tcp
     /* --- send_wnd_update (EVENT-APP-RECV 1.3) ----------------------------- */
     /* update receving buffer space */
     if (s->rx_bump) {
-        // if ((c->rx_avail >> TCP_WND_SCALE) == 0 && c->tx_avail == 0)
-        if (c->tx_pending == 0)
+        // if ((c->mtp.rx_avail >> TCP_WND_SCALE) == 0 && c->tx_avail == 0)
+        if (c->mtp.tx_pending == 0)
             s->wnd_upd = true;
-        c->rx_avail += s->rx_bump;
-        xdp_egress_log("Rxwnd is updated from %u to %u", min((c->rx_avail - s->rx_bump) >> TCP_WND_SCALE, 0xFFFF), c->rx_avail);
+        c->mtp.rx_avail += s->rx_bump;
+        xdp_egress_log("Rxwnd is updated from %u to %u", min((c->mtp.rx_avail - s->rx_bump) >> TCP_WND_SCALE, 0xFFFF), c->mtp.rx_avail);
     }
 
     /* --- the FLAG_SYNC dummy packet: a frame with no payload sent purely to
@@ -578,7 +578,7 @@ static __always_inline int send_wnd_update(struct iphdr *iph, struct tcphdr *tcp
             fill_tcp_hdr(iph, tcph, c, s->ref_ts, data_end, TCP_FLAG_ACK);
             fill_ip_hdr(iph, 0, false);
             TCP_UNLOCK(c);
-            xdp_egress_log("Rxwnd is updated from empty to %u, send extra ack", min(c->rx_avail >> TCP_WND_SCALE, 0xFFFF));
+            xdp_egress_log("Rxwnd is updated from empty to %u, send extra ack", min(c->mtp.rx_avail >> TCP_WND_SCALE, 0xFFFF));
             return XDP_TX;
         }
         TCP_UNLOCK(c);
@@ -593,24 +593,24 @@ static __always_inline int gen_seg(struct iphdr *iph, struct tcphdr *tcph,
                                    struct tcp_tx_scratch *s, __u32 cpu)
 {
 
-    // this is probably caused by fast retransmission as we reset the c->tx_next_pos
+    // this is probably caused by fast retransmission as we reset the c->mtp.tx_next_pos
     // but there are pending packets in the queue, simply drop them
-    if (unlikely(s->tx_pos != c->tx_next_pos)) {
+    if (unlikely(s->tx_pos != c->mtp.tx_next_pos)) {
         TCP_UNLOCK(c);
-        xdp_egress_log("tx_pos(%u) != c->tx_next_pos(%u)", s->tx_pos, c->tx_next_pos);
-        // bpf_printk("tx_pos(%u) != c->tx_next_pos(%u)", s->tx_pos, c->tx_next_pos);
+        xdp_egress_log("tx_pos(%u) != c->mtp.tx_next_pos(%u)", s->tx_pos, c->mtp.tx_next_pos);
+        // bpf_printk("tx_pos(%u) != c->mtp.tx_next_pos(%u)", s->tx_pos, c->mtp.tx_next_pos);
         return XDP_DROP;
     }
 
     if (s->tx_pending)
-        c->tx_pending += s->tx_pending;
+        c->mtp.tx_pending += s->tx_pending;
 
     __u32 avail = tcp_txavail(c);
 
     if (unlikely(avail < s->payload_len)) {
         // FIXME
-        // bpf_printk("c->rx_remote_avail(%u), c->tx_sent(%u), c->tx_avail(%u), payload_len(%u)", 
-        //     c->rx_remote_avail, c->tx_sent, c->tx_avail, s->payload_len);
+        // bpf_printk("c->mtp.rx_remote_avail(%u), c->mtp.tx_sent(%u), c->tx_avail(%u), payload_len(%u)", 
+        //     c->mtp.rx_remote_avail, c->mtp.tx_sent, c->tx_avail, s->payload_len);
         // bpf_printk("avail(%u) < payload_len(%u)", avail, s->payload_len);
     }
 
@@ -620,13 +620,13 @@ static __always_inline int gen_seg(struct iphdr *iph, struct tcphdr *tcph,
 
     fill_ip_hdr(iph, s->payload_len, c->ecn_enable);
 
-    c->tx_next_seq += s->payload_len;
-    c->tx_next_pos += s->payload_len;
-    if (c->tx_next_pos >= c->tx_buf_size)
-        c->tx_next_pos -= c->tx_buf_size;
-    c->tx_sent += s->payload_len;
-    cc->txp = c->tx_sent > 0;
-    c->tx_pending -= s->payload_len;
+    c->mtp.tx_next_seq += s->payload_len;
+    c->mtp.tx_next_pos += s->payload_len;
+    if (c->mtp.tx_next_pos >= c->mtp.tx_buf_size)
+        c->mtp.tx_next_pos -= c->mtp.tx_buf_size;
+    c->mtp.tx_sent += s->payload_len;
+    cc->mtp.txp = c->mtp.tx_sent > 0;
+    c->mtp.tx_pending -= s->payload_len;
 
     // /*** NO CC ***/
     // TCP_UNLOCK(c);
@@ -634,21 +634,21 @@ static __always_inline int gen_seg(struct iphdr *iph, struct tcphdr *tcph,
     // return XDP_TX;
     
     #ifdef BYPASS_RL
-    if (cc->rate >= LINK_BANDWIDTH && !nr_pkts_in_tw[cpu]) {
+    if (cc->mtp.rate >= LINK_BANDWIDTH && !nr_pkts_in_tw[cpu]) {
         // eRPC recommends to bypass rate limiter
         goto bypass_rl;
     }
     #endif
 
     #ifdef BYPASS_RL
-    if ((!nr_pkts_in_tw[cpu] || c->tx_sent == s->payload_len) && desired_tx_ts <= s->ref_ts) {
+    if ((!nr_pkts_in_tw[cpu] || c->mtp.tx_sent == s->payload_len) && desired_tx_ts <= s->ref_ts) {
         goto bypass_rl;
     }
     #endif
 
     TCP_UNLOCK(c);
 
-    // bpf_printk("cc->rate(%lu)", cc->rate);
+    // bpf_printk("cc->mtp.rate(%lu)", cc->mtp.rate);
 
     __u32 key = cpu;
     struct timing_wheel *tw_map = bpf_map_lookup_elem(&tw_outer_map, &key);
@@ -662,7 +662,7 @@ static __always_inline int gen_seg(struct iphdr *iph, struct tcphdr *tcph,
         log_panic("idx == POISON_32");
         return XDP_DROP;
     }
-    // bpf_printk("TW idx(%u), tx_ts(%lu), (%u)", idx, desired_tx_ts, cc->rate);
+    // bpf_printk("TW idx(%u), tx_ts(%lu), (%u)", idx, desired_tx_ts, cc->mtp.rate);
 
     return bpf_redirect_map(tw_map, idx, 0);
 
